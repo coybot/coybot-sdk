@@ -1,12 +1,12 @@
 """
 Auto-detection and factory for camera implementations.
 
-See https://astral.us/docs for details.
+See https://coy.bot/docs for details.
 """
 
 from typing import Optional
 
-from astral_sdk.camera.base import Camera
+from coybot_sdk.camera.base import Camera
 
 
 def _check_oakd_available() -> bool:
@@ -114,7 +114,7 @@ def _try_oakd(rgb_fps: int, enable_depth: bool, rgb_resolution: tuple[int, int])
         return None
 
     try:
-        from astral_sdk.camera.oakdlite import OakDLiteCamera
+        from coybot_sdk.camera.oakdlite import OakDLiteCamera
         return OakDLiteCamera(
             rgb_fps=rgb_fps,
             enable_depth=enable_depth,
@@ -131,7 +131,7 @@ def _try_realsense(rgb_fps: int, enable_depth: bool, rgb_resolution: tuple[int, 
         return None
 
     try:
-        from astral_sdk.camera.intel_d435i import RealSenseCamera
+        from coybot_sdk.camera.intel_d435i import RealSenseCamera
         # Cap fps at 30 for stability
         return RealSenseCamera(
             rgb_fps=min(rgb_fps, 30),

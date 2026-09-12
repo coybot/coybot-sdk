@@ -540,7 +540,7 @@ LOG_PATH="${TMPDIR:-/tmp}/phrover-runtime-room-topology.log"
 xcrun devicectl device copy from \
   --device "$DEVICE_ID" \
   --domain-type appDataContainer \
-  --domain-identifier us.astral.phrover \
+  --domain-identifier bot.coy.phrover \
   --source Documents/phrover-runtime.log \
   --destination "$LOG_PATH"
 

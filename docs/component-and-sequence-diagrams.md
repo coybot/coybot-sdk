@@ -1,6 +1,6 @@
-# Astral SDK Component and Sequence Diagrams
+# Coybot SDK Component and Sequence Diagrams
 
-This document shows how the main components in `astral-sdk` fit together and how the two primary runtime flows work.
+This document shows how the main components in `coybot-sdk` fit together and how the two primary runtime flows work.
 
 ## Component Diagram
 
@@ -8,7 +8,7 @@ This document shows how the main components in `astral-sdk` fit together and how
 flowchart LR
   subgraph "Python Drone SDK"
     PyApp["Python examples / user app"]
-    SDK["astral_sdk"]
+    SDK["coybot_sdk"]
     DroneAPI["drone.py MAVLink API"]
     CameraAPI["Camera abstraction"]
     OAK["OAK-D Lite driver"]
@@ -18,7 +18,7 @@ flowchart LR
 
   subgraph "ROS 2 Optional Stack"
     Nav2["Nav2 / ROS nodes"]
-    Bridge["astral_drone MAVLink bridge"]
+    Bridge["coybot_drone MAVLink bridge"]
     Topics["ROS topics: cmd_vel, odom, battery, pose"]
   end
 
@@ -42,7 +42,7 @@ flowchart LR
   subgraph "Rover Hardware / Optional Cloud"
     ESP32["WAVE ROVER ESP32"]
     Rover["4WD rover chassis"]
-    Cloud["Astral / user backend not in repo"]
+    Cloud["Coybot / user backend not in repo"]
     AWS["Cognito / AWS IoT MQTT"]
   end
 
@@ -81,7 +81,7 @@ flowchart LR
 sequenceDiagram
   actor User
   participant App as "Python script / CLI"
-  participant SDK as "astral_sdk.drone"
+  participant SDK as "coybot_sdk.drone"
   participant MAV as "pymavlink"
   participant FC as "ArduPilot FC or SITL"
   participant Drone as "Drone motors / sensors"

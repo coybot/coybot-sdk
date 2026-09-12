@@ -20,7 +20,7 @@ public final class AuthService: NSObject {
     /// - Parameter keychainKey: Keychain account used to persist the session. Namespace this
     ///   per-app (e.g. your bundle id + ".session") if multiple apps on the same device use
     ///   PhroverCloud against different backends.
-    public init(config: PhroverCloudConfig, keychainKey: String = "us.astral.phrover.session") {
+    public init(config: PhroverCloudConfig, keychainKey: String = "bot.coy.phrover.session") {
         self.config = config
         self.keychainKey = keychainKey
         super.init()

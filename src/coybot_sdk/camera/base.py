@@ -1,7 +1,7 @@
 """
 Abstract base class and frame container for camera implementations.
 
-See https://astral.us/docs for details.
+See https://coy.bot/docs for details.
 """
 
 from abc import ABC, abstractmethod

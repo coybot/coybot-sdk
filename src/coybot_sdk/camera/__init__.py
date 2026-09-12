@@ -5,10 +5,10 @@ Supports:
 - Luxonis OAK-D Lite (DepthAI)
 - Intel RealSense D435i
 
-See https://astral.us/docs for details.
+See https://coy.bot/docs for details.
 """
 
-from astral_sdk.camera.base import Camera, CameraFrame
-from astral_sdk.camera.auto import get_camera, list_available_cameras
+from coybot_sdk.camera.base import Camera, CameraFrame
+from coybot_sdk.camera.auto import get_camera, list_available_cameras
 
 __all__ = ["Camera", "CameraFrame", "get_camera", "list_available_cameras"]

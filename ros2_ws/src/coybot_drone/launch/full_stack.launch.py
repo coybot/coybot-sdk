@@ -22,7 +22,7 @@ from ament_index_python.packages import get_package_share_directory
 
 def generate_launch_description():
     # Package directories
-    pkg_share = get_package_share_directory('astral_drone')
+    pkg_share = get_package_share_directory('coybot_drone')
     
     # Launch arguments
     use_sim_time = LaunchConfiguration('use_sim_time', default='false')
@@ -50,7 +50,7 @@ def generate_launch_description():
     
     # Camera bridge node
     camera_node = Node(
-        package='astral_drone',
+        package='coybot_drone',
         executable='camera_node',
         name='camera_bridge',
         parameters=[{
@@ -65,7 +65,7 @@ def generate_launch_description():
     
     # MAVLink bridge node
     mavlink_node = Node(
-        package='astral_drone',
+        package='coybot_drone',
         executable='mavlink_bridge',
         name='mavlink_bridge',
         parameters=[{

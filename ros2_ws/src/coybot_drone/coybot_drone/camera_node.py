@@ -2,10 +2,10 @@
 """
 Camera Bridge Node — publishes RGB and depth images to ROS 2 topics.
 
-Bridges the astral-sdk camera abstraction (OAK-D Lite / RealSense D435i)
+Bridges the coybot-sdk camera abstraction (OAK-D Lite / RealSense D435i)
 to ROS 2 for use with Isaac ROS Visual SLAM and Nav2.
 
-See https://astral.us/docs for details.
+See https://coy.bot/docs for details.
 """
 
 import rclpy
@@ -60,7 +60,7 @@ class CameraBridgeNode(Node):
     def _init_camera(self):
         """Initialize the camera using auto-detection."""
         try:
-            from astral_sdk.camera import get_camera
+            from coybot_sdk.camera import get_camera
 
             self.camera = get_camera(
                 rgb_fps=self.fps,

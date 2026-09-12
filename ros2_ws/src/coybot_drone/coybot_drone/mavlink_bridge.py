@@ -7,7 +7,7 @@ MAVLink ``SET_POSITION_TARGET_LOCAL_NED`` messages for the flight
 controller. Also publishes drone state (position, velocity, odometry,
 battery) to ROS 2 topics.
 
-See https://astral.us/docs for details.
+See https://coy.bot/docs for details.
 """
 
 import rclpy

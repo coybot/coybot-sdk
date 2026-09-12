@@ -290,7 +290,7 @@ Confirm:
 ### Task 7: Calibrate and complete physical acceptance
 
 **Device:** `C40C8EA8-E545-5B47-ADEA-CD8118AE844C`  
-**Bundle:** `us.astral.phrover`
+**Bundle:** `bot.coy.phrover`
 
 - [ ] **Step 1: Measure and record the rigid mount**
 
@@ -324,7 +324,7 @@ Expected: both confirmed room transitions complete without furniture contact, wh
 DEVICE_ID="C40C8EA8-E545-5B47-ADEA-CD8118AE844C"
 LOG_PATH="${TMPDIR:-/tmp}/phrover-runtime-depth-safety-acceptance.log"
 
-xcrun devicectl device copy from   --device "$DEVICE_ID"   --domain-type appDataContainer   --domain-identifier us.astral.phrover   --source Documents/phrover-runtime.log   --destination "$LOG_PATH"
+xcrun devicectl device copy from   --device "$DEVICE_ID"   --domain-type appDataContainer   --domain-identifier bot.coy.phrover   --source Documents/phrover-runtime.log   --destination "$LOG_PATH"
 
 rg "depth_safety|nav_safety_stop|nav_replan|room_transition|doorway_crossed" "$LOG_PATH"
 ```

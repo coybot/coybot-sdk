@@ -5,12 +5,12 @@ Standalone arm/disarm utility for ArduPilot drones via MAVLink.
 This is a simple CLI script that connects directly to the flight controller
 and arms or disarms the drone, without going through the full SDK.
 
-See https://astral.us/docs for details.
+See https://coy.bot/docs for details.
 
 Usage:
-    python -m astral_sdk.arm_disarm arm
-    python -m astral_sdk.arm_disarm disarm
-    python -m astral_sdk.arm_disarm status
+    python -m coybot_sdk.arm_disarm arm
+    python -m coybot_sdk.arm_disarm disarm
+    python -m coybot_sdk.arm_disarm status
 """
 
 import argparse

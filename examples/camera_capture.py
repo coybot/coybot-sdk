@@ -4,14 +4,14 @@ Capture a single frame from an attached camera (OAK-D Lite or RealSense
 D435i) and save it to disk.
 
 Install the camera dependencies first:
-    pip install astral-sdk[all]
+    pip install coybot-sdk[all]
 """
 
 import argparse
 
 import cv2
 
-from astral_sdk.camera import get_camera, list_available_cameras
+from coybot_sdk.camera import get_camera, list_available_cameras
 
 
 def main():

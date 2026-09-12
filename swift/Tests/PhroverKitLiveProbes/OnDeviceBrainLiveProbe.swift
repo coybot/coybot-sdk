@@ -13,7 +13,7 @@ import PhroverKit
 /// never runs in the fast e2e gate — it needs Apple Intelligence ready on the host, is
 /// slow, and is non-deterministic. Run explicitly:
 ///
-///   xcodebuild test -scheme astral-sdk-Package \
+///   xcodebuild test -scheme coybot-sdk-Package \
 ///     -destination 'platform=iOS Simulator,name=iPhone 17' \
 ///     -only-testing:PhroverKitLiveProbes
 ///

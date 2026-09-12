@@ -6,9 +6,9 @@ The OAK-D Lite has:
 - Stereo depth from two OV7251 mono cameras
 - Intel Movidius Myriad X VPU for on-device AI
 
-Install: ``pip install astral-sdk[camera-oak]``
+Install: ``pip install coybot-sdk[camera-oak]``
 
-See https://astral.us/docs for details.
+See https://coy.bot/docs for details.
 """
 
 from typing import Optional
@@ -18,10 +18,10 @@ try:
 except ImportError:
     raise ImportError(
         "depthai library required. "
-        "Install with: pip install astral-sdk[camera-oak]"
+        "Install with: pip install coybot-sdk[camera-oak]"
     )
 
-from astral_sdk.camera.base import Camera, CameraFrame
+from coybot_sdk.camera.base import Camera, CameraFrame
 
 
 class OakDLiteCamera(Camera):

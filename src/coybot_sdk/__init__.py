@@ -1,11 +1,11 @@
 """
-astral-sdk: Open Python SDK for ArduPilot drones.
+coybot-sdk: Open Python SDK for ArduPilot drones.
 
 This package provides MAVLink primitives, camera drivers, and utilities
-for building drone applications. See https://astral.us/docs for details.
+for building drone applications. See https://coy.bot/docs for details.
 """
 
-from astral_sdk.drone import (
+from coybot_sdk.drone import (
     # Connection
     set_config_path,
     disconnect,

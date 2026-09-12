@@ -1,11 +1,11 @@
-# Astral Overhaul — Phase 0 Audit (astral-sdk repo)
+# Coybot Overhaul — Phase 0 Audit (coybot-sdk repo)
 
 Scope: public API surface, mission schema, test coverage, licensing/SPDX, dependency
 license table. Website/benchmark/dataset findings live in `../eco/OVERHAUL_AUDIT.md`.
 
 ## Public API surface
 
-`src/astral_sdk/__init__.py:8-73` re-exports a flat namespace from `drone.py`: connection
+`src/coybot_sdk/__init__.py:8-73` re-exports a flat namespace from `drone.py`: connection
 (`set_config_path`, `disconnect`), flight (`arm`, `disarm`, `takeoff`, `land`, `goto`,
 `set_velocity`, `set_yaw`, `wait`), telemetry (`get_position`, `get_attitude`,
 `get_battery`, `get_flight_mode`, `get_telemetry`, `is_armed`), setup (`motor_test`,
@@ -25,7 +25,7 @@ single-shot imperative commands.
 
 A mission concept does exist, but in the `eco` repo, not here:
 `eco/drone/common/mission_runner.py:30-48` defines a `MissionRunner` that treats a mission
-as an **opaque flat dict** persisted to `/var/lib/astral/mission_active.json`, with its own
+as an **opaque flat dict** persisted to `/var/lib/coybot/mission_active.json`, with its own
 docstring admitting `"ROS2/MAVROS integration should be implemented inside start_mission()
 and abort_mission()"` — it's a stub, not a working planner, and has no branching/tree
 structure.
@@ -52,7 +52,7 @@ risks creating a third, competing mission concept.
 
 `pytest --collect-only` from `sdk/` in the ambient Python 3.9 collected the 7 import tests
 fine but errored on `test_e2e_sitl.py` with `ModuleNotFoundError: No module named
-'astral_sdk'` — the package isn't installed in that interpreter. Not a code bug, just means
+'coybot_sdk'` — the package isn't installed in that interpreter. Not a code bug, just means
 CI/local runs need `pip install -e .` first; worth confirming that's documented for
 contributors if it isn't already.
 
@@ -61,14 +61,14 @@ There is no coverage anywhere (SDK or eco) of the benchmark scoring math — see
 
 ## Licensing
 
-- `sdk/LICENSE` (Apache 2.0, "Copyright 2026 Astral AI, Inc.") and `sdk/NOTICE`
-  ("astral-sdk" / same copyright line) are both clean, standard, unmodified text.
+- `sdk/LICENSE` (Apache 2.0, "Copyright 2026 Coybot AI, Inc.") and `sdk/NOTICE`
+  ("coybot-sdk" / same copyright line) are both clean, standard, unmodified text.
 - `sdk/pyproject.toml` declares `license = "Apache-2.0"` with correct SPDX ID.
 - `Package.swift` has no license field (SwiftPM manifests don't support one) — licensing is
   conveyed via `sdk/LICENSE` only, which is fine.
-- `ros2_ws/src/astral_drone/package.xml:8` and `setup.py:24` both declare Apache-2.0.
+- `ros2_ws/src/coybot_drone/package.xml:8` and `setup.py:24` both declare Apache-2.0.
 - No vendored/copied GPL or AGPL source found anywhere. The MAVLink bridge
-  (`ros2_ws/src/astral_drone/astral_drone/mavlink_bridge.py:78,83`) talks to the flight
+  (`ros2_ws/src/coybot_drone/coybot_drone/mavlink_bridge.py:78,83`) talks to the flight
   controller as a **separate process** over the MAVLink wire protocol via `pymavlink` — not
   linked code in the copyleft sense for that boundary. ROS 2 dependencies declared in
   `package.xml` (`isaac_ros_visual_slam`, `nav2_bringup`, etc.) are external `<depend>`

@@ -32,7 +32,7 @@
 
 1. Run focused speech/reducer suites and `scripts/test-swift-sdk.sh`.
 2. Build the physical-device target.
-3. Install and launch `us.astral.phrover` on the paired iPhone.
+3. Install and launch `bot.coy.phrover` on the paired iPhone.
 4. Verify immediate Listening card, partial update when available, final Recognized/Working transition, and silent-attempt failure.
 5. Pull the runtime log if device behavior differs.
 

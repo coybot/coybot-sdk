@@ -13,7 +13,7 @@ Usage:
 
 import argparse
 
-from astral_sdk.motor_test import run_motor_test
+from coybot_sdk.motor_test import run_motor_test
 
 
 def main():

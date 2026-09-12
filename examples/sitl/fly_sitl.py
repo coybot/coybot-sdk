@@ -8,7 +8,7 @@ Prereq: SITL running and listening on tcp:127.0.0.1:5760, e.g.
 
 Then in another shell:
 
-    export ASTRAL_SDK_SERIAL_PORT=tcp:127.0.0.1:5760
+    export COYBOT_SDK_SERIAL_PORT=tcp:127.0.0.1:5760
     python fly_sitl.py
 
 The SDK calls below are identical to what you'd run on real hardware.
@@ -18,14 +18,14 @@ The only thing that changes is the connection URL.
 import os
 import time
 
-import astral_sdk as drone
+import coybot_sdk as drone
 
 
 def main():
-    if "ASTRAL_SDK_SERIAL_PORT" not in os.environ:
+    if "COYBOT_SDK_SERIAL_PORT" not in os.environ:
         print(
-            "Set ASTRAL_SDK_SERIAL_PORT to your SITL endpoint, e.g. "
-            "export ASTRAL_SDK_SERIAL_PORT=tcp:127.0.0.1:5760"
+            "Set COYBOT_SDK_SERIAL_PORT to your SITL endpoint, e.g. "
+            "export COYBOT_SDK_SERIAL_PORT=tcp:127.0.0.1:5760"
         )
         return
 

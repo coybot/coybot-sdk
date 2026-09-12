@@ -18,7 +18,7 @@ public final class NetworkMonitor: Sendable {
             self._isOnline = path.status == .satisfied
             self.lock.unlock()
         }
-        monitor.start(queue: DispatchQueue(label: "astral-sdk.NetworkMonitor"))
+        monitor.start(queue: DispatchQueue(label: "coybot-sdk.NetworkMonitor"))
     }
 
     public var isOnline: Bool {

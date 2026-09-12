@@ -1,8 +1,8 @@
-# astral-sdk
+# coybot-sdk
 
 **Drones that finish the mission when the network doesn't.**
 
-`astral-sdk` is the open interface for the [Astral](https://astral.us) stack — a Python
+`coybot-sdk` is the open interface for the [Coybot](https://coy.bot) stack — a Python
 package for ArduPilot-based drones, and a set of Swift packages for Phrover, the
 phone-brained WAVE ROVER. Everything that runs on the drone or the phone is here,
 including the on-device reasoning loop; only the cloud backend is closed (see
@@ -13,31 +13,31 @@ including the on-device reasoning loop; only the cloud backend is closed (see
 ### Install
 
 ```bash
-uv add astral-sdk
+uv add coybot-sdk
 ```
 
 or
 
 ```bash
-pip install astral-sdk
+pip install coybot-sdk
 ```
 
 Camera support is optional. Pick the drivers you need:
 
 ```bash
-pip install astral-sdk[camera-oak]        # Luxonis OAK-D Lite
-pip install astral-sdk[camera-realsense]  # Intel RealSense D435i
-pip install astral-sdk[all]               # both
+pip install coybot-sdk[camera-oak]        # Luxonis OAK-D Lite
+pip install coybot-sdk[camera-realsense]  # Intel RealSense D435i
+pip install coybot-sdk[all]               # both
 ```
 
 ### Quickstart
 
-Copy `src/astral_sdk/config_example.yaml` to `config.yaml` in your working
+Copy `src/coybot_sdk/config_example.yaml` to `config.yaml` in your working
 directory and edit `serial_port` to match your flight controller.
 
 ```python
 import time
-import astral_sdk as drone
+import coybot_sdk as drone
 
 # Arm, take off to 2 meters AGL, hover, and land.
 if drone.takeoff(2.0):
@@ -49,8 +49,8 @@ drone.disconnect()
 
 All movement commands are clamped to safe limits (see
 `MIN_ALTITUDE`, `MAX_ALTITUDE`, `MAX_VELOCITY`, `MAX_YAW_RATE` in
-`astral_sdk.drone`). Failsafes can be installed onto the flight controller
-once with `astral_sdk.configure_failsafes()`.
+`coybot_sdk.drone`). Failsafes can be installed onto the flight controller
+once with `coybot_sdk.configure_failsafes()`.
 
 See the [`examples/`](./examples) directory for runnable scripts:
 
@@ -87,14 +87,14 @@ ESP32 over WiFi. Three library products, layered so you only pull in what you ne
 Add the package in Xcode (File → Add Package Dependencies) or in `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/astral-us/astral-sdk", from: "0.1.0")
+.package(url: "https://github.com/coybot/coybot-sdk", from: "0.1.0")
 ```
 
 then depend on the products you need:
 
 ```swift
 .target(name: "YourApp", dependencies: [
-    .product(name: "PhroverKit", package: "astral-sdk"),
+    .product(name: "PhroverKit", package: "coybot-sdk"),
 ])
 ```
 
@@ -128,8 +128,8 @@ try await control.stop()
   velocity and position control, telemetry, parameters, and failsafe setup.
 - **Camera drivers** — common abstraction (`Camera`, `CameraFrame`) plus
   implementations for OAK-D Lite (DepthAI) and Intel RealSense D435i.
-- **CLI utilities** — `astral-arm-disarm` and `astral-motor-test`.
-- **ROS 2 bridge** — an optional `astral_drone` package under
+- **CLI utilities** — `coybot-arm-disarm` and `coybot-motor-test`.
+- **ROS 2 bridge** — an optional `coybot_drone` package under
   `ros2_ws/` that exposes the camera and MAVLink as ROS 2 topics for use
   with Isaac ROS Visual SLAM and Nav2.
 - **Swift SDK** — `RoverNav`/`PhroverKit`/`PhroverCloud`, the full on-device brain
@@ -148,11 +148,11 @@ reasoning/planning loop — that's the whole point of this repo. What's intentio
   drives/navigates/talks fully on-device without any cloud step.
 
 If you need fleet management, video pipelines, or hosted dialog escalation, talk to us
-at [astral.us](https://astral.us).
+at [coy.bot](https://coy.bot).
 
 ## Documentation
 
-Full docs live at [astral.us/docs](https://astral.us/docs).
+Full docs live at [coy.bot/docs](https://coy.bot/docs).
 
 ## License
 

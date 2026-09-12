@@ -7,10 +7,10 @@ and ESC connections. Use this BEFORE flying a new build.
 
 SAFETY: Always remove props before running this.
 
-See https://astral.us/docs for details.
+See https://coy.bot/docs for details.
 
 Usage:
-    python -m astral_sdk.motor_test [--throttle 20] [--duration 2]
+    python -m coybot_sdk.motor_test [--throttle 20] [--duration 2]
 """
 
 import argparse

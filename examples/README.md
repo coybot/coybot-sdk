@@ -1,24 +1,24 @@
 # Examples
 
-Runnable examples that demonstrate `astral-sdk`.
+Runnable examples that demonstrate `coybot-sdk`.
 
 ## Setup
 
 ```bash
-uv add astral-sdk
+uv add coybot-sdk
 # or:
-pip install astral-sdk
+pip install coybot-sdk
 ```
 
 For the camera example, install one of the camera extras:
 
 ```bash
-pip install astral-sdk[camera-oak]        # OAK-D Lite
-pip install astral-sdk[camera-realsense]  # Intel RealSense D435i
-pip install astral-sdk[all]               # Both
+pip install coybot-sdk[camera-oak]        # OAK-D Lite
+pip install coybot-sdk[camera-realsense]  # Intel RealSense D435i
+pip install coybot-sdk[all]               # Both
 ```
 
-Copy `src/astral_sdk/config_example.yaml` to `config.yaml` in the directory
+Copy `src/coybot_sdk/config_example.yaml` to `config.yaml` in the directory
 you run the example from, and edit `serial_port` to match your flight
 controller (a stable `/dev/serial/by-id/...` path is recommended over
 `/dev/ttyACM*`).

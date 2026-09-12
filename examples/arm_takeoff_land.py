@@ -13,7 +13,7 @@ takeoff site.
 
 import time
 
-import astral_sdk as drone
+import coybot_sdk as drone
 
 
 def main():

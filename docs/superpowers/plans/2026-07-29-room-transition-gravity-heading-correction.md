@@ -253,7 +253,7 @@ Confirm especially:
 ### Task 6: Physical Forward/Reverse Acceptance
 
 **Device:** `C40C8EA8-E545-5B47-ADEA-CD8118AE844C`  
-**Bundle:** `us.astral.phrover`
+**Bundle:** `bot.coy.phrover`
 
 - [ ] **Step 1: Build, sign, install, and launch**
 
@@ -277,7 +277,7 @@ Expected: the known connection is selected in reverse and crossing confirmation 
 DEVICE_ID="C40C8EA8-E545-5B47-ADEA-CD8118AE844C"
 LOG_PATH="${TMPDIR:-/tmp}/phrover-runtime-gravity-heading-acceptance.log"
 
-xcrun devicectl device copy from   --device "$DEVICE_ID"   --domain-type appDataContainer   --domain-identifier us.astral.phrover   --source Documents/phrover-runtime.log   --destination "$LOG_PATH"
+xcrun devicectl device copy from   --device "$DEVICE_ID"   --domain-type appDataContainer   --domain-identifier bot.coy.phrover   --source Documents/phrover-runtime.log   --destination "$LOG_PATH"
 
 rg "relative_heading|nav_scan|frontier_|doorway_candidate|room_transition|doorway_crossed" "$LOG_PATH"
 ```

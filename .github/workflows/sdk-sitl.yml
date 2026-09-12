@@ -1,6 +1,6 @@
 name: sdk-sitl
 
-# Public per-frame regression gate: exercises astral_sdk against real ArduPilot SITL
+# Public per-frame regression gate: exercises coybot_sdk against real ArduPilot SITL
 # (Copter/Rover/Plane) with no hardware. See tests/test_e2e_sitl.py and
 # examples/sitl/README.md. Building ArduPilot from source is the slow part here (tens of
 # minutes on a cold cache) — this is the honest cost of testing against real firmware

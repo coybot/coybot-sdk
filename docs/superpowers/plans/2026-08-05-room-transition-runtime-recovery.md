@@ -213,7 +213,7 @@ Confirm current-pose authority, no stale goal dispatch, exact-command depth auth
 
 - [ ] **Step 3: Deploy to the physical iPhone**
 
-Build/install through the existing signed-device workflow and launch `us.astral.phrover` on device `C40C8EA8-E545-5B47-ADEA-CD8118AE844C`.
+Build/install through the existing signed-device workflow and launch `bot.coy.phrover` on device `C40C8EA8-E545-5B47-ADEA-CD8118AE844C`.
 
 - [ ] **Step 4: Run both acceptance paths**
 
@@ -225,7 +225,7 @@ Build/install through the existing signed-device workflow and launch `us.astral.
 ```bash
 DEVICE_ID="C40C8EA8-E545-5B47-ADEA-CD8118AE844C"
 LOG_PATH="${TMPDIR:-/tmp}/phrover-runtime-recovery-acceptance.log"
-xcrun devicectl device copy from   --device "$DEVICE_ID"   --domain-type appDataContainer   --domain-identifier us.astral.phrover   --source Documents/phrover-runtime.log   --destination "$LOG_PATH"
+xcrun devicectl device copy from   --device "$DEVICE_ID"   --domain-type appDataContainer   --domain-identifier bot.coy.phrover   --source Documents/phrover-runtime.log   --destination "$LOG_PATH"
 rg "speech_capture_completed|voice_command_received|doorway_frontier_admitted|room_transition_(started|completed|failed|exhausted)|nav_scan_depth|nav_safety_stop" "$LOG_PATH"
 ```
 

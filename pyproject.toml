@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "astral-sdk"
+name = "coybot-sdk"
 version = "0.1.0"
 description = "Open Python SDK for ArduPilot drones: MAVLink primitives, camera drivers, and examples."
 readme = "README.md"
@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 authors = [
-    { name = "Astral AI, Inc.", email = "team@astral.us" },
+    { name = "Coybot AI, Inc.", email = "team@coy.bot" },
 ]
 keywords = ["drone", "mavlink", "ardupilot", "robotics", "uav"]
 classifiers = [
@@ -45,21 +45,21 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://astral.us"
-Repository = "https://github.com/astral-us/astral-sdk"
-Documentation = "https://astral.us/docs"
-Issues = "https://github.com/astral-us/astral-sdk/issues"
+Homepage = "https://coy.bot"
+Repository = "https://github.com/coybot/coybot-sdk"
+Documentation = "https://coy.bot/docs"
+Issues = "https://github.com/coybot/coybot-sdk/issues"
 
 [project.scripts]
-astral-arm-disarm = "astral_sdk.arm_disarm:main"
-astral-motor-test = "astral_sdk.motor_test:main"
+coybot-arm-disarm = "coybot_sdk.arm_disarm:main"
+coybot-motor-test = "coybot_sdk.motor_test:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/astral_sdk"]
+packages = ["src/coybot_sdk"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "src/astral_sdk",
+    "src/coybot_sdk",
     "examples",
     "tests",
     "README.md",

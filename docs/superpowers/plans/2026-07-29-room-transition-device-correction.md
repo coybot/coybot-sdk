@@ -213,7 +213,7 @@ Run standards and spec review against `docs/superpowers/specs/2026-07-29-room-tr
 
 - [ ] **Step 3: Deploy to the physical iPhone**
 
-Build and install the app on device `C40C8EA8-E545-5B47-ADEA-CD8118AE844C` using the existing signed-device workflow, then launch bundle `us.astral.phrover`. Do not assume simulator success proves the sensor convention.
+Build and install the app on device `C40C8EA8-E545-5B47-ADEA-CD8118AE844C` using the existing signed-device workflow, then launch bundle `bot.coy.phrover`. Do not assume simulator success proves the sensor convention.
 
 - [ ] **Step 4: Exercise doorway traversal**
 
@@ -235,7 +235,7 @@ LOG_PATH="${TMPDIR:-/tmp}/phrover-runtime-room-transition-correction.log"
 xcrun devicectl device copy from \
   --device "$DEVICE_ID" \
   --domain-type appDataContainer \
-  --domain-identifier us.astral.phrover \
+  --domain-identifier bot.coy.phrover \
   --source Documents/phrover-runtime.log \
   --destination "$LOG_PATH"
 

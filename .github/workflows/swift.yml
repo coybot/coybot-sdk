@@ -32,7 +32,7 @@ jobs:
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
       - name: Build all three products + run RoverNavTests
         run: |
-          xcodebuild test -scheme astral-sdk-Package \
+          xcodebuild test -scheme coybot-sdk-Package \
             -destination "id=${{ steps.sim.outputs.udid }}" \
             -only-testing:RoverNavTests
       - name: Build the PhroverOperator example app

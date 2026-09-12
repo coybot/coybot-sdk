@@ -1,10 +1,10 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>astral_drone</name>
+  <name>coybot_drone</name>
   <version>0.1.0</version>
-  <description>ROS 2 integration for astral-sdk: camera bridge, MAVLink bridge, Nav2 stack.</description>
-  <maintainer email="team@astral.us">Astral AI</maintainer>
+  <description>ROS 2 integration for coybot-sdk: camera bridge, MAVLink bridge, Nav2 stack.</description>
+  <maintainer email="team@coy.bot">Coybot AI</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_python</buildtool_depend>

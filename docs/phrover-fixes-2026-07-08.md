@@ -117,7 +117,7 @@ Key log findings:
     deliberate scan for the requested refrigerator.
 - The July 9 follow-up pull could not retrieve a fresh runtime log:
   - `xcrun devicectl list devices` showed `iPhone ... unavailable`.
-  - `xcrun devicectl device copy from ... --domain-identifier us.astral.phrover` failed
+  - `xcrun devicectl device copy from ... --domain-identifier bot.coy.phrover` failed
     with CoreDevice error `1011`, `unable to locate a device matching the requested device identifier`.
   - Code review of `MissionAgent` showed the same likely failure mode: unresolved visual
     targets rotated once, then the mission asked the brain again. If that second brain result
@@ -605,7 +605,7 @@ flowchart TD
         DriveUI["DriveView / NavigateView"]
     end
 
-    subgraph SDK["Astral SDK"]
+    subgraph SDK["Coybot SDK"]
         direction TB
         SpeechIn["SpeechIn"]
         SpeechOut["SpeechOut"]
@@ -710,7 +710,7 @@ flowchart TD
 Only Foundation Models/SystemLanguageModel is an Apple Intelligence component. Speech,
 AVFoundation, ARKit, Vision, and Core ML are Apple-provided iOS frameworks. The classes
 that call those frameworks, including `SpeechIn`, `ARSessionManager`, and `Detector`, are
-implemented in the Astral SDK.
+implemented in the Coybot SDK.
 
 ### Voice Target Navigation Sequence
 

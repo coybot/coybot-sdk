@@ -14,7 +14,7 @@ public final class RoverTelemetryPublisher {
     private var task: Task<Void, Never>?
 
     public init(ar: ARSessionManager, nav: NavigationController, mqtt: MQTTService,
-                idKey: String = "us.astral.phrover.id") {
+                idKey: String = "bot.coy.phrover.id") {
         self.ar = ar
         self.nav = nav
         self.mqtt = mqtt

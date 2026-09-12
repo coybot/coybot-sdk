@@ -13,12 +13,12 @@ import PhroverCloud
 /// Requires the local bridge running (it fakes only the API Gateway authorizer, and only
 /// on 127.0.0.1):
 ///
-///   cd eco && AWS_PROFILE=astral python3 -m e2e.harness.live_rover_act_bridge
+///   cd eco && AWS_PROFILE=coybot python3 -m e2e.harness.live_rover_act_bridge
 ///
 /// then run with the bridge URL injected (or just use eco/e2e/run_live_mission.sh):
 ///
 ///   TEST_RUNNER_LIVE_ROVER_ACT_URL=http://127.0.0.1:<port> xcodebuild test \
-///     -scheme astral-sdk-Package -destination 'platform=iOS Simulator,name=iPhone 17' \
+///     -scheme coybot-sdk-Package -destination 'platform=iOS Simulator,name=iPhone 17' \
 ///     -only-testing:PhroverKitLiveProbes/CloudBrainLiveMissionTests
 ///
 /// Skips (not fails) when the env var is absent, so it can never leak into the fast gate.

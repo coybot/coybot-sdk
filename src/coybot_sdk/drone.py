@@ -5,7 +5,7 @@ This module wraps ``pymavlink`` with safety-clamped helpers for arming,
 takeoff, landing, velocity control, and telemetry. It is designed to be
 the foundation that higher-level autonomy stacks build on.
 
-See https://astral.us/docs for the full reference.
+See https://coy.bot/docs for the full reference.
 
 SAFETY: All movement commands are clamped to the limits defined below.
 These limits are deliberately conservative; override them only if you
@@ -22,7 +22,7 @@ from pathlib import Path
 from pymavlink import mavutil
 
 
-_logger = logging.getLogger("astral_sdk.drone")
+_logger = logging.getLogger("coybot_sdk.drone")
 _logger.setLevel(logging.INFO)
 if not _logger.handlers:
     _stderr_handler = logging.StreamHandler(sys.stderr)
@@ -63,10 +63,10 @@ _mavlink_lock = threading.RLock()  # Lock for serial port access (pymavlink isn'
 
 
 # Default config path: alongside the calling script. Override with set_config_path()
-# or by setting the ASTRAL_SDK_CONFIG environment variable.
+# or by setting the COYBOT_SDK_CONFIG environment variable.
 import os as _os
 
-DRONE_DIR = Path(_os.environ.get("ASTRAL_SDK_CONFIG_DIR", Path.cwd())).absolute()
+DRONE_DIR = Path(_os.environ.get("COYBOT_SDK_CONFIG_DIR", Path.cwd())).absolute()
 
 
 def set_config_path(path):
@@ -140,8 +140,8 @@ def _connect():
             baud = config.get("baud_rate", baud)
 
         # Allow environment overrides for the simple case
-        port = _os.environ.get("ASTRAL_SDK_SERIAL_PORT", port)
-        baud = int(_os.environ.get("ASTRAL_SDK_BAUD_RATE", baud))
+        port = _os.environ.get("COYBOT_SDK_SERIAL_PORT", port)
+        baud = int(_os.environ.get("COYBOT_SDK_BAUD_RATE", baud))
 
         # Network URLs (SITL, MAVProxy, etc.) bypass the serial-device check.
         is_network = port.startswith(("tcp:", "tcpin:", "udp:", "udpin:", "udpout:"))
@@ -150,7 +150,7 @@ def _connect():
             raise ConnectionError(
                 f"Flight controller not found at {port}. "
                 f"Check USB connection and verify the serial port in config.yaml. "
-                f"For SITL/simulation, set ASTRAL_SDK_SERIAL_PORT to a MAVLink URL "
+                f"For SITL/simulation, set COYBOT_SDK_SERIAL_PORT to a MAVLink URL "
                 f"(e.g. tcp:127.0.0.1:5760)."
             )
 
@@ -876,7 +876,7 @@ def _get_camera():
     global _camera
     if _camera is None:
         try:
-            from astral_sdk.camera import get_camera, list_available_cameras
+            from coybot_sdk.camera import get_camera, list_available_cameras
 
             available = list_available_cameras()
             if available:

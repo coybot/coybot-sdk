@@ -20,9 +20,9 @@ import PackageDescription
 // doesn't exist on macOS, so the package as a whole (and its full test suite, including
 // RoverNavTests) needs an iOS destination:
 //
-//   xcodebuild test -scheme astral-sdk-Package -destination 'platform=iOS Simulator,name=...'
+//   xcodebuild test -scheme coybot-sdk-Package -destination 'platform=iOS Simulator,name=...'
 let package = Package(
-    name: "astral-sdk",
+    name: "coybot-sdk",
     platforms: [.iOS("26.0"), .macOS(.v14)],
     products: [
         .library(name: "RoverNav", targets: ["RoverNav"]),

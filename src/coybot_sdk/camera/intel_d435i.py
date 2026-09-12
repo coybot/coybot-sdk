@@ -7,9 +7,9 @@ The D435i has:
 - IMU (accelerometer + gyroscope)
 - USB 3.0 connection
 
-Install: ``pip install astral-sdk[camera-realsense]``
+Install: ``pip install coybot-sdk[camera-realsense]``
 
-See https://astral.us/docs for details.
+See https://coy.bot/docs for details.
 """
 
 from typing import Optional
@@ -21,10 +21,10 @@ try:
 except ImportError:
     raise ImportError(
         "pyrealsense2 library required. "
-        "Install with: pip install astral-sdk[camera-realsense]"
+        "Install with: pip install coybot-sdk[camera-realsense]"
     )
 
-from astral_sdk.camera.base import Camera, CameraFrame
+from coybot_sdk.camera.base import Camera, CameraFrame
 
 
 class RealSenseCamera(Camera):

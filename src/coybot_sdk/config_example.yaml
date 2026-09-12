@@ -1,8 +1,8 @@
-# astral-sdk configuration template
+# coybot-sdk configuration template
 # Copy this to config.yaml and edit for your setup.
-# By default, astral-sdk loads config.yaml from the current working directory.
+# By default, coybot-sdk loads config.yaml from the current working directory.
 # Override the directory with set_config_path() or the
-# ASTRAL_SDK_CONFIG_DIR environment variable.
+# COYBOT_SDK_CONFIG_DIR environment variable.
 
 # Flight Controller Connection
 # Tip: prefer a stable /dev/serial/by-id/... path over /dev/ttyACM*

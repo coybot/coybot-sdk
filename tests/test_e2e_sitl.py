@@ -1,9 +1,9 @@
-"""Public, hardware-free e2e self-test: exercises astral_sdk against ArduPilot SITL for
+"""Public, hardware-free e2e self-test: exercises coybot_sdk against ArduPilot SITL for
 each of the three vehicle frames the SDK can drive (Copter, Rover, Plane).
 
 Requires ArduPilot's `sim_vehicle.py` on PATH (see examples/sitl/README.md for setup —
 the ArduPilot dev docs' standard install puts Tools/autotest on PATH). When it's not
-found, every test here skips cleanly, so `pip install astral-sdk && pytest` still passes
+found, every test here skips cleanly, so `pip install coybot-sdk && pytest` still passes
 with no SITL installed — this file is not part of the always-on test_imports.py smoke tier.
 
 Scope: this proves the SDK's arm / velocity-command / telemetry / disarm contract holds
@@ -29,7 +29,7 @@ import time
 
 import pytest
 
-import astral_sdk as drone
+import coybot_sdk as drone
 
 SITL_BIN = shutil.which("sim_vehicle.py")
 pytestmark = pytest.mark.skipif(
@@ -98,7 +98,7 @@ def _arm_with_retry(timeout: float) -> bool:
 
 def test_arm_move_telemetry_disarm(sitl_port):
     frame, port = sitl_port
-    os.environ["ASTRAL_SDK_SERIAL_PORT"] = f"tcp:127.0.0.1:{port}"
+    os.environ["COYBOT_SDK_SERIAL_PORT"] = f"tcp:127.0.0.1:{port}"
     try:
         assert _arm_with_retry(_ARM_RETRY_TIMEOUT_S), f"{frame}: arm() failed"
         assert drone.is_armed(), f"{frame}: not armed after arm()"
@@ -113,4 +113,4 @@ def test_arm_move_telemetry_disarm(sitl_port):
         assert drone.disarm(), f"{frame}: disarm() failed"
         assert not drone.is_armed(), f"{frame}: still armed after disarm()"
     finally:
-        del os.environ["ASTRAL_SDK_SERIAL_PORT"]
+        del os.environ["COYBOT_SDK_SERIAL_PORT"]

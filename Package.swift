@@ -40,7 +40,10 @@ let package = Package(
             name: "PhroverKit",
             dependencies: ["RoverNav"],
             path: "swift/Sources/PhroverKit",
-            resources: [.copy("Resources/RoverYOLO.mlpackage")]
+            // .process (not .copy) so the CoreML compiler turns the .mlpackage into a
+            // compiled RoverYOLO.mlmodelc in the bundle. Detector.modelResourceURL
+            // prefers .mlmodelc, and copying verbatim meant that never existed.
+            resources: [.process("Resources/RoverYOLO.mlpackage")]
         ),
         .testTarget(name: "PhroverKitTests", dependencies: ["PhroverKit"], path: "swift/Tests/PhroverKitTests"),
 

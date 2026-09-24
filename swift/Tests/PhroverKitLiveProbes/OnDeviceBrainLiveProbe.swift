@@ -89,6 +89,10 @@ final class OnDeviceBrainLiveProbe: XCTestCase {
                 case .imagePoint: if chairVisible() { pose = Self.chair } // no real depth sensor here
                 case .visualQuery: if chairVisible() { pose = Self.chair }
                 }
+            case .follow(let target):
+                // Following is a mode with no discrete outcome to simulate here — this
+                // probe only walks a pose forward per decision.
+                print("     (follow \(target) — no moving target in this static probe)")
             case .lookAround, .say:
                 break // no state change
             case .claimRoom(let roomId):

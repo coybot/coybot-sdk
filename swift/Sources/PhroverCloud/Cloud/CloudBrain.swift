@@ -93,6 +93,7 @@ private struct ActRequest: Encodable {
     let lastAnswerWasInconclusive: Bool
     let teamContext: WireTeamContext?
     let batteryPercent: Double?
+    let followState: String?
     let recentActions: [String]
 
     init(_ context: MissionContext) {
@@ -116,6 +117,7 @@ private struct ActRequest: Encodable {
                           widthMeters: $0.widthMeters, status: $0.status.rawValue)
         }
         plan = context.plan
+        followState = context.followState
         lastAnswerWasInconclusive = context.lastAnswerWasInconclusive
         teamContext = context.teamContext.map { tc in
             WireTeamContext(
@@ -143,7 +145,7 @@ private struct ActRequest: Encodable {
 /// JSON boundary to a non-Swift backend.
 private struct ActResponse: Decodable {
     let action: String
-    let targetKind: String?   // "imagePoint" | "worldPoint" — only when action == "navigate"
+    let targetKind: String?   // "imagePoint" | "worldPoint" | "visualQuery" — navigate/follow
     let x: Double?
     let y: Double?
     let angle: Double?        // radians — only when action == "lookAround"
@@ -158,6 +160,21 @@ private struct ActResponse: Decodable {
             switch targetKind {
             case "worldPoint": return .navigate(.worldPoint(Vec2(x, y)))
             default: return .navigate(.imagePoint(CGPoint(x: x, y: y)))
+            }
+        case "follow":
+            // A follow may be named ("the person in the hat") as well as pointed at: a
+            // moving target is often easier to describe than to pin to a pixel that will
+            // be a round-trip stale by the time it lands.
+            if targetKind == "visualQuery", let text, !text.isEmpty {
+                return .follow(.visualQuery(text))
+            }
+            guard let x, let y else {
+                guard let text, !text.isEmpty else { return nil }
+                return .follow(.visualQuery(text))
+            }
+            switch targetKind {
+            case "worldPoint": return .follow(.worldPoint(Vec2(x, y)))
+            default: return .follow(.imagePoint(CGPoint(x: x, y: y)))
             }
         case "explore":
             guard let candidateId, !candidateId.isEmpty else { return nil }

@@ -140,6 +140,12 @@ public enum RoverDecision: Equatable, Sendable {
     /// Turn to look for something not currently in view. Radians, CCW positive; a brain can
     /// ask for more than one look (each up to `2 * .pi`) across successive ticks.
     case lookAround(angle: Double)
+    /// Keep station on something that is moving — a person walking, a cart being towed.
+    /// Unlike `navigate`, this is a *mode*: it starts and keeps running until the target is
+    /// lost, the time budget runs out, or a later decision stops it. The brain is still
+    /// asked for a decision periodically while it runs, so it can narrate, ask, or break
+    /// off; repeating `.follow` for the same target is a no-op rather than a restart.
+    case follow(NavigationTarget)
     /// Speak a clarifying question, then wait for a reply before the next decision.
     case ask(String)
     /// Speak, with no expectation of a reply.
@@ -238,6 +244,11 @@ public struct MissionContext: Sendable {
     /// claimable rooms and the team's current knowledge of who has claimed what and
     /// who's still responding. `nil` for a solo mission.
     public var teamContext: TeamContext?
+    /// What follow mode is doing right now ("following", "searching", …), or `nil` when
+    /// nothing is being followed. A follow runs between ticks rather than inside one, so
+    /// without this the brain has no way to tell a running follow from one that already
+    /// ended.
+    public var followState: String?
     /// Human-readable "action → outcome" lines, oldest first, for the last few ticks
     /// (see `MissionAgent`'s ring buffer) — lets a brain notice it's repeating itself or
     /// failed to follow through on a narrated intention, which nothing else in the
@@ -256,6 +267,7 @@ public struct MissionContext: Sendable {
                 lastAnswerWasInconclusive: Bool = false,
                 batteryPercent: Double? = nil,
                 teamContext: TeamContext? = nil,
+                followState: String? = nil,
                 recentActions: [String] = []) {
         self.utterance = utterance
         self.frameJPEG = frameJPEG
@@ -268,6 +280,7 @@ public struct MissionContext: Sendable {
         self.lastAnswerWasInconclusive = lastAnswerWasInconclusive
         self.batteryPercent = batteryPercent
         self.teamContext = teamContext
+        self.followState = followState
         self.recentActions = recentActions
     }
 }

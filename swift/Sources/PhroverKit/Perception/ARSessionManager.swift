@@ -125,9 +125,23 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         CGPoint(x: (1 - p.y) * imageSize.width, y: (1 - p.x) * imageSize.height)
     }
 
+    /// Fraction of the depth map's smaller side sampled either side of the point. Small
+    /// enough to stay on the object, large enough to span the gaps a single pixel falls
+    /// through (see `sampleDepth`).
+    static let depthSampleWindowFraction = 0.03
+
     /// Samples the LiDAR depth map (meters) at the raw-sensor-space point corresponding to
     /// a Vision-normalized point. The depth map is lower-res than the color camera but
     /// aligned to the same field of view, so the fractional position carries over directly.
+    ///
+    /// Reads a small window and takes its 25th percentile rather than the single pixel
+    /// under the point. A detection's centre is not guaranteed to land on the object: on a
+    /// standing person it routinely falls between torso and arm and reads the wall metres
+    /// behind them, which puts the unprojected world point well past the target. Preferring
+    /// the nearer quartile of a local window biases toward the surface facing the camera —
+    /// the same reasoning as `forwardClearance(fromDepthMap:)`'s low percentile, over a
+    /// local window instead of the whole driving corridor. Erring near also errs safe: a
+    /// goal short of the object is a stop, one behind it is a collision.
     static func sampleDepth(_ depthMap: CVPixelBuffer, atVisionNormalizedPoint p: CGPoint, imageSize: CGSize) -> Float? {
         guard imageSize.width > 0, imageSize.height > 0 else { return nil }
         let sensor = sensorPixel(forVisionNormalizedPoint: p, imageSize: imageSize)
@@ -137,11 +151,23 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         let dw = CVPixelBufferGetWidth(depthMap), dh = CVPixelBufferGetHeight(depthMap)
         guard let base = CVPixelBufferGetBaseAddress(depthMap), dw > 0, dh > 0 else { return nil }
         let stride = CVPixelBufferGetBytesPerRow(depthMap) / MemoryLayout<Float32>.size
+        let ptr = base.assumingMemoryBound(to: Float32.self)
         let dx = min(dw - 1, max(0, Int((sensor.x / imageSize.width) * Double(dw))))
         let dy = min(dh - 1, max(0, Int((sensor.y / imageSize.height) * Double(dh))))
-        let depth = base.assumingMemoryBound(to: Float32.self)[dy * stride + dx]
-        guard depth > 0.05, depth.isFinite else { return nil }
-        return depth
+
+        let half = max(1, Int(Double(min(dw, dh)) * depthSampleWindowFraction))
+        var samples: [Float] = []
+        samples.reserveCapacity((2 * half + 1) * (2 * half + 1))
+        for y in max(0, dy - half)...min(dh - 1, dy + half) {
+            for x in max(0, dx - half)...min(dw - 1, dx + half) {
+                let d = ptr[y * stride + x]
+                if d > 0.05 && d.isFinite { samples.append(d) }
+            }
+        }
+        guard !samples.isEmpty else { return nil }
+        samples.sort()
+        let index = min(samples.count - 1, max(0, Int(Double(samples.count - 1) * 0.25)))
+        return samples[index]
     }
 
     /// Back-projects a raw-sensor-space point at a known depth through the camera

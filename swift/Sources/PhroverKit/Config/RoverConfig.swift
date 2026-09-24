@@ -42,6 +42,19 @@ public enum RoverConfig {
     /// Only relax the normal obstacle threshold when the projected target is nearby.
     public static let visualTargetApproachDistance = 1.20
 
+    // MARK: - Follow mode
+    /// A followed target *is* the forward obstacle, so the clearance stop is relaxed only
+    /// while the cone reading agrees with the target's own range to within this margin.
+    /// Anything else entering the cone still stops the rover.
+    public static let followClearanceMatchTolerance = 0.30
+    /// Give up if nothing matching the request is seen within this window.
+    public static let followAcquireTimeout: TimeInterval = 8
+    /// Hard budget on one follow leg. Following is open-ended by nature; without a ceiling
+    /// it runs until the battery decides (see adr/0011-time-budget-rule.md).
+    public static let maxFollowDuration: TimeInterval = 300
+    /// Scan pulses attempted toward the last known bearing before declaring the target lost.
+    public static let followSearchPulses = 12
+
     // MARK: - Safety
     /// If no successful command round-trip within this window, ObstacleGuard forces a stop.
     /// Keep this above brief planning/logging gaps; individual rover sends still retry and fail fast.

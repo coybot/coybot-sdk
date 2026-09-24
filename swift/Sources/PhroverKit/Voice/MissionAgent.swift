@@ -146,6 +146,19 @@ public protocol RoverTeamRadio: AnyObject {
     func broadcastClaim(_ roomId: String)
 }
 
+/// Follow-mode surface `MissionAgent` drives — optional (nil if the app wires no
+/// follower). A separate protocol from `RoverMotion` because following is not a trip: it
+/// starts, runs between ticks, and ends on its own terms, so it cannot be expressed through
+/// a `navigate`-shaped call that the mission loop waits on.
+@MainActor
+public protocol RoverFollowing: AnyObject {
+    /// What is being followed right now, or `nil` if nothing is.
+    var followingSpec: TargetSpec? { get }
+    var followState: FollowController.State { get }
+    func follow(_ spec: TargetSpec, seed: Vec2?)
+    func stopFollowing()
+}
+
 /// Default `RoverVoice`: on-device TTS/STT.
 @MainActor
 public final class SpeechRoverVoice: RoverVoice {
@@ -202,6 +215,7 @@ public final class MissionAgent {
     private let motion: RoverMotion
     private let perception: RoverPerception
     private let voice: RoverVoice
+    private let follower: RoverFollowing?
     private let battery: RoverBattery?
     private let teamRadio: RoverTeamRadio?
     private let askTimeout: TimeInterval
@@ -236,6 +250,11 @@ public final class MissionAgent {
     /// Getting this close to a candidate marks it visited.
     private let visitedRadius = 1.0
 
+    /// How long a running follow is left alone between brain look-ins. Long enough that a
+    /// multi-minute follow fits inside `maxTicksPerUtterance`, short enough that the brain
+    /// can still break off promptly.
+    private let followReviewInterval: TimeInterval = 10
+
     /// Hard cap on think-ticks per utterance so a brain that never emits `.stop`/`.done`
     /// can't loop forever (matters most for scripted/fake brains in tests).
     private let maxTicksPerUtterance: Int
@@ -243,6 +262,7 @@ public final class MissionAgent {
     public init(motion: RoverMotion,
                 perception: RoverPerception,
                 voice: RoverVoice,
+                follower: RoverFollowing? = nil,
                 battery: RoverBattery? = nil,
                 teamRadio: RoverTeamRadio? = nil,
                 askTimeout: TimeInterval = 8,
@@ -262,6 +282,7 @@ public final class MissionAgent {
         self.motion = motion
         self.perception = perception
         self.voice = voice
+        self.follower = follower
         self.battery = battery
         self.teamRadio = teamRadio
         self.askTimeout = askTimeout
@@ -293,6 +314,7 @@ public final class MissionAgent {
             isHandlingMission = false
             phase = .acting
             motion.cancel()
+            follower?.stopFollowing()
             phase = .idle
             RuntimeFileLog.append("voice_command_stop", fields: ["utterance": trimmedUtterance])
             return
@@ -562,6 +584,15 @@ public final class MissionAgent {
                     outcome = "ask(\"\(question)\") → no reply"
                 }
 
+            case .follow(let target):
+                guard let followOutcome = await startOrContinueFollowing(target,
+                                                                         missionID: missionID) else {
+                    phase = .idle
+                    RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
+                    return
+                }
+                outcome = followOutcome
+
             case .say(let text):
                 voice.speak(text)
                 outcome = "say(\"\(text)\") → (no motion)"
@@ -572,6 +603,7 @@ public final class MissionAgent {
 
             case .stop:
                 motion.cancel()
+                follower?.stopFollowing()
                 phase = .idle
                 return
 
@@ -809,18 +841,26 @@ public final class MissionAgent {
     static func bestVisualTargetMatch(query: String,
                                       objects: [PerceivedObject],
                                       minimumConfidence: Float) -> PerceivedObject? {
-        let queryTokens = normalizedVisualQueryTokens(query)
-        guard !queryTokens.isEmpty else { return nil }
+        guard !normalizedVisualQueryTokens(query).isEmpty else { return nil }
         return objects
             .filter { $0.confidence >= minimumConfidence }
-            .filter { object in
-                let label = normalizedVisualQuery(object.label)
-                let labelTokens = normalizedVisualQueryTokens(object.label)
-                return queryTokens.contains(label)
-                    || labelTokens.contains(where: { queryTokens.contains($0) })
-                    || queryTokens.contains(where: { label.contains($0) })
-            }
+            .filter { visualQueryMatches(query: query, label: $0.label) }
             .max { $0.confidence < $1.confidence }
+    }
+
+    /// Whether a detector label satisfies a free-text visual query, using the same
+    /// tokenization and canonicalization `bestVisualTargetMatch` grounds navigation
+    /// targets with. Exposed as a predicate (rather than kept inline) so `TargetTracker`
+    /// selects follow candidates by exactly the same rule — a query that steers a
+    /// `navigate` must steer a `follow` identically.
+    static func visualQueryMatches(query: String, label: String) -> Bool {
+        let queryTokens = normalizedVisualQueryTokens(query)
+        guard !queryTokens.isEmpty else { return false }
+        let normalizedLabel = normalizedVisualQuery(label)
+        let labelTokens = normalizedVisualQueryTokens(label)
+        return queryTokens.contains(normalizedLabel)
+            || labelTokens.contains(where: { queryTokens.contains($0) })
+            || queryTokens.contains(where: { normalizedLabel.contains($0) })
     }
 
     private static func normalizedVisualQuery(_ value: String) -> String {
@@ -1366,6 +1406,7 @@ public final class MissionAgent {
                        lastAnswerWasInconclusive: lastAnswerWasInconclusive,
                        batteryPercent: battery?.percent,
                        teamContext: teamRadio?.currentTeamContext(),
+                       followState: followStateDescription(),
                        recentActions: recentActionLines)
     }
 
@@ -1379,9 +1420,110 @@ public final class MissionAgent {
             .joined(separator: ",")
     }
 
+    private func followStateDescription() -> String? {
+        guard let follower, follower.followingSpec != nil else { return nil }
+        return follower.followState.description
+    }
+
+    /// Start (or keep) following whatever `target` names. Returns the tick outcome line, or
+    /// `nil` if the mission was cancelled while waiting.
+    ///
+    /// Following runs *between* ticks: this starts it and then blocks only long enough to
+    /// give the brain a periodic look-in, so the brain can narrate, ask, or break off
+    /// without the mission loop burning its whole tick budget spinning. Repeating `.follow`
+    /// for the same target deliberately does nothing — a brain re-stating its intent must
+    /// not restart the lock and lose the track it already has.
+    private func startOrContinueFollowing(_ target: NavigationTarget, missionID: Int) async -> String? {
+        guard let follower else {
+            voice.speak("I can't follow anything right now.")
+            return "follow → unavailable"
+        }
+        guard let resolved = followSpec(for: target) else {
+            voice.speak("I couldn't tell who to follow.")
+            return "follow → couldn't resolve target"
+        }
+
+        let alreadyFollowing = follower.followingSpec.map {
+            Self.visualQueryMatches(query: $0.query, label: resolved.spec.query)
+        } ?? false
+        if !alreadyFollowing {
+            // Never drive a goal and hold a stand-off at the same time — two controllers
+            // writing wheel commands is the one thing neither of them can recover from.
+            motion.cancel()
+            follower.follow(resolved.spec, seed: resolved.seed)
+            voice.speak("Following the \(resolved.spec.query). Say stop when you want me to hold.")
+            RuntimeFileLog.append("mission_follow_started", fields: [
+                "mission": "\(missionID)",
+                "query": resolved.spec.query,
+                "seed": resolved.seed.map { String(format: "%.2f,%.2f", $0.x, $0.y) } ?? "none"
+            ])
+        }
+
+        await waitWhileFollowing(missionID: missionID)
+        guard isCurrentMission(missionID) else { return nil }
+
+        if case .ended(let message) = follower.followState {
+            voice.speak(message)
+            return "follow(\(resolved.spec.query)) → ended: \(message)"
+        }
+        return "follow(\(resolved.spec.query)) → \(follower.followState.description)"
+    }
+
+    /// Block while a follow runs, up to one brain review interval, returning early the
+    /// moment it ends. Without this the mission loop would re-ask the brain at full speed
+    /// and exhaust its tick budget within seconds of starting a mode that is meant to run
+    /// for minutes.
+    private func waitWhileFollowing(missionID: Int) async {
+        guard let follower else { return }
+        let deadline = Date().addingTimeInterval(followReviewInterval)
+        while Date() < deadline {
+            if Task.isCancelled || !isCurrentMission(missionID) { return }
+            if follower.followingSpec == nil { return }
+            if case .ended = follower.followState { return }
+            try? await Task.sleep(for: .seconds(0.25))
+        }
+    }
+
+    /// Resolve a navigation target into something followable.
+    ///
+    /// An `.imagePoint` from a cloud brain is treated as a *selector*, not a coordinate:
+    /// the point was chosen against a frame that is a round-trip old, so by the time it
+    /// arrives the pixel may be the wall a walking person was standing in front of. What
+    /// survives the delay is which object was meant, so the point picks the label and seeds
+    /// the tracker, and association in the current frame does the rest.
+    private func followSpec(for target: NavigationTarget) -> (spec: TargetSpec, seed: Vec2?)? {
+        switch target {
+        case .visualQuery(let query):
+            let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            return (TargetSpec(query: trimmed), perception.groundObject(query: trimmed)
+                        .flatMap { perception.unproject(normalizedPoint: $0) })
+        case .imagePoint(let point):
+            guard let seed = perception.unproject(normalizedPoint: point) else { return nil }
+            guard let label = nearestDetectedLabel(toWorldPoint: seed) else { return nil }
+            return (TargetSpec(query: label), seed)
+        case .worldPoint(let point):
+            guard let label = nearestDetectedLabel(toWorldPoint: point) else { return nil }
+            return (TargetSpec(query: label), point)
+        }
+    }
+
+    private func nearestDetectedLabel(toWorldPoint point: Vec2) -> String? {
+        perception.detectObjects()
+            .compactMap { object -> (String, Double)? in
+                guard let world = perception.unproject(normalizedPoint: object.normalizedPoint) else {
+                    return nil
+                }
+                return (object.label, world.distance(to: point))
+            }
+            .min { $0.1 < $1.1 }?
+            .0
+    }
+
     private func decisionDescription(_ decision: RoverDecision) -> String {
         switch decision {
         case .navigate(let target): return "navigate(\(targetDescription(target)))"
+        case .follow(let target): return "follow(\(targetDescription(target)))"
         case .explore(let candidateId): return "explore(\(candidateId))"
         case .lookAround(let angle): return String(format: "lookAround(%.2f)", angle)
         case .ask: return "ask"

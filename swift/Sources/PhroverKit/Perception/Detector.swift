@@ -73,21 +73,16 @@ public final class Detector {
         return configuration
     }
 
-    public func detect(_ pixelBuffer: CVPixelBuffer) -> [Detection] {
+    /// Runs the model on the buffer rotated upright by `orientation` (normally
+    /// `ARSessionManager.imageOrientation`). Boxes come back in that upright frame, which is
+    /// the frame `ARSessionManager.unproject` inverts — so pass the same orientation to both.
+    ///
+    /// Deliberately one orientation, not a retry over all four: boxes from a different
+    /// rotation are in a different frame and unproject to the wrong place, and retrying
+    /// quadruples inference on every frame with nothing in view.
+    public func detect(_ pixelBuffer: CVPixelBuffer, orientation: CGImagePropertyOrientation = .right) -> [Detection] {
         guard let request else { return [] }
-        for orientation in Self.detectionOrientations(preferred: .right) {
-            let detections = detect(pixelBuffer, request: request, orientation: orientation)
-            if !detections.isEmpty { return detections }
-        }
-        return []
-    }
-
-    static func detectionOrientations(preferred: CGImagePropertyOrientation) -> [CGImagePropertyOrientation] {
-        var orientations = [preferred]
-        for fallback in [CGImagePropertyOrientation.right, .up, .left, .down] where fallback != preferred {
-            orientations.append(fallback)
-        }
-        return orientations
+        return detect(pixelBuffer, request: request, orientation: orientation)
     }
 
     private func detect(_ pixelBuffer: CVPixelBuffer,

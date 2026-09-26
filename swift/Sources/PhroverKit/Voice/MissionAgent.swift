@@ -76,7 +76,7 @@ public final class ARPerceptionSource: RoverPerception {
 
     public func detectObjects() -> [PerceivedObject] {
         guard let detector, let buffer = ar.latestPixelBuffer else { return [] }
-        return detector.detect(buffer).map {
+        return detector.detect(buffer, orientation: ar.imageOrientation).map {
             PerceivedObject(label: $0.label,
                             confidence: $0.confidence,
                             normalizedPoint: CGPoint(x: $0.boundingBox.midX, y: $0.boundingBox.midY))
@@ -88,7 +88,7 @@ public final class ARPerceptionSource: RoverPerception {
     }
 
     public func capturedFrameJPEG() -> Data? {
-        FrameEncoder.jpeg(ar.latestPixelBuffer)
+        FrameEncoder.jpeg(ar.latestPixelBuffer, orientation: ar.imageOrientation)
     }
 
     public func explorationFrontiers() -> [Frontier] {

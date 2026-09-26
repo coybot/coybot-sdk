@@ -1,4 +1,6 @@
 import XCTest
+import UIKit
+import CoreImage
 import CoreVideo
 import simd
 import RoverNav
@@ -7,9 +9,7 @@ import RoverNav
 /// `ARCamera`/`ARDepthData` have no public initializers, so ARKit can never hand a test a
 /// real one — these tests exercise the pure-math helpers `ARSessionManager` factors its
 /// `unproject(normalizedPoint:)` through (`sensorPixel`/`sampleDepth`/`unprojectPoint`)
-/// against synthetic intrinsics/transforms/depth instead. Runs on the iOS Simulator; the
-/// one thing this can't cover is whether the `.right`-orientation assumption actually
-/// matches a real device's camera buffer — see rover/README.md status notes.
+/// against synthetic intrinsics/transforms/depth instead. Runs on the iOS Simulator.
 @MainActor
 final class UnprojectionTests: XCTestCase {
     func testSensorPixelHandlesCorners() {
@@ -102,7 +102,170 @@ final class UnprojectionTests: XCTestCase {
         XCTAssertEqual(goal.y, 2, accuracy: 0.01)
     }
 
+    // MARK: - Orientation
+
+    /// The invariant the whole mount-agnostic path rests on: a point picked in the image
+    /// the model saw (`CIImage.oriented`, which is what `FrameEncoder` sends the brain and
+    /// matches what Vision runs on) maps back to the raw pixel it came from. Checked by
+    /// rendering a single marked pixel through Core Image rather than restating the
+    /// rotation table, so a sign slip in `sensorPixel` can't hide behind a matching slip
+    /// in the test.
+    func testSensorPixelInvertsCoreImageRotationForEveryMount() throws {
+        let width = 8, height = 4
+        let marked = (x: 1, y: 0) // raw top-left-origin pixel; off every axis of symmetry
+        let raw = Self.makeMarkedBGRABuffer(width: width, height: height, marked: marked)
+
+        for orientation in [CGImagePropertyOrientation.up, .right, .left, .down] {
+            let (upright, size) = try Self.render(CIImage(cvPixelBuffer: raw).oriented(orientation))
+            let found = try XCTUnwrap(Self.brightestPixel(upright, width: size.w, height: size.h),
+                                      "no marker for \(orientation.rawValue)")
+            // Pixel centre in the upright image, as a Vision-normalized (y-up) point.
+            let vision = CGPoint(x: (Double(found.x) + 0.5) / Double(size.w),
+                                 y: 1 - (Double(found.y) + 0.5) / Double(size.h))
+
+            let sensor = ARSessionManager.sensorPixel(forVisionNormalizedPoint: vision,
+                                                      imageSize: CGSize(width: width, height: height),
+                                                      orientation: orientation)
+
+            XCTAssertEqual(sensor.x, Double(marked.x) + 0.5, accuracy: 0.01, "orientation \(orientation.rawValue)")
+            XCTAssertEqual(sensor.y, Double(marked.y) + 0.5, accuracy: 0.01, "orientation \(orientation.rawValue)")
+        }
+    }
+
+    func testDefaultOrientationKeepsPortraitMapping() {
+        let imageSize = CGSize(width: 1920, height: 1440)
+        let p = CGPoint(x: 0.2, y: 0.7)
+
+        let implicit = ARSessionManager.sensorPixel(forVisionNormalizedPoint: p, imageSize: imageSize)
+        let explicit = ARSessionManager.sensorPixel(forVisionNormalizedPoint: p, imageSize: imageSize, orientation: .right)
+
+        XCTAssertEqual(implicit, explicit)
+    }
+
+    func testImageOrientationFollowsGravityForEachMount() {
+        // Camera looking level, rolled about its optical axis. 0° = the usual portrait hold.
+        XCTAssertEqual(ARSessionManager.imageOrientation(cameraTransform: Self.levelCamera(rollDegrees: 0), previous: .up), .right)
+        XCTAssertEqual(ARSessionManager.imageOrientation(cameraTransform: Self.levelCamera(rollDegrees: 90), previous: .right), .up)
+        XCTAssertEqual(ARSessionManager.imageOrientation(cameraTransform: Self.levelCamera(rollDegrees: 180), previous: .right), .left)
+        XCTAssertEqual(ARSessionManager.imageOrientation(cameraTransform: Self.levelCamera(rollDegrees: 270), previous: .right), .down)
+    }
+
+    func testImageOrientationHoldsNearTheDiagonal() {
+        // 50° is past the 45° midpoint but inside the hysteresis band: stay put.
+        XCTAssertEqual(ARSessionManager.imageOrientation(cameraTransform: Self.levelCamera(rollDegrees: 50), previous: .right), .right)
+        XCTAssertEqual(ARSessionManager.imageOrientation(cameraTransform: Self.levelCamera(rollDegrees: 40), previous: .up), .up)
+        // Well past it: switch.
+        XCTAssertEqual(ARSessionManager.imageOrientation(cameraTransform: Self.levelCamera(rollDegrees: 65), previous: .right), .up)
+    }
+
+    func testImageOrientationHoldsWhenLookingStraightDown() {
+        // Optical axis along world -Y: world-up has no component in the image plane.
+        let down = simd_float4x4(columns: (
+            SIMD4<Float>(1, 0, 0, 0),
+            SIMD4<Float>(0, 0, -1, 0),
+            SIMD4<Float>(0, 1, 0, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
+        XCTAssertEqual(ARSessionManager.imageOrientation(cameraTransform: down, previous: .left), .left)
+    }
+
+    /// A landscape mount must land a detection in the same world spot a portrait mount
+    /// does when both are looking at the same raw pixel.
+    func testUnprojectPointAgreesAcrossMountsForTheSameRawPixel() {
+        let intrinsics = simd_float3x3(columns: (
+            SIMD3<Float>(500, 0, 0),
+            SIMD3<Float>(0, 500, 0),
+            SIMD3<Float>(400, 300, 1)
+        ))
+        let imageSize = CGSize(width: 800, height: 600)
+        let rawPixel = CGPoint(x: 600, y: 150) // right of and above the principal point
+        let u = rawPixel.x / imageSize.width, v = rawPixel.y / imageSize.height
+        let asPortrait = CGPoint(x: 1 - v, y: 1 - u)  // how that pixel reads in the .right-rotated image
+        let asLandscape = CGPoint(x: u, y: 1 - v)     // and in the .up image
+
+        let a = ARSessionManager.unprojectPoint(asPortrait, imageSize: imageSize, orientation: .right,
+                                                intrinsics: intrinsics, cameraTransform: simd_float4x4(1), depth: 2)
+        let b = ARSessionManager.unprojectPoint(asLandscape, imageSize: imageSize, orientation: .up,
+                                                intrinsics: intrinsics, cameraTransform: simd_float4x4(1), depth: 2)
+
+        XCTAssertEqual(a.x, b.x, accuracy: 1e-6)
+        XCTAssertEqual(a.y, b.y, accuracy: 1e-6)
+        XCTAssertEqual(a.x, 0.8, accuracy: 1e-6) // (600 - 400) / 500 * 2
+    }
+
+    func testFrameEncoderSendsTheUprightImage() throws {
+        let raw = Self.makeMarkedBGRABuffer(width: 40, height: 20, marked: (x: 0, y: 0))
+
+        let portrait = try XCTUnwrap(FrameEncoder.jpeg(raw, orientation: .right).flatMap(UIImage.init(data:)))
+        let landscape = try XCTUnwrap(FrameEncoder.jpeg(raw, orientation: .up).flatMap(UIImage.init(data:)))
+
+        XCTAssertEqual(portrait.size.width, 20)
+        XCTAssertEqual(portrait.size.height, 40)
+        XCTAssertEqual(landscape.size.width, 40)
+        XCTAssertEqual(landscape.size.height, 20)
+    }
+
     // MARK: - Helpers
+
+    /// Camera looking level along world -Z, rolled about its optical axis. ARKit's camera
+    /// +X runs toward the phone's bottom edge, so at roll 0 it points at the ground.
+    private static func levelCamera(rollDegrees: Double) -> simd_float4x4 {
+        let r = rollDegrees * .pi / 180
+        let x = SIMD3<Float>(Float(sin(r)), Float(-cos(r)), 0)
+        let z = SIMD3<Float>(0, 0, 1)
+        let y = simd_cross(z, x)
+        return simd_float4x4(columns: (
+            SIMD4<Float>(x, 0), SIMD4<Float>(y, 0), SIMD4<Float>(z, 0), SIMD4<Float>(0, 0, 0, 1)
+        ))
+    }
+
+    private static func makeMarkedBGRABuffer(width: Int, height: Int, marked: (x: Int, y: Int)) -> CVPixelBuffer {
+        var buffer: CVPixelBuffer?
+        let attrs: [CFString: Any] = [
+            kCVPixelBufferCGImageCompatibilityKey: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: true
+        ]
+        CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA,
+                            attrs as CFDictionary, &buffer)
+        let pixelBuffer = buffer!
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+        let rowBytes = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let base = CVPixelBufferGetBaseAddress(pixelBuffer)!.assumingMemoryBound(to: UInt8.self)
+        for y in 0..<height {
+            for x in 0..<width {
+                let px = base + y * rowBytes + x * 4
+                let on: UInt8 = (x == marked.x && y == marked.y) ? 255 : 0
+                px[0] = on; px[1] = on; px[2] = on; px[3] = 255
+            }
+        }
+        return pixelBuffer
+    }
+
+    /// Renders to a top-left-origin RGBA8 bitmap.
+    private static func render(_ image: CIImage) throws -> (pixels: [UInt8], size: (w: Int, h: Int)) {
+        let extent = image.extent.integral
+        let w = Int(extent.width), h = Int(extent.height)
+        var pixels = [UInt8](repeating: 0, count: w * h * 4)
+        let context = CIContext(options: [.workingColorSpace: NSNull(), .outputColorSpace: NSNull()])
+        let cg = try XCTUnwrap(context.createCGImage(image, from: extent))
+        let bitmap = try XCTUnwrap(CGContext(data: &pixels, width: w, height: h, bitsPerComponent: 8,
+                                             bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        bitmap.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return (pixels, (w, h))
+    }
+
+    private static func brightestPixel(_ pixels: [UInt8], width: Int, height: Int) -> (x: Int, y: Int)? {
+        var best: (x: Int, y: Int, v: Int)?
+        for y in 0..<height {
+            for x in 0..<width {
+                let v = Int(pixels[(y * width + x) * 4])
+                if v > 128, v > (best?.v ?? 0) { best = (x, y, v) }
+            }
+        }
+        return best.map { ($0.x, $0.y) }
+    }
 
     private static func makeDepthBuffer(width: Int, height: Int, constantDepth: Float) -> CVPixelBuffer {
         var pixelBuffer: CVPixelBuffer?

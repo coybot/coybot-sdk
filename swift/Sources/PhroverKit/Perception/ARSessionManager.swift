@@ -1,5 +1,6 @@
 import Foundation
 import ARKit
+import ImageIO
 import RoverNav
 
 /// Owns the ARKit session and is the rover's **primary odometry + mapping** source
@@ -27,6 +28,11 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     public private(set) var latestCamera: ARCamera?
     /// Latest LiDAR depth map (meters, aligned to `latestCamera.imageResolution`'s aspect).
     public private(set) var latestDepthMap: CVPixelBuffer?
+    /// Which way up the raw camera buffer is, derived from gravity each frame. Everything
+    /// that hands the image to a model (`Detector`, `FrameEncoder`) rotates by this so the
+    /// model sees the scene upright, and `unproject` inverts the same rotation — so the
+    /// phone can be mounted portrait, landscape either way, or upside down.
+    public private(set) var imageOrientation: CGImagePropertyOrientation = .right
     private var lastClearanceLogAt = Date.distantPast
 
     public override init() {
@@ -58,6 +64,11 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         pose = Self.groundPose(from: frame.camera.transform)
         latestPixelBuffer = frame.capturedImage
         latestCamera = frame.camera
+        let orientation = Self.imageOrientation(cameraTransform: frame.camera.transform, previous: imageOrientation)
+        if orientation != imageOrientation {
+            imageOrientation = orientation
+            RuntimeFileLog.append("image_orientation", fields: ["exif": "\(orientation.rawValue)"])
+        }
         if let depth = frame.smoothedSceneDepth ?? frame.sceneDepth {
             forwardClearance = Self.forwardClearance(from: depth)
             latestDepthMap = depth.depthMap
@@ -96,33 +107,70 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
 
     // MARK: - Object grounding
 
-    /// Back-projects a point in `Detector`'s normalized Vision coordinates (bottom-left
-    /// origin, y-up, in the upright/portrait frame Vision produces because `Detector` hands
-    /// it the buffer with `orientation: .right`) to a world point on the nav plane, by
-    /// sampling the aligned LiDAR depth map and unprojecting through the camera intrinsics.
-    /// Returns `nil` if there's no camera/depth yet or the sampled depth is invalid.
+    /// Back-projects a point in normalized Vision coordinates (bottom-left origin, y-up)
+    /// of the *upright* image — the frame `Detector` boxes and the cloud brain's image
+    /// points are both in, because both see the buffer rotated by `imageOrientation` — to
+    /// a world point on the nav plane, by sampling the aligned LiDAR depth map and
+    /// unprojecting through the camera intrinsics. Returns `nil` if there's no
+    /// camera/depth yet or the sampled depth is invalid.
     ///
-    /// The `.right`-rotation inverse assumes the phone is held in the same portrait
-    /// orientation `Detector` was tuned for; this is the one piece of the perception path
-    /// that can only be validated on a real LiDAR device (see rover/README.md status notes)
-    /// — `ARCamera` has no public initializer, so the math below is split into the static
-    /// helpers `sensorPixel`/`sampleDepth`/`unprojectPoint` specifically so it can still be
-    /// exercised in tests against synthetic intrinsics/transforms/depth.
+    /// `ARCamera` has no public initializer, so the math is split into the static helpers
+    /// `sensorPixel`/`sampleDepth`/`unprojectPoint` so it can be exercised in tests against
+    /// synthetic intrinsics/transforms/depth.
     public func unproject(normalizedPoint: CGPoint) -> Vec2? {
         guard let camera = latestCamera, let depthMap = latestDepthMap else { return nil }
         let imageSize = camera.imageResolution // raw (landscape) sensor pixel space, matches `intrinsics`
-        guard let depth = Self.sampleDepth(depthMap, atVisionNormalizedPoint: normalizedPoint, imageSize: imageSize) else {
+        guard let depth = Self.sampleDepth(depthMap, atVisionNormalizedPoint: normalizedPoint,
+                                           imageSize: imageSize, orientation: imageOrientation) else {
             return nil
         }
-        return Self.unprojectPoint(normalizedPoint, imageSize: imageSize,
+        return Self.unprojectPoint(normalizedPoint, imageSize: imageSize, orientation: imageOrientation,
                                    intrinsics: camera.intrinsics, cameraTransform: camera.transform, depth: depth)
     }
 
-    /// Undoes the `.right` (90° clockwise) rotation `Detector`'s Vision request handler
-    /// applied, landing back in the raw sensor pixel space `intrinsics`/depth are
-    /// calibrated against.
-    static func sensorPixel(forVisionNormalizedPoint p: CGPoint, imageSize: CGSize) -> CGPoint {
-        CGPoint(x: (1 - p.y) * imageSize.width, y: (1 - p.x) * imageSize.height)
+    /// Undoes the rotation a Vision request (or `CIImage.oriented`) applied for
+    /// `orientation`, landing back in the raw sensor pixel space (top-left origin)
+    /// `intrinsics`/depth are calibrated against.
+    static func sensorPixel(forVisionNormalizedPoint p: CGPoint, imageSize: CGSize,
+                            orientation: CGImagePropertyOrientation = .right) -> CGPoint {
+        // Upright image, top-left origin, normalized.
+        let u = p.x, v = 1 - p.y
+        let raw: (u: Double, v: Double)
+        switch orientation {
+        case .up: raw = (u, v)
+        case .left: raw = (1 - v, u)        // displayed after a 90° counter-clockwise turn
+        case .down: raw = (1 - u, 1 - v)    // 180°
+        default: raw = (v, 1 - u)           // .right, 90° clockwise; mirrored never occurs
+        }
+        return CGPoint(x: raw.u * imageSize.width, y: raw.v * imageSize.height)
+    }
+
+    /// Minimum lead the gravity component on a new image axis needs over the current one
+    /// before the orientation flips. About 12° either side of 45°, so a mount that sits
+    /// near the diagonal, or a chassis rocking over a threshold, doesn't flicker.
+    static let orientationHysteresis = 0.2
+
+    /// Which EXIF orientation makes the raw buffer upright, from where world-up falls in
+    /// the camera's image plane. ARKit's camera +X runs along the raw image toward its right
+    /// edge and +Y toward its top, so world-up's components on those axes say which raw
+    /// edge is up: left edge up is the ordinary portrait hold (`.right`), top edge up is
+    /// landscape with the raw buffer already upright (`.up`). Holds `previous` when the
+    /// camera looks nearly straight up or down, where the roll is undefined.
+    static func imageOrientation(cameraTransform t: simd_float4x4,
+                                 previous: CGImagePropertyOrientation) -> CGImagePropertyOrientation {
+        let upX = Double(t.columns.0.y), upY = Double(t.columns.1.y)
+        func lift(_ o: CGImagePropertyOrientation) -> Double {
+            switch o {
+            case .up: return upY
+            case .left: return upX
+            case .down: return -upY
+            default: return -upX
+            }
+        }
+        let best = [CGImagePropertyOrientation.right, .up, .left, .down].max { lift($0) < lift($1) }!
+        guard best != previous, lift(best) > 0.3,
+              lift(best) > lift(previous) + orientationHysteresis else { return previous }
+        return best
     }
 
     /// Fraction of the depth map's smaller side sampled either side of the point. Small
@@ -142,9 +190,10 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     /// the same reasoning as `forwardClearance(fromDepthMap:)`'s low percentile, over a
     /// local window instead of the whole driving corridor. Erring near also errs safe: a
     /// goal short of the object is a stop, one behind it is a collision.
-    static func sampleDepth(_ depthMap: CVPixelBuffer, atVisionNormalizedPoint p: CGPoint, imageSize: CGSize) -> Float? {
+    static func sampleDepth(_ depthMap: CVPixelBuffer, atVisionNormalizedPoint p: CGPoint, imageSize: CGSize,
+                            orientation: CGImagePropertyOrientation = .right) -> Float? {
         guard imageSize.width > 0, imageSize.height > 0 else { return nil }
-        let sensor = sensorPixel(forVisionNormalizedPoint: p, imageSize: imageSize)
+        let sensor = sensorPixel(forVisionNormalizedPoint: p, imageSize: imageSize, orientation: orientation)
 
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
@@ -174,8 +223,10 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     /// intrinsics and pose into a world-plane point (matches `groundPose`'s x/world-x,
     /// y/world-z convention). Pure math — testable with synthetic intrinsics/transform.
     static func unprojectPoint(_ visionNormalizedPoint: CGPoint, imageSize: CGSize,
+                               orientation: CGImagePropertyOrientation = .right,
                                intrinsics: simd_float3x3, cameraTransform: simd_float4x4, depth: Float) -> Vec2 {
-        let sensor = sensorPixel(forVisionNormalizedPoint: visionNormalizedPoint, imageSize: imageSize)
+        let sensor = sensorPixel(forVisionNormalizedPoint: visionNormalizedPoint, imageSize: imageSize,
+                                 orientation: orientation)
         let fx = Double(intrinsics[0][0]), fy = Double(intrinsics[1][1])
         let cx = Double(intrinsics[2][0]), cy = Double(intrinsics[2][1])
         let d = Double(depth)

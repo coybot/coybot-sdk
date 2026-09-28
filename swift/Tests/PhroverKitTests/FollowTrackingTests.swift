@@ -30,6 +30,36 @@ final class FollowTrackingTests: XCTestCase {
         XCTAssertEqual(tracker.track?.position, Vec2(5, 1))
     }
 
+    /// The operator named an attribute the detector can report. The plain `person` still
+    /// matches "the guy" — it must not win just by being the louder detection.
+    func testAcquiresTheCandidateTheQueryDescribesMostSpecifically() {
+        let tracker = TargetTracker()
+        tracker.lock(to: TargetSpec(query: "the guy with the hat"))
+
+        tracker.update(observations: [
+            observation(Vec2(3, 0), label: "person", confidence: 0.95),
+            observation(Vec2(5, 1), label: "person_hat", confidence: 0.8)
+        ], now: t0)
+
+        XCTAssertEqual(tracker.track?.position, Vec2(5, 1))
+    }
+
+    /// Specificity picks who; position keeps them. A frame where only the plain label is
+    /// reported at the tracked spot (the hat not made out) must not break the track.
+    func testStaysOnTheTrackWhenTheAttributeDropsOutForAFrame() {
+        let tracker = TargetTracker()
+        tracker.lock(to: TargetSpec(query: "the person with the hat"))
+        tracker.update(observations: [observation(Vec2(5, 1), label: "person_hat")], now: t0)
+        let id = tracker.track?.id
+
+        tracker.update(observations: [observation(Vec2(5.1, 1.2), label: "person")],
+                       now: t0.addingTimeInterval(0.1))
+
+        XCTAssertEqual(tracker.track?.id, id)
+        XCTAssertEqual(tracker.state, .tracking)
+        XCTAssertEqual(tracker.track?.position.x ?? 0, 5.1, accuracy: 0.2)
+    }
+
     func testSeedBiasesTheInitialPick() {
         let tracker = TargetTracker()
         tracker.lock(to: TargetSpec(query: "person"), seed: Vec2(3, 0))

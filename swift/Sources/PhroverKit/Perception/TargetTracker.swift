@@ -142,9 +142,14 @@ public final class TargetTracker {
             $0.confidence >= params.minimumConfidence
                 && MissionAgent.visualQueryMatches(query: spec.query, label: $0.label)
         }
+        // Choosing *who* (the first pick, and any unvouched re-acquisition) goes by how
+        // specifically the label fits the query — the one with the hat, not merely a
+        // person. Staying on them once locked goes by position (the gate below), so a
+        // detector that stops seeing the hat for a frame does not break the track.
+        let specific = MissionAgent.mostSpecificMatches(candidates, query: spec.query, label: \.label)
 
         guard let existing = track else {
-            if let picked = initialPick(from: candidates) {
+            if let picked = initialPick(from: specific) {
                 track = TargetTrack(id: nextID,
                                     position: picked.worldPoint,
                                     velocity: .zero,
@@ -174,7 +179,7 @@ public final class TargetTracker {
         // rather than grabbing whatever else is in frame — that grab is exactly how a
         // follow silently transfers to a passer-by.
         if unseenFor >= params.reacquireAfter,
-           let fallback = nearest(to: predicted, among: candidates, within: .infinity) {
+           let fallback = nearest(to: predicted, among: specific, within: .infinity) {
             unverifiedReacquisitions += 1
             RuntimeFileLog.append("follow_target_reacquired_unverified", fields: [
                 "unseen_for": String(format: "%.2f", unseenFor),

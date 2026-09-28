@@ -12,6 +12,34 @@ final class OnDeviceBrainTests: XCTestCase {
 
         XCTAssertEqual(factory.createdCount, 2)
     }
+
+    func testFollowMapsToAVisualQueryFollow() {
+        let decision = OnDeviceBrain.map(Self.raw(.follow, visualQuery: "the person with the hat"),
+                                         context: MissionContext())
+        XCTAssertEqual(decision, .follow(.visualQuery("the person with the hat")))
+    }
+
+    func testFollowWithNoDescriptionFollowsAPerson() {
+        let decision = OnDeviceBrain.map(Self.raw(.follow, visualQuery: "  "), context: MissionContext())
+        XCTAssertEqual(decision, .follow(.visualQuery("person")))
+    }
+
+    func testPromptTellsTheModelAFollowIsRunning() {
+        let brain = OnDeviceBrain(isAvailable: { true }, makeResponder: { FakeOnDeviceBrainResponder() })
+        var context = MissionContext()
+        context.followState = "following the guy with the hat"
+        context.recentActions = ["follow(person) → following"]
+
+        let prompt = brain.promptText(context)
+
+        XCTAssertTrue(prompt.contains("currently following the guy with the hat"), prompt)
+        XCTAssertTrue(prompt.contains("follow(person) → following"), prompt)
+    }
+
+    private static func raw(_ action: OnDeviceAction, visualQuery: String = "") -> OnDeviceDecision {
+        OnDeviceDecision(action: action, visualQuery: visualQuery, memoryQuery: "", question: "",
+                         spokenText: "", lookAroundDegrees: 0, exploreCandidateId: "", updatedPlan: "")
+    }
 }
 
 @MainActor

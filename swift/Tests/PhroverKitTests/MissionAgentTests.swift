@@ -10,6 +10,86 @@ import RoverNav
 /// only be verified on a real device (see rover/README.md status notes).
 @MainActor
 final class MissionAgentTests: XCTestCase {
+    func testFollowDecisionStartsTheFollower() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.objects = [PerceivedObject(label: "person", confidence: 0.95,
+                                              normalizedPoint: CGPoint(x: 0.5, y: 0.5))]
+        let follower = FakeFollower()
+        let brain = FakeBrain(script: [.follow(.visualQuery("person")), .done])
+        let agent = MissionAgent(motion: motion, perception: perception, voice: FakeVoice(),
+                                 follower: follower) { brain }
+
+        await agent.handle("follow me")
+
+        XCTAssertEqual(follower.followCalls.map(\.query), ["person"])
+        XCTAssertTrue(brain.seenContexts.last?.followState != nil,
+                      "the brain's look-in during a follow must be told a follow is running")
+    }
+
+    /// A brain that decides to drive somewhere mid-follow must end the follow first, or
+    /// the follower and the navigator both write wheel commands.
+    func testNavigatingDuringAFollowStopsTheFollowerFirst() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.objects = [PerceivedObject(label: "person", confidence: 0.95,
+                                              normalizedPoint: CGPoint(x: 0.5, y: 0.5))]
+        var order: [String] = []
+        let follower = FakeFollower()
+        follower.onEvent = { order.append($0) }
+        motion.onNavigate = { _ in order.append("navigate") }
+        let brain = FakeBrain(script: [.follow(.visualQuery("person")),
+                                       .navigate(.imagePoint(CGPoint(x: 0.5, y: 0.5))),
+                                       .done])
+        let agent = MissionAgent(motion: motion, perception: perception, voice: FakeVoice(),
+                                 follower: follower) { brain }
+
+        await agent.handle("follow me, then go to the chair")
+
+        XCTAssertEqual(order, ["follow", "stopFollowing", "navigate"])
+    }
+
+    func testLookingAroundDuringAFollowStopsTheFollowerFirst() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.objects = [PerceivedObject(label: "person", confidence: 0.95,
+                                              normalizedPoint: CGPoint(x: 0.5, y: 0.5))]
+        let follower = FakeFollower()
+        let brain = FakeBrain(script: [.follow(.visualQuery("person")), .lookAround(angle: 1), .done])
+        let agent = MissionAgent(motion: motion, perception: perception, voice: FakeVoice(),
+                                 follower: follower) { brain }
+
+        await agent.handle("follow me")
+
+        XCTAssertEqual(follower.stopCallCount, 1)
+        XCTAssertEqual(motion.rotateCalls, [1])
+    }
+
+    func testVisualMatchPrefersTheLabelTheQueryDescribesMostSpecifically() {
+        let objects = [
+            PerceivedObject(label: "blue_toolbox", confidence: 0.97, normalizedPoint: CGPoint(x: 0.2, y: 0.5)),
+            PerceivedObject(label: "red_toolbox", confidence: 0.91, normalizedPoint: CGPoint(x: 0.8, y: 0.5)),
+        ]
+
+        let red = MissionAgent.bestVisualTargetMatch(query: "the red toolbox", objects: objects, minimumConfidence: 0.5)
+        let any = MissionAgent.bestVisualTargetMatch(query: "the toolbox", objects: objects, minimumConfidence: 0.5)
+
+        XCTAssertEqual(red?.label, "red_toolbox")
+        XCTAssertEqual(any?.label, "blue_toolbox", "no attribute named: the most confident instance")
+    }
+
+    func testSpokenTargetDoesNotDoubleTheArticle() {
+        XCTAssertEqual(MissionAgent.spokenTarget("the person with the hat"), "the person with the hat")
+        XCTAssertEqual(MissionAgent.spokenTarget("person"), "the person")
+    }
+
+    func testEverydayWordsForAHumanMatchThePersonLabel() {
+        for query in ["the guy", "that woman", "the kid in red", "someone"] {
+            XCTAssertTrue(MissionAgent.visualQueryMatches(query: query, label: "person"), query)
+        }
+        XCTAssertFalse(MissionAgent.visualQueryMatches(query: "the guy", label: "chair"))
+    }
+
     func testGroundsVisibleTargetAndFinishes() async {
         let motion = FakeMotion()
         let perception = FakePerception()
@@ -897,6 +977,37 @@ final class MissionAgentTests: XCTestCase {
 }
 
 // MARK: - Fakes
+
+@MainActor
+private final class FakeFollower: RoverFollowing {
+    private(set) var followingSpec: TargetSpec?
+    var followState: FollowController.State = .idle
+    private(set) var followCalls: [TargetSpec] = []
+    private(set) var stopCallCount = 0
+    /// Shared with the fake motion so a test can assert what happened first.
+    var onEvent: ((String) -> Void)?
+    /// Ends the follow on its own after this long, so a test doesn't sit out the whole
+    /// brain review interval.
+    var endsAfter: TimeInterval = 0.03
+
+    func follow(_ spec: TargetSpec, seed: Vec2?) {
+        followCalls.append(spec)
+        followingSpec = spec
+        followState = .following
+        onEvent?("follow")
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(endsAfter))
+            if followingSpec != nil { followState = .ended("lost them") }
+        }
+    }
+
+    func stopFollowing() {
+        stopCallCount += 1
+        followingSpec = nil
+        followState = .idle
+        onEvent?("stopFollowing")
+    }
+}
 
 private enum FakeBrainError: Error, Equatable {
     case modelUnavailable

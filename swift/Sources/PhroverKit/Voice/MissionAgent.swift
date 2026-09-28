@@ -458,6 +458,7 @@ public final class MissionAgent {
 
             switch decision {
             case .navigate(let target):
+                stopFollowingBeforeOtherMotion(decision, missionID: missionID)
                 let effectiveTarget = effectiveNavigationTarget(target,
                                                                 lockedVisualQuery: &lockedVisualQuery,
                                                                 missionID: missionID)
@@ -547,6 +548,7 @@ public final class MissionAgent {
                 outcome = describeMotionOutcome(label: "navigate", poseBefore: poseBefore)
 
             case .explore(let candidateId):
+                stopFollowingBeforeOtherMotion(decision, missionID: missionID)
                 guard let candidate = explorationCandidates.first(where: { $0.id == candidateId }) else {
                     voice.speak("I'm not sure which opening that is anymore.")
                     if recordTick(decision: decision, poseBefore: poseBefore, newObjects: newObjects,
@@ -564,6 +566,7 @@ public final class MissionAgent {
                 outcome = describeMotionOutcome(label: "explore(\(candidateId))", poseBefore: poseBefore)
 
             case .lookAround(let angle):
+                stopFollowingBeforeOtherMotion(decision, missionID: missionID)
                 await motion.rotate(by: angle)
                 if await recoverOrStopMissionIfMotionFailed(missionID: missionID) { return }
                 let poseAfter = perception.pose?.position
@@ -842,10 +845,32 @@ public final class MissionAgent {
                                       objects: [PerceivedObject],
                                       minimumConfidence: Float) -> PerceivedObject? {
         guard !normalizedVisualQueryTokens(query).isEmpty else { return nil }
-        return objects
-            .filter { $0.confidence >= minimumConfidence }
-            .filter { visualQueryMatches(query: query, label: $0.label) }
+        return mostSpecificMatches(objects.filter { $0.confidence >= minimumConfidence },
+                                   query: query, label: \.label)
             .max { $0.confidence < $1.confidence }
+    }
+
+    /// How much of a label the query accounts for: the number of the label's tokens the
+    /// query names, 0 when `visualQueryMatches` rejects it. "the red toolbox" scores
+    /// `red_toolbox` 2 and `blue_toolbox` 1, "the guy with the hat" scores `person_hat` 2
+    /// and `person` 1.
+    static func visualQueryMatchScore(query: String, label: String) -> Int {
+        guard visualQueryMatches(query: query, label: label) else { return 0 }
+        let queryTokens = Set(normalizedVisualQueryTokens(query))
+        return max(1, normalizedVisualQueryTokens(label).filter(queryTokens.contains).count)
+    }
+
+    /// The matching items whose labels the query describes most specifically. Without
+    /// this, any label sharing the category word matches — the plain `person` satisfies
+    /// "the person with the hat" — and the higher-confidence one wins regardless of the
+    /// attribute the operator actually named. Ties keep every tied item, so a query that
+    /// names only the category ("the toolbox") still matches every instance.
+    static func mostSpecificMatches<T>(_ items: [T], query: String, label: (T) -> String) -> [T] {
+        let scored = items
+            .map { ($0, visualQueryMatchScore(query: query, label: label($0))) }
+            .filter { $0.1 > 0 }
+        guard let best = scored.map(\.1).max() else { return [] }
+        return scored.filter { $0.1 == best }.map(\.0)
     }
 
     /// Whether a detector label satisfies a free-text visual query, using the same
@@ -887,6 +912,11 @@ public final class MissionAgent {
             return "refrigerator"
         case "tvs", "television", "televisions":
             return "tv"
+        // The detector's only word for a human is COCO's "person"; operators say anything but.
+        case "people", "persons", "guy", "guys", "man", "men", "woman", "women", "lady",
+             "ladies", "boy", "boys", "girl", "girls", "kid", "kids", "child", "children",
+             "someone", "somebody", "human", "humans":
+            return "person"
         default:
             return token
         }
@@ -1420,9 +1450,33 @@ public final class MissionAgent {
             .joined(separator: ",")
     }
 
+    /// "the person with the hat" as it would be said aloud: the brain's description,
+    /// with "the" added only if it doesn't already open with a determiner.
+    static func spokenTarget(_ query: String) -> String {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let first = trimmed.split(separator: " ").first.map { $0.lowercased() } ?? ""
+        return ["the", "a", "an", "that", "this", "my", "your", "him", "her", "them", "me"].contains(first)
+            ? trimmed : "the \(trimmed)"
+    }
+
+    /// Any decision that drives the base itself ends a running follow first: two
+    /// controllers writing wheel commands is the one thing neither can recover from. The
+    /// mirror of `startOrContinueFollowing` cancelling `motion` before it starts a follow.
+    private func stopFollowingBeforeOtherMotion(_ decision: RoverDecision, missionID: Int) {
+        guard let follower, follower.followingSpec != nil else { return }
+        follower.stopFollowing()
+        RuntimeFileLog.append("mission_follow_stopped", fields: [
+            "mission": "\(missionID)",
+            "reason": decisionDescription(decision)
+        ])
+    }
+
+    /// "following the guy with the hat" — the target, not just the state. A brain told
+    /// only "following" re-states the follow in its own words on its next look-in, and a
+    /// re-statement that drops the attribute ("the person") grounds on every person in view.
     private func followStateDescription() -> String? {
-        guard let follower, follower.followingSpec != nil else { return nil }
-        return follower.followState.description
+        guard let follower, let spec = follower.followingSpec else { return nil }
+        return "\(follower.followState.description) \(spec.query)"
     }
 
     /// Start (or keep) following whatever `target` names. Returns the tick outcome line, or
@@ -1451,7 +1505,7 @@ public final class MissionAgent {
             // writing wheel commands is the one thing neither of them can recover from.
             motion.cancel()
             follower.follow(resolved.spec, seed: resolved.seed)
-            voice.speak("Following the \(resolved.spec.query). Say stop when you want me to hold.")
+            voice.speak("Following \(Self.spokenTarget(resolved.spec.query)). Say stop when you want me to hold.")
             RuntimeFileLog.append("mission_follow_started", fields: [
                 "mission": "\(missionID)",
                 "query": resolved.spec.query,

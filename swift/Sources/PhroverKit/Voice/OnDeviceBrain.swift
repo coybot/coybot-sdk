@@ -12,7 +12,7 @@ struct OnDeviceDecision {
     @Guide(description: "What the rover should do next")
     var action: OnDeviceAction
 
-    @Guide(description: "When action is navigateToObject: a short phrase describing what to drive toward, as if pointing it out to someone looking at the same view — can include colors, attributes, or possessives (\"the green chair\", \"my backpack\"), not just an object category. Empty otherwise.")
+    @Guide(description: "When action is navigateToObject: a short phrase describing what to drive toward, as if pointing it out to someone looking at the same view — can include colors, attributes, or possessives (\"the green chair\", \"my backpack\"), not just an object category. When action is follow: who or what to follow, the same way (\"the person with the hat\"; \"person\" for \"follow me\"). Empty otherwise.")
     var visualQuery: String
 
     @Guide(description: "When action is navigateToMemory: a short phrase describing which past location to return to (e.g. 'home', 'where we started', 'the kitchen'), matched loosely against recent conversation. Empty otherwise.")
@@ -37,6 +37,7 @@ struct OnDeviceDecision {
 @Generable
 enum OnDeviceAction: String, CaseIterable {
     case navigateToObject
+    case follow
     case navigateToMemory
     case explore
     case lookAround
@@ -92,7 +93,7 @@ public final class OnDeviceBrain: RoverBrain {
         return try await makeResponder().nextAction(prompt: prompt, context: context)
     }
 
-    private static let instructions = """
+    static let instructions = """
             You are the on-device brain of a small autonomous ground rover. Decide the \
             single next action given what the operator said, what's currently visible, \
             remembered objects, unexplored openings, and your mission plan. Keep a short \
@@ -109,14 +110,21 @@ public final class OnDeviceBrain: RoverBrain {
             openings list to go check — prefer unexplored openings, and if one you checked \
             turned out empty, try the next. Use lookAround to scan in place, including \
             explicit commands like "turn left" or "turn right" (left is positive degrees, \
-            right is negative degrees). Ask only if \
+            right is negative degrees). Use follow only when the operator asks you to keep \
+            moving with someone ("follow me", "come with me", "follow the guy with the \
+            hat"); it continues on its own until they say stop. A question, a turn, or \
+            "go to"/"drive over to" someone is not follow — driving to a person once is \
+            navigateToObject. "Follow me" means the person talking to you: use visualQuery \
+            "person". When you are already following, keep going by choosing follow with \
+            exactly the description you are following, unless the operator asked for \
+            something else. Ask only if \
             you genuinely need clarification and haven't already asked; if a previous \
             question went unanswered, do your best with what you have rather than asking \
             again. Choose done once the operator's request is fully satisfied — including \
             any later steps of your plan, like returning after fetching something.
             """
 
-    private func promptText(_ context: MissionContext) -> String {
+    func promptText(_ context: MissionContext) -> String {
         var lines: [String] = []
         if let utterance = context.utterance { lines.append("Operator just said: \"\(utterance)\"") }
         if let plan = context.plan { lines.append("Current plan: \(plan)") }
@@ -145,13 +153,19 @@ public final class OnDeviceBrain: RoverBrain {
             lines.append("Recent conversation: " + context.memory.turns.suffix(5)
                 .map { "\"\($0.utterance)\"" }.joined(separator: "; "))
         }
+        if let followState = context.followState {
+            lines.append("You are currently \(followState). To keep following, choose follow with that same description.")
+        }
+        if !context.recentActions.isEmpty {
+            lines.append("Your recent actions and what happened: " + context.recentActions.suffix(4).joined(separator: "; "))
+        }
         if context.lastAnswerWasInconclusive {
             lines.append("Your last question went unanswered — proceed with your best guess instead of asking again.")
         }
         return lines.joined(separator: "\n")
     }
 
-    fileprivate static func map(_ raw: OnDeviceDecision, context: MissionContext) -> RoverDecision {
+    static func map(_ raw: OnDeviceDecision, context: MissionContext) -> RoverDecision {
         switch raw.action {
         case .navigateToObject:
             // A remembered object matching the description beats a fresh visual search —
@@ -162,6 +176,10 @@ public final class OnDeviceBrain: RoverBrain {
                 return .navigate(.worldPoint(remembered.worldPoint))
             }
             return .navigate(.visualQuery(raw.visualQuery))
+
+        case .follow:
+            let query = raw.visualQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+            return .follow(.visualQuery(query.isEmpty ? "person" : query))
 
         case .explore:
             return .explore(candidateId: raw.exploreCandidateId)

@@ -114,13 +114,57 @@ try await control.send(WheelCommand(left: 0.2, right: 0.2))
 try await control.stop()
 ```
 
+### Install the reference app on a phone
+
+Any iPhone or iPad that runs iOS 26 works; see the table below for what differs between
+phones.
+
+1. Get the latest `main` (if you already have a checkout with local changes you don't
+   need, `git fetch && git reset --hard origin/main` discards them):
+   ```bash
+   git clone https://github.com/coybot/coybot-sdk && cd coybot-sdk
+   ```
+2. Open `examples/PhroverOperator/PhroverOperator.xcodeproj` in Xcode.
+3. Select the **PhroverOperator** target → **Signing & Capabilities** → choose your
+   development team. If Xcode says the bundle identifier is taken, change it to
+   something unique to you.
+4. Plug in the phone and trust the Mac. On first install, turn on
+   **Settings → Privacy & Security → Developer Mode** on the phone and restart it.
+5. Pick the phone as the run destination and press **Run** (⌘R).
+6. On the phone, allow camera, microphone, speech recognition and local network access
+   when asked, then join the rover's WiFi (the ESP32's own network, `192.168.4.1` by
+   default).
+7. Optional: copy `Config/PhroverCloud.example.plist` to `PhroverCloud.plist` and fill in
+   your backend to enable sign-in and the cloud brain.
+
+Mount the phone any way up — orientation comes from gravity — with the rear camera
+facing forward. Hold the mic button on the **Talk** tab and say "follow me".
+
+What each phone can do:
+
+| Phone has | "follow me" | Other voice commands | Stops for obstacles |
+|---|---|---|---|
+| LiDAR + Apple Intelligence (e.g. iPhone 15 Pro and later Pro models, M-series iPad Pro) | Yes | On-device, or cloud when signed in | Yes |
+| Apple Intelligence, no LiDAR (e.g. iPhone 16, iPhone 17, iPhone Air) | Yes | On-device, or cloud when signed in | **No** |
+| LiDAR, no Apple Intelligence (e.g. iPhone 12 Pro–14 Pro) | Yes | Cloud only | Yes |
+| Neither (e.g. iPhone 11–15, iPhone 13 mini) | Yes | Cloud only | **No** |
+
+- **"follow me" needs no AI model.** Plain follow requests ("follow me", "come with me",
+  "follow the guy with the hat") are recognised directly, and a follow keeps running if
+  no brain is available — so it works offline on any phone.
+- **Without LiDAR there is no obstacle detection.** The rover holds its distance from the
+  person it follows but will not stop for a wall, a bag or anyone else. People are placed
+  where their feet meet the floor ARKit finds — sweep the camera over the floor once
+  before starting; plain glossy floors take longest.
+- **The WAVE ROVER tops out at about 0.35 m/s**, slower than a normal walk — walk slowly.
+
 ### Hardware compatibility
 
 - **Chassis**: Waveshare WAVE ROVER (or any base speaking the same Waveshare JSON
   protocol — `GET /js?json={"T":1,"L":<m/s>,"R":<m/s>}`).
-- **Phone**: iPhone/iPad with LiDAR for full autonomy (`ARSessionManager` uses scene
-  depth); manual teleop and voice work without LiDAR. iOS 26+ (Apple Foundation Model
-  floor).
+- **Phone**: any iPhone/iPad on iOS 26+. LiDAR adds obstacle stopping and room mapping;
+  Apple Intelligence adds an offline brain for commands other than follow (see the table
+  above).
 
 ## What's included
 

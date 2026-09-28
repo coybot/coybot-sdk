@@ -205,6 +205,65 @@ final class UnprojectionTests: XCTestCase {
         XCTAssertEqual(landscape.size.height, 20)
     }
 
+    // MARK: - No LiDAR
+
+    private static let intrinsics = simd_float3x3(columns: (
+        SIMD3<Float>(1000, 0, 0), SIMD3<Float>(0, 1000, 0), SIMD3<Float>(960, 720, 1)
+    ))
+    private static let sensor = CGSize(width: 1920, height: 1440)
+
+    func testCameraRayAgreesWithUnprojection() {
+        let transform = Self.levelCamera(rollDegrees: 0)
+        let point = CGPoint(x: 0.3, y: 0.2)
+        let ray = ARSessionManager.cameraRay(through: point, imageSize: Self.sensor, orientation: .right,
+                                             intrinsics: Self.intrinsics, cameraTransform: transform)
+        let atDepth = ARSessionManager.unprojectPoint(point, imageSize: Self.sensor, orientation: .right,
+                                                      intrinsics: Self.intrinsics, cameraTransform: transform,
+                                                      depth: 3)
+        // Same pixel, so the depth-3 point lies on the ray.
+        let horizontal = simd_normalize(SIMD2(ray.direction.x, ray.direction.z))
+        let toPoint = simd_normalize(SIMD2(Float(atDepth.x) - ray.origin.x, Float(atDepth.y) - ray.origin.z))
+        XCTAssertEqual(simd_dot(horizontal, toPoint), 1, accuracy: 1e-4)
+    }
+
+    /// A phone 0.2 m up on the rover, looking level: the ray to feet 2.5 m ahead drops
+    /// 0.2 m over 2.5 m, and must land on the floor there.
+    func testFeetRayLandsOnTheFloorAtTheirDistance() {
+        let origin = SIMD3<Float>(0, 0.2, 0)
+        let direction = simd_normalize(SIMD3<Float>(0, -0.2, -2.5))
+
+        let hit = ARSessionManager.floorIntersection(origin: origin, direction: direction, floorY: 0)
+
+        XCTAssertEqual(hit?.z ?? 0, -2.5, accuracy: 1e-3)
+        XCTAssertEqual(hit?.y ?? 1, 0, accuracy: 1e-4)
+    }
+
+    func testALevelOrRisingRayNeverHitsTheFloor() {
+        let origin = SIMD3<Float>(0, 0.2, 0)
+        XCTAssertNil(ARSessionManager.floorIntersection(origin: origin, direction: SIMD3(0, 0, -1), floorY: 0))
+        XCTAssertNil(ARSessionManager.floorIntersection(origin: origin, direction: simd_normalize(SIMD3(0, 0.1, -1)), floorY: 0))
+        // Nearly level: the "hit" is tens of metres out, which is noise, not a person.
+        XCTAssertNil(ARSessionManager.floorIntersection(origin: origin, direction: simd_normalize(SIMD3(0, -0.005, -1)), floorY: 0))
+    }
+
+    func testRangeFromApparentHeight() {
+        // 1.7 m tall at 2.5 m with a 1000 px focal length spans 680 px of the frame's
+        // height. Portrait (.right): upright height is the sensor's 1920 px width.
+        let fraction = 680.0 / 1920.0
+        let box = CGRect(x: 0.4, y: 0.3, width: 0.2, height: fraction)
+
+        let range = ARSessionManager.depthFromApparentHeight(box, imageSize: Self.sensor, orientation: .right,
+                                                             intrinsics: Self.intrinsics)
+
+        XCTAssertEqual(range ?? 0, 2.5, accuracy: 0.01)
+    }
+
+    func testACutOffPersonGivesNoRange() {
+        let touchingBottom = CGRect(x: 0.4, y: 0.0, width: 0.2, height: 0.6)
+        XCTAssertNil(ARSessionManager.depthFromApparentHeight(touchingBottom, imageSize: Self.sensor,
+                                                              orientation: .right, intrinsics: Self.intrinsics))
+    }
+
     // MARK: - Helpers
 
     /// Camera looking level along world -Z, rolled about its optical axis. ARKit's camera

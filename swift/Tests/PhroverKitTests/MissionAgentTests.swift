@@ -10,6 +10,62 @@ import RoverNav
 /// only be verified on a real device (see rover/README.md status notes).
 @MainActor
 final class MissionAgentTests: XCTestCase {
+    func testPlainFollowRequestsAreRecognisedWithoutABrain() {
+        let cases: [(String, String?)] = [
+            ("follow me", "person"),
+            ("Follow me, please.", "person"),
+            ("hey rover follow me to the gate", "person"),
+            ("come with me", "person"),
+            ("tag along", "person"),
+            ("follow the guy with the hat", "the guy with the hat"),
+            ("keep up with that woman", "that woman"),
+            ("follow the hallway", nil),
+            ("follow me and then come back", nil),
+            ("go to the chair", nil),
+            ("is anyone there", nil),
+        ]
+        for (utterance, expected) in cases {
+            XCTAssertEqual(MissionAgent.directFollowQuery(utterance), expected, utterance)
+        }
+    }
+
+    /// iPhone 13 mini offline: no Apple Intelligence, no cloud — no brain at all.
+    func testFollowMeWorksWithNoBrainAtAll() async {
+        let perception = FakePerception()
+        perception.objects = [PerceivedObject(label: "person", confidence: 0.95,
+                                              normalizedPoint: CGPoint(x: 0.5, y: 0.5))]
+        let follower = FakeFollower()
+        let voice = FakeVoice()
+        let agent = MissionAgent(motion: FakeMotion(), perception: perception, voice: voice,
+                                 follower: follower) { nil }
+
+        await agent.handle("follow me")
+
+        XCTAssertEqual(follower.followCalls.map(\.query), ["person"])
+        XCTAssertFalse(voice.spoken.contains { $0.contains("think") }, "\(voice.spoken)")
+        XCTAssertTrue(voice.spoken.contains("lost them"), "the follow's end is still reported")
+    }
+
+    /// A brain that can't answer (Apple Intelligence unavailable, cloud down) must not end
+    /// a follow that is going fine.
+    func testAFollowKeepsGoingWhenTheBrainFails() async {
+        let perception = FakePerception()
+        perception.objects = [PerceivedObject(label: "person", confidence: 0.95,
+                                              normalizedPoint: CGPoint(x: 0.5, y: 0.5))]
+        let follower = FakeFollower()
+        follower.endsAfter = 0.5
+        let voice = FakeVoice()
+        let brain = ThrowingBrain(error: RoverBrainError.unavailable)
+        let agent = MissionAgent(motion: FakeMotion(), perception: perception, voice: voice,
+                                 follower: follower, brainErrorLogger: { _, _ in }) { brain }
+
+        await agent.handle("follow me")
+
+        XCTAssertEqual(follower.followCalls.count, 1, "a re-stated follow must not restart the lock")
+        XCTAssertEqual(follower.stopCallCount, 0)
+        XCTAssertFalse(voice.spoken.contains { $0.contains("trouble thinking") }, "\(voice.spoken)")
+    }
+
     func testFollowDecisionStartsTheFollower() async {
         let motion = FakeMotion()
         let perception = FakePerception()

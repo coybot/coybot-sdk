@@ -33,6 +33,11 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     /// model sees the scene upright, and `unproject` inverts the same rotation — so the
     /// phone can be mounted portrait, landscape either way, or upside down.
     public private(set) var imageOrientation: CGImagePropertyOrientation = .right
+    /// World height (ARKit y) of the floor, from the lowest horizontal plane ARKit has
+    /// found below the camera. What a phone with no LiDAR places people and objects on.
+    public private(set) var floorHeight: Float?
+    /// Whether this device produces a LiDAR depth map at all (Pro iPhones and iPads).
+    public var hasLiDAR: Bool { ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) }
     private var lastClearanceLogAt = Date.distantPast
 
     public override init() {
@@ -51,6 +56,11 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         }
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
             config.frameSemantics.insert(.smoothedSceneDepth)
+        }
+        // Without LiDAR there is no depth map; the floor plane is what everything is
+        // placed on instead (see `groundPoint(boundingBox:label:)`).
+        if !hasLiDAR {
+            config.planeDetection = [.horizontal]
         }
         session.run(config, options: [.resetTracking, .removeExistingAnchors])
     }
@@ -76,8 +86,26 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         }
     }
 
-    public func session(_ session: ARSession, didAdd anchors: [ARAnchor]) { collectMesh(anchors) }
-    public func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) { collectMesh(anchors) }
+    public func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
+        collectMesh(anchors)
+        collectFloor(anchors)
+    }
+    public func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
+        collectMesh(anchors)
+        collectFloor(anchors)
+    }
+
+    private func collectFloor(_ anchors: [ARAnchor]) {
+        guard let cameraY = latestCamera?.transform.columns.3.y else { return }
+        let heights = anchors
+            .compactMap { $0 as? ARPlaneAnchor }
+            .filter { $0.alignment == .horizontal }
+            .map { $0.transform.columns.3.y }
+            // A table top is a horizontal plane too; the floor is below the camera.
+            .filter { $0 < cameraY - 0.05 }
+        guard let lowest = heights.min() else { return }
+        floorHeight = min(floorHeight ?? lowest, lowest)
+    }
 
     private func collectMesh(_ anchors: [ARAnchor]) {
         let mesh = anchors.compactMap { $0 as? ARMeshAnchor }
@@ -126,6 +154,77 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         }
         return Self.unprojectPoint(normalizedPoint, imageSize: imageSize, orientation: imageOrientation,
                                    intrinsics: camera.intrinsics, cameraTransform: camera.transform, depth: depth)
+    }
+
+    /// Where a detected object stands on the nav plane. With LiDAR, the depth under its
+    /// centre (`unproject`). Without it, where the ray through the bottom-centre of its
+    /// box — a person's feet — meets the floor ARKit has found; before a floor is found,
+    /// and only for a person, from how tall they look against an assumed 1.7 m.
+    public func groundPoint(boundingBox box: CGRect, label: String) -> Vec2? {
+        if latestDepthMap != nil {
+            return unproject(normalizedPoint: CGPoint(x: box.midX, y: box.midY))
+        }
+        guard let camera = latestCamera else { return nil }
+        let imageSize = camera.imageResolution
+        if let floorHeight {
+            let ray = Self.cameraRay(through: CGPoint(x: box.midX, y: box.minY), imageSize: imageSize,
+                                     orientation: imageOrientation, intrinsics: camera.intrinsics,
+                                     cameraTransform: camera.transform)
+            if let hit = Self.floorIntersection(origin: ray.origin, direction: ray.direction, floorY: floorHeight) {
+                return Vec2(Double(hit.x), Double(hit.z))
+            }
+        }
+        guard MissionAgent.visualQueryMatchScore(query: "person", label: label) > 0,
+              let depth = Self.depthFromApparentHeight(box, imageSize: imageSize,
+                                                        orientation: imageOrientation,
+                                                        intrinsics: camera.intrinsics)
+        else { return nil }
+        return Self.unprojectPoint(CGPoint(x: box.midX, y: box.midY), imageSize: imageSize,
+                                   orientation: imageOrientation, intrinsics: camera.intrinsics,
+                                   cameraTransform: camera.transform, depth: Float(depth))
+    }
+
+    /// The world ray through a Vision-normalized image point.
+    static func cameraRay(through point: CGPoint, imageSize: CGSize, orientation: CGImagePropertyOrientation,
+                          intrinsics: simd_float3x3, cameraTransform: simd_float4x4)
+        -> (origin: SIMD3<Float>, direction: SIMD3<Float>) {
+        let sensor = sensorPixel(forVisionNormalizedPoint: point, imageSize: imageSize, orientation: orientation)
+        let fx = Double(intrinsics[0][0]), fy = Double(intrinsics[1][1])
+        let cx = Double(intrinsics[2][0]), cy = Double(intrinsics[2][1])
+        // Camera space at depth 1: +X right, +Y up, looking down -Z (as in unprojectPoint).
+        let local = SIMD4<Float>(Float((sensor.x - cx) / fx), Float(-(sensor.y - cy) / fy), -1, 0)
+        let world = cameraTransform * local
+        let origin = cameraTransform.columns.3
+        return (SIMD3(origin.x, origin.y, origin.z), simd_normalize(SIMD3(world.x, world.y, world.z)))
+    }
+
+    /// Where a ray meets the horizontal plane y = `floorY`, if it points down at it and
+    /// lands within `maxRange` metres (a nearly level ray "hits" the floor absurdly far
+    /// away, which is worse than no answer).
+    static func floorIntersection(origin: SIMD3<Float>, direction: SIMD3<Float>, floorY: Float,
+                                  maxRange: Float = 12) -> SIMD3<Float>? {
+        guard direction.y < -1e-3, origin.y > floorY else { return nil }
+        let t = (floorY - origin.y) / direction.y
+        let hit = origin + t * direction
+        let horizontal = simd_length(SIMD2(hit.x - origin.x, hit.z - origin.z))
+        return horizontal <= maxRange ? hit : nil
+    }
+
+    /// Range (m, along the optical axis) to a person from how tall their box is, assuming
+    /// `assumedHeight`. Rough — a child or someone sitting reads far — so it is only the
+    /// fallback until ARKit has a floor. `nil` when the box touches the top or bottom of
+    /// the frame, since a cut-off person looks shorter and so farther than they are.
+    static func depthFromApparentHeight(_ box: CGRect, imageSize: CGSize, orientation: CGImagePropertyOrientation,
+                                        intrinsics: simd_float3x3, assumedHeight: Double = 1.7) -> Double? {
+        guard box.minY > 0.02, box.maxY < 0.98 else { return nil }
+        let top = sensorPixel(forVisionNormalizedPoint: CGPoint(x: box.midX, y: box.maxY),
+                              imageSize: imageSize, orientation: orientation)
+        let bottom = sensorPixel(forVisionNormalizedPoint: CGPoint(x: box.midX, y: box.minY),
+                                 imageSize: imageSize, orientation: orientation)
+        let pixels = hypot(top.x - bottom.x, top.y - bottom.y)
+        guard pixels > 1 else { return nil }
+        let focal = Double(intrinsics[0][0] + intrinsics[1][1]) / 2
+        return focal * assumedHeight / pixels
     }
 
     /// Undoes the rotation a Vision request (or `CIImage.oriented`) applied for

@@ -295,7 +295,7 @@ public final class FollowController {
 
     private func observations() -> [TargetObservation] {
         perception.detectObjects().compactMap { object in
-            guard let world = perception.unproject(normalizedPoint: object.normalizedPoint) else {
+            guard let world = perception.groundPoint(of: object) else {
                 return nil
             }
             return TargetObservation(label: object.label,

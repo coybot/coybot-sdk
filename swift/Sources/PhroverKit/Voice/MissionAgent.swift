@@ -41,6 +41,10 @@ public protocol RoverPerception: AnyObject {
     /// current view, or `nil` if nothing matches. Has a default (substring-match)
     /// implementation below; conform your own for open-vocabulary/attribute grounding.
     func groundObject(query: String) -> CGPoint?
+    /// Where a detected object stands on the nav plane. The default unprojects its
+    /// centre point through depth; a phone without LiDAR has no depth and places it by
+    /// its base on the floor instead (`ARPerceptionSource`).
+    func groundPoint(of object: PerceivedObject) -> Vec2?
     /// Openings into unexplored space (frontier detection over the scene mesh). Default
     /// implementation returns [] for perception sources with no mapping capability.
     func explorationFrontiers() -> [Frontier]
@@ -59,6 +63,10 @@ extension RoverPerception {
     }
 
     public func explorationFrontiers() -> [Frontier] { [] }
+
+    public func groundPoint(of object: PerceivedObject) -> Vec2? {
+        unproject(normalizedPoint: object.normalizedPoint)
+    }
 }
 
 /// Default `RoverPerception`: on-device COCO detection over the live ARKit frame.
@@ -79,12 +87,18 @@ public final class ARPerceptionSource: RoverPerception {
         return detector.detect(buffer, orientation: ar.imageOrientation).map {
             PerceivedObject(label: $0.label,
                             confidence: $0.confidence,
-                            normalizedPoint: CGPoint(x: $0.boundingBox.midX, y: $0.boundingBox.midY))
+                            normalizedPoint: CGPoint(x: $0.boundingBox.midX, y: $0.boundingBox.midY),
+                            boundingBox: $0.boundingBox)
         }
     }
 
     public func unproject(normalizedPoint: CGPoint) -> Vec2? {
         ar.unproject(normalizedPoint: normalizedPoint)
+    }
+
+    public func groundPoint(of object: PerceivedObject) -> Vec2? {
+        guard let box = object.boundingBox else { return unproject(normalizedPoint: object.normalizedPoint) }
+        return ar.groundPoint(boundingBox: box, label: object.label)
     }
 
     public func capturedFrameJPEG() -> Data? {
@@ -377,7 +391,13 @@ public final class MissionAgent {
                 RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
                 return
             }
-            guard let brain = currentBrain() else {
+            // A plain follow request needs no model to understand, and a running follow
+            // needs none to continue — which is what makes "follow me" work on a phone
+            // with no Apple Intelligence and no signal.
+            let directFollow = tick == 0 ? firstUtterance.flatMap(Self.directFollowQuery) : nil
+            let brain = currentBrain()
+            if brain == nil, directFollow == nil || follower == nil, !isFollowing {
+                if followEndedWithNothingElseToDo { phase = .idle; return }
                 voice.speak("Sorry, I can't think right now.")
                 RuntimeFileLog.append("mission_failed", fields: [
                     "mission": "\(missionID)",
@@ -403,33 +423,55 @@ public final class MissionAgent {
             nextUtterance = nil
 
             let output: BrainOutput
-            do {
-                output = try await nextBrainAction(brain, context: ctx)
-            } catch is BrainDecisionTimeoutError {
-                guard isCurrentMission(missionID) else {
-                    phase = .idle
-                    RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
-                    return
-                }
-                voice.speak("Sorry, I'm having trouble thinking right now.")
-                RuntimeFileLog.append("mission_brain_timeout", fields: [
-                    "mission": "\(missionID)",
-                    "timeout": String(format: "%.2f", brainDecisionTimeout)
+            if let directFollow, follower != nil {
+                output = BrainOutput(decision: .follow(.visualQuery(directFollow)))
+                RuntimeFileLog.append("mission_follow_direct", fields: [
+                    "mission": "\(missionID)", "query": directFollow
                 ])
-                brainFailed = true
-                break
-            } catch {
-                guard isCurrentMission(missionID) else {
-                    phase = .idle
-                    RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
-                    return
+            } else if let brain {
+                do {
+                    output = try await nextBrainAction(brain, context: ctx)
+                } catch is BrainDecisionTimeoutError {
+                    if let keep = keepFollowingOutput(missionID: missionID) {
+                        output = keep
+                    } else {
+                        guard isCurrentMission(missionID) else {
+                            phase = .idle
+                            RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
+                            return
+                        }
+                        if followEndedWithNothingElseToDo { phase = .idle; return }
+                        voice.speak("Sorry, I'm having trouble thinking right now.")
+                        RuntimeFileLog.append("mission_brain_timeout", fields: [
+                            "mission": "\(missionID)",
+                            "timeout": String(format: "%.2f", brainDecisionTimeout)
+                        ])
+                        brainFailed = true
+                        break
+                    }
+                } catch {
+                    if let keep = keepFollowingOutput(missionID: missionID, error: error, context: ctx) {
+                        output = keep
+                    } else {
+                        guard isCurrentMission(missionID) else {
+                            phase = .idle
+                            RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
+                            return
+                        }
+                        brainErrorLogger(error, ctx)
+                        if followEndedWithNothingElseToDo { phase = .idle; return }
+                        voice.speak("Sorry, I'm having trouble thinking right now.")
+                        RuntimeFileLog.append("mission_brain_error", fields: [
+                            "mission": "\(missionID)",
+                            "error": error.localizedDescription
+                        ])
+                        brainFailed = true
+                        break
+                    }
                 }
-                brainErrorLogger(error, ctx)
-                voice.speak("Sorry, I'm having trouble thinking right now.")
-                RuntimeFileLog.append("mission_brain_error", fields: [
-                    "mission": "\(missionID)",
-                    "error": error.localizedDescription
-                ])
+            } else if let keep = keepFollowingOutput(missionID: missionID) {
+                output = keep
+            } else {
                 brainFailed = true
                 break
             }
@@ -739,7 +781,7 @@ public final class MissionAgent {
     private func updateWorldModel() {
         // Object permanence: pin every current detection to the nav plane.
         for object in perception.detectObjects() {
-            if let world = perception.unproject(normalizedPoint: object.normalizedPoint) {
+            if let world = perception.groundPoint(of: object) {
                 memory.rememberObject(label: object.label, at: world)
             }
         }
@@ -1450,6 +1492,68 @@ public final class MissionAgent {
             .joined(separator: ",")
     }
 
+    /// The follow this mission was for has ended (and said why). With no brain to ask
+    /// what next, that is the end of the mission — not an apology for not thinking.
+    private var followEndedWithNothingElseToDo: Bool {
+        guard case .follow = lastDecision, case .ended = follower?.followState else { return false }
+        return true
+    }
+
+    private var isFollowing: Bool {
+        guard let follower, follower.followingSpec != nil else { return false }
+        if case .ended = follower.followState { return false }
+        return true
+    }
+
+    /// While a follow is running, a brain that is missing, unavailable, errors or times
+    /// out means "carry on", not "give up": the follow needs no reasoning to continue, and
+    /// the operator can still say stop. `nil` when nothing is being followed.
+    private func keepFollowingOutput(missionID: Int, error: Error? = nil,
+                                     context: MissionContext? = nil) -> BrainOutput? {
+        guard isFollowing, let spec = follower?.followingSpec else { return nil }
+        if let error, let context { brainErrorLogger(error, context) }
+        RuntimeFileLog.append("mission_follow_without_brain", fields: [
+            "mission": "\(missionID)",
+            "query": spec.query,
+            "error": error?.localizedDescription ?? "no brain"
+        ])
+        return BrainOutput(decision: .follow(.visualQuery(spec.query)))
+    }
+
+    /// The target of an utterance that is nothing but a request to follow a person —
+    /// "follow me", "come with me", "follow the guy with the hat" — or `nil` for anything
+    /// else, which goes to the brain. Deliberately narrow: compound requests ("follow me
+    /// and then come back"), and follows of things that aren't people ("follow the
+    /// hallway"), are the brain's to interpret.
+    static func directFollowQuery(_ utterance: String) -> String? {
+        var text = " " + utterance.lowercased()
+            .components(separatedBy: CharacterSet.letters.union(.whitespaces).union(CharacterSet(charactersIn: "'")).inverted)
+            .joined(separator: " ")
+            .split(separator: " ").joined(separator: " ") + " "
+        for filler in [" hey ", " ok ", " okay ", " rover ", " phrover ", " please ", " now ",
+                       " can you ", " could you ", " would you ", " will you ", " just "] {
+            text = text.replacingOccurrences(of: filler, with: " ")
+        }
+        text = text.trimmingCharacters(in: .whitespaces)
+        if ["and", "then", "until", "after", "unless"].contains(where: {
+            text.split(separator: " ").map(String.init).contains($0)
+        }) { return nil }
+        if ["tag along", "come along", "follow"].contains(text) { return "person" }
+
+        let verbs = ["follow", "come with", "walk with", "stay with", "stick with", "go with",
+                     "keep up with", "tag along with", "come along with", "stay behind", "walk behind"]
+        guard let verb = verbs.first(where: { text.hasPrefix($0 + " ") }) else { return nil }
+        var target = String(text.dropFirst(verb.count + 1))
+        // "follow me to the gate": where they are going doesn't change who to follow.
+        for cut in [" to ", " into ", " toward ", " towards ", " over to ", " around "] {
+            if let range = target.range(of: cut) { target = String(target[..<range.lowerBound]) }
+        }
+        target = target.trimmingCharacters(in: .whitespaces)
+        if ["me", "us", "him", "her", "them", "this guy", "that guy"].contains(target) { return "person" }
+        guard visualQueryMatches(query: target, label: "person") else { return nil }
+        return target
+    }
+
     /// "the person with the hat" as it would be said aloud: the brain's description,
     /// with "the" added only if it doesn't already open with a determiner.
     static func spokenTarget(_ query: String) -> String {
@@ -1565,7 +1669,7 @@ public final class MissionAgent {
     private func nearestDetectedLabel(toWorldPoint point: Vec2) -> String? {
         perception.detectObjects()
             .compactMap { object -> (String, Double)? in
-                guard let world = perception.unproject(normalizedPoint: object.normalizedPoint) else {
+                guard let world = perception.groundPoint(of: object) else {
                     return nil
                 }
                 return (object.label, world.distance(to: point))

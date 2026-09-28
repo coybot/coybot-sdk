@@ -10,11 +10,16 @@ public struct PerceivedObject: Equatable, Sendable {
     /// Normalized Vision-space point (bottom-left origin), suitable for
     /// `ARSessionManager.unproject(normalizedPoint:)`.
     public var normalizedPoint: CGPoint
+    /// The detection's box in the same frame, when the detector produced one. Lets a
+    /// phone with no LiDAR place the object by where its base meets the floor
+    /// (`ARSessionManager.groundPoint(boundingBox:label:)`) instead of by depth.
+    public var boundingBox: CGRect?
 
-    public init(label: String, confidence: Float, normalizedPoint: CGPoint) {
+    public init(label: String, confidence: Float, normalizedPoint: CGPoint, boundingBox: CGRect? = nil) {
         self.label = label
         self.confidence = confidence
         self.normalizedPoint = normalizedPoint
+        self.boundingBox = boundingBox
     }
 }
 

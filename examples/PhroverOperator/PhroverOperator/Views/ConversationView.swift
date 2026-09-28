@@ -13,6 +13,7 @@ import UIKit
 /// `PhroverCloud.plist` is configured; on-device only otherwise.
 struct ConversationView: View {
     let ar: ARSessionManager
+    let control: RoverControl
     let nav: NavigationController
     let cloudBrain: CloudBrain?
 
@@ -71,7 +72,11 @@ struct ConversationView: View {
             let voice = SpeechRoverVoice(out: speechOut, speechIn: speechIn)
             let onDevice = OnDeviceBrain()
             let brain: RoverBrain = cloudBrain.map { HybridBrain(cloud: $0, onDevice: onDevice) } ?? onDevice
-            agent = MissionAgent(motion: nav, perception: perception, voice: voice, phaseDidChange: { phase in
+            // "follow me" needs a follower; without one the agent can only say it can't.
+            let follower = FollowController(perception: perception,
+                                            drive: LocalRoverDrive(ar: ar, control: control))
+            agent = MissionAgent(motion: nav, perception: perception, voice: voice, follower: follower,
+                                 phaseDidChange: { phase in
                 missionPhase = phase
             }) { brain }
         }

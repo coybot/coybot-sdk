@@ -62,6 +62,51 @@ final class UnprojectionTests: XCTestCase {
         XCTAssertEqual(clearance, 3.5, accuracy: 0.001)
     }
 
+    func testSampleObjectDepthUsesBoundingBoxMedianInsteadOfCenterOutlier() throws {
+        let imageSize = CGSize(width: 100, height: 100)
+        // Fine enough that neighbouring sample points' windows don't overlap.
+        let depthMap = Self.makeDepthBuffer(width: 60, height: 60, constantDepth: 5.5)
+        let box = CGRect(x: 0.2, y: 0.2, width: 0.6, height: 0.6)
+
+        for point in ARSessionManager.objectDepthSamplePoints(in: box) where point != CGPoint(x: 0.5, y: 0.5) {
+            Self.setDepth(1.2, atVisionNormalizedPoint: point, imageSize: imageSize, in: depthMap)
+        }
+
+        let sample = try XCTUnwrap(
+            ARSessionManager.sampleObjectDepth(
+                depthMap,
+                inVisionNormalizedBoundingBox: box,
+                imageSize: imageSize
+            )
+        )
+
+        XCTAssertEqual(sample.depth, 1.2, accuracy: 0.001)
+        XCTAssertNotEqual(sample.point, CGPoint(x: 0.5, y: 0.5))
+    }
+
+    func testSampleObjectDepthPrefersNearestSupportedClusterOverBackgroundMajority() throws {
+        let imageSize = CGSize(width: 100, height: 100)
+        // Fine enough that neighbouring sample points' windows don't overlap.
+        let depthMap = Self.makeDepthBuffer(width: 60, height: 60, constantDepth: 5.5)
+        let box = CGRect(x: 0.2, y: 0.2, width: 0.6, height: 0.6)
+        let points = ARSessionManager.objectDepthSamplePoints(in: box)
+
+        for point in points.prefix(3) {
+            Self.setDepth(1.2, atVisionNormalizedPoint: point, imageSize: imageSize, in: depthMap)
+        }
+
+        let sample = try XCTUnwrap(
+            ARSessionManager.sampleObjectDepth(
+                depthMap,
+                inVisionNormalizedBoundingBox: box,
+                imageSize: imageSize
+            )
+        )
+
+        XCTAssertEqual(sample.depth, 1.2, accuracy: 0.001)
+        XCTAssertTrue(points.prefix(3).contains(sample.point))
+    }
+
     func testUnprojectPointAtIdentityTransform() {
         // fx = fy = 500, principal point (cx, cy) = (400, 300), raw sensor 600x800.
         let intrinsics = simd_float3x3(columns: (
@@ -354,5 +399,27 @@ final class UnprojectionTests: XCTestCase {
         let stride = CVPixelBufferGetBytesPerRow(depthMap) / MemoryLayout<Float32>.size
         let base = CVPixelBufferGetBaseAddress(depthMap)!.assumingMemoryBound(to: Float32.self)
         base[y * stride + x] = depth
+    }
+
+    private static func setDepth(_ depth: Float,
+                                 atVisionNormalizedPoint point: CGPoint,
+                                 imageSize: CGSize,
+                                 in depthMap: CVPixelBuffer) {
+        let sensor = ARSessionManager.sensorPixel(
+            forVisionNormalizedPoint: point,
+            imageSize: imageSize
+        )
+        let width = CVPixelBufferGetWidth(depthMap)
+        let height = CVPixelBufferGetHeight(depthMap)
+        let x = min(width - 1, max(0, Int((sensor.x / imageSize.width) * Double(width))))
+        let y = min(height - 1, max(0, Int((sensor.y / imageSize.height) * Double(height))))
+        // Paint a 3x3 surface patch, not one pixel: `sampleDepth` reads a small window
+        // around the point (see `depthSampleWindowFraction`), so a lone pixel is — by
+        // design — treated as noise rather than an object surface.
+        for py in max(0, y - 1)...min(height - 1, y + 1) {
+            for px in max(0, x - 1)...min(width - 1, x + 1) {
+                setDepth(depth, x: px, y: py, in: depthMap)
+            }
+        }
     }
 }

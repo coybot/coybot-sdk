@@ -4,22 +4,61 @@ import RoverNav
 
 /// One perceived object, as seen by whichever detector produced it — the on-device COCO
 /// `Detector`, or a cloud VLM's open-vocabulary grounding.
+public struct ObjectColorEvidence: Equatable, Sendable {
+    public let color: LocalObjectColor
+    public let confidence: Float
+
+    public init(color: LocalObjectColor, confidence: Float) {
+        self.color = color
+        self.confidence = Self.clamped(confidence)
+    }
+
+    private static func clamped(_ confidence: Float) -> Float {
+        confidence.isFinite ? min(max(confidence, 0), 1) : 0
+    }
+}
+
 public struct PerceivedObject: Equatable, Sendable {
     public var label: String
-    public var confidence: Float
+    public var confidence: Float {
+        didSet { confidence = Self.clamped(confidence) }
+    }
     /// Normalized Vision-space point (bottom-left origin), suitable for
     /// `ARSessionManager.unproject(normalizedPoint:)`.
     public var normalizedPoint: CGPoint
-    /// The detection's box in the same frame, when the detector produced one. Lets a
-    /// phone with no LiDAR place the object by where its base meets the floor
+    /// Normalized Vision-space bounds (bottom-left origin) in the same frame, when the
+    /// detector produced one. Used for local image analysis, multi-sample LiDAR depth, and
+    /// — on a phone with no LiDAR — placing the object by where its base meets the floor
     /// (`ARSessionManager.groundPoint(boundingBox:label:)`) instead of by depth.
-    public var boundingBox: CGRect?
+    public var normalizedBoundingBox: CGRect?
+    /// Dominant local colors, sorted by confidence and then color name.
+    public var colorEvidence: [ObjectColorEvidence] {
+        didSet { colorEvidence = Self.sorted(colorEvidence) }
+    }
 
-    public init(label: String, confidence: Float, normalizedPoint: CGPoint, boundingBox: CGRect? = nil) {
+    public init(label: String,
+                confidence: Float,
+                normalizedPoint: CGPoint,
+                normalizedBoundingBox: CGRect? = nil,
+                colorEvidence: [ObjectColorEvidence] = []) {
         self.label = label
-        self.confidence = confidence
+        self.confidence = Self.clamped(confidence)
         self.normalizedPoint = normalizedPoint
-        self.boundingBox = boundingBox
+        self.normalizedBoundingBox = normalizedBoundingBox
+        self.colorEvidence = Self.sorted(colorEvidence)
+    }
+
+    private static func clamped(_ confidence: Float) -> Float {
+        confidence.isFinite ? min(max(confidence, 0), 1) : 0
+    }
+
+    private static func sorted(_ evidence: [ObjectColorEvidence]) -> [ObjectColorEvidence] {
+        evidence.sorted {
+            if $0.confidence != $1.confidence {
+                return $0.confidence > $1.confidence
+            }
+            return $0.color.rawValue < $1.color.rawValue
+        }
     }
 }
 
@@ -59,8 +98,15 @@ public struct MissionMemory: Sendable {
 
     public private(set) var turns: [Turn] = []
     public private(set) var rememberedObjects: [RememberedObject] = []
+    private var currentMissionTurnStart = 0
     /// Where the rover was when the very first utterance of the mission was recorded.
     public private(set) var missionStartPose: Pose2D?
+
+    /// Conversation recorded since the current operator command began. Brains use this
+    /// view for current-mission grounding while `turns` remains available for recall.
+    public var currentMissionTurns: ArraySlice<Turn> {
+        turns.dropFirst(currentMissionTurnStart)
+    }
 
     /// Same label within this distance = the same physical object (updated, not duplicated).
     static let objectMergeRadius = 0.75
@@ -72,6 +118,7 @@ public struct MissionMemory: Sendable {
     /// the first pose observed during the lifetime of the app's `MissionAgent`.
     public mutating func beginMission(utterance: String, at pose: Pose2D) {
         missionStartPose = pose
+        currentMissionTurnStart = turns.count
         turns.append(Turn(utterance: utterance, pose: pose))
     }
 
@@ -219,6 +266,9 @@ public struct BrainOutput: Equatable, Sendable {
 /// Deliberately data-only so different brains — an on-device text reasoner, a cloud vision
 /// reasoner — can consume the same shape, each using whatever subset it can.
 public struct MissionContext: Sendable {
+    /// Stable identifier assigned by `MissionAgent` for correlating brain selection,
+    /// perception, and navigation telemetry. Standalone brain callers may leave it nil.
+    public var missionID: Int?
     /// What the operator just said, if this tick was triggered by a fresh utterance.
     public var utterance: String?
     /// Downscaled JPEG of the rover's current view, for brains that can see. `nil` when no
@@ -261,7 +311,8 @@ public struct MissionContext: Sendable {
     /// attempt or the fortieth).
     public var recentActions: [String]
 
-    public init(utterance: String? = nil,
+    public init(missionID: Int? = nil,
+                utterance: String? = nil,
                 frameJPEG: Data? = nil,
                 visibleObjects: [PerceivedObject] = [],
                 pose: Pose2D? = nil,
@@ -274,6 +325,7 @@ public struct MissionContext: Sendable {
                 teamContext: TeamContext? = nil,
                 followState: String? = nil,
                 recentActions: [String] = []) {
+        self.missionID = missionID
         self.utterance = utterance
         self.frameJPEG = frameJPEG
         self.visibleObjects = visibleObjects
@@ -290,19 +342,43 @@ public struct MissionContext: Sendable {
     }
 }
 
+/// Structured mission diagnostics shared by the brain selector and mission executor.
+/// Runtime callers normally use the default closure supplied by their initializer; tests
+/// can inject one sink across both components to assert causal event ordering.
+public typealias MissionTelemetrySink = (_ event: String, _ fields: [String: String]) -> Void
+
+extension OnDeviceBrainAvailability {
+    public var logValue: String {
+        switch self {
+        case .available: "available"
+        case .deviceNotEligible: "device_not_eligible"
+        case .appleIntelligenceNotEnabled: "apple_intelligence_not_enabled"
+        case .modelNotReady: "model_not_ready"
+        }
+    }
+}
+
 /// A reasoner that turns a `MissionContext` into the next action (plus an optional plan
-/// rewrite). Two implementations, chosen by `MissionAgent` per think-tick based on
-/// connectivity: `CloudBrain` (primary, open-vocabulary) and `OnDeviceBrain` (fallback,
-/// best-effort).
+/// rewrite). `HybridBrain` attempts `OnDeviceBrain` first and uses a configured cloud
+/// brain only as an optional second stage.
 @MainActor
 public protocol RoverBrain: AnyObject {
     func nextAction(_ context: MissionContext) async throws -> BrainOutput
 }
 
-public enum RoverBrainError: LocalizedError {
+public enum RoverBrainError: Error, Equatable, LocalizedError {
     case unavailable
+    case onDeviceUnavailable(OnDeviceBrainAvailability)
+    case unsupported(String)
 
     public var errorDescription: String? {
-        "This brain is not available right now."
+        switch self {
+        case .unavailable:
+            "This brain is not available right now."
+        case .onDeviceUnavailable(let availability):
+            availability.operatorMessage
+        case .unsupported(let message):
+            message
+        }
     }
 }

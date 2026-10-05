@@ -15,12 +15,14 @@ import PackageDescription
 // Platform floor: SwiftPM has no per-target platform override, so the package-wide iOS
 // minimum is pinned to what PhroverKit's on-device Apple Foundation Model support actually
 // requires (iOS 26), even though RoverNav's own code would run on much older iOS. macOS is
-// declared only for RoverNav, which is pure Foundation and buildable/testable standalone
-// there (`swift build --target RoverNav`) — PhroverKit/PhroverCloud import ARKit, which
-// doesn't exist on macOS, so the package as a whole (and its full test suite, including
-// RoverNavTests) needs an iOS destination:
+// declared only for RoverNav, which is pure Foundation and buildable standalone there
+// (`swift build --target RoverNav`) — PhroverKit/PhroverCloud import ARKit, which doesn't
+// exist on macOS, so the regular RoverNavTests, PhroverKitTests, and PhroverCloudTests
+// suites use an iOS destination through the committed example-project scheme:
 //
-//   xcodebuild test -scheme coybot-sdk-Package -destination 'platform=iOS Simulator,name=...'
+//   scripts/test-swift-sdk.sh
+//
+// (or directly: xcodebuild test -scheme coybot-sdk-Package -destination 'platform=iOS Simulator,name=...')
 let package = Package(
     name: "coybot-sdk",
     platforms: [.iOS("26.0"), .macOS(.v14)],
@@ -45,15 +47,20 @@ let package = Package(
             // prefers .mlmodelc, and copying verbatim meant that never existed.
             resources: [.process("Resources/RoverYOLO.mlpackage")]
         ),
-        .testTarget(name: "PhroverKitTests", dependencies: ["PhroverKit"], path: "swift/Tests/PhroverKitTests"),
+        .testTarget(
+            name: "PhroverKitTests",
+            dependencies: ["PhroverKit"],
+            path: "swift/Tests/PhroverKitTests",
+            resources: [.copy("Fixtures/ScreenDetector")]
+        ),
 
         // Deliberately separate from PhroverKitTests: makes real, slow, non-deterministic
         // model calls — the on-device Foundation Model (needs Apple Intelligence ready on
         // the host Mac/device), and, via PhroverCloud's CloudBrain pointed at a local
         // bridge (eco/e2e/harness/live_rover_act_bridge.py), real billed Bedrock calls.
-        // eco/e2e/harness/phrover.py's fast gate only passes
-        // `-only-testing:RoverNavTests -only-testing:PhroverKitTests`, so this target never
-        // runs there — invoke explicitly with `-only-testing:PhroverKitLiveProbes`, or via
+        // The committed PhroverSDKTests scheme includes only RoverNavTests,
+        // PhroverKitTests, and PhroverCloudTests, so this target never runs in the
+        // regular gate — invoke it explicitly through a scheme that includes it, or via
         // eco/e2e/run_live_mission.sh for the cloud-brain mission.
         .testTarget(name: "PhroverKitLiveProbes",
                     dependencies: ["PhroverKit", "PhroverCloud"],
@@ -67,6 +74,11 @@ let package = Package(
                 .product(name: "AWSIoT", package: "aws-sdk-ios-spm"),
             ],
             path: "swift/Sources/PhroverCloud"
+        ),
+        .testTarget(
+            name: "PhroverCloudTests",
+            dependencies: ["PhroverCloud", "PhroverKit", "RoverNav"],
+            path: "swift/Tests/PhroverCloudTests"
         ),
 
         // Drives the real MissionAgent against the Godot Depot sim (eco/drone/sim/godot/,

@@ -7,6 +7,12 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A10000000000000000000001 /* RoverNav in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000014 /* RoverNav */; };
+		A10000000000000000000002 /* PhroverKit in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000015 /* PhroverKit */; };
+		A10000000000000000000003 /* RoverNav in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000016 /* RoverNav */; };
+		A20000000000000000000001 /* PhroverCloud in Frameworks */ = {isa = PBXBuildFile; productRef = A2000000000000000000000A /* PhroverCloud */; };
+		A20000000000000000000002 /* PhroverKit in Frameworks */ = {isa = PBXBuildFile; productRef = A2000000000000000000000B /* PhroverKit */; };
+		A20000000000000000000003 /* RoverNav in Frameworks */ = {isa = PBXBuildFile; productRef = A2000000000000000000000C /* RoverNav */; };
 		5A2384AF187F3102DC2DF6F0 /* NavigateView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3304DDCFABDAC0EE11CAB10A /* NavigateView.swift */; };
 		7041D6822FFD6A5B00A3472A /* RoverNav in Frameworks */ = {isa = PBXBuildFile; productRef = 26B06C98B9A384470FDD1416 /* RoverNav */; };
 		7041D6832FFD6A5B00A3472A /* PhroverKit in Frameworks */ = {isa = PBXBuildFile; productRef = 992417FC94F0973DA81C2CF3 /* PhroverKit */; };
@@ -29,6 +35,9 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		A10000000000000000000004 /* RoverNavTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = RoverNavTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		A10000000000000000000005 /* PhroverKitTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PhroverKitTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		A20000000000000000000004 /* PhroverCloudTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PhroverCloudTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		1E388A91BD26143433D6D93B /* PhroverOperatorUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = PhroverOperatorUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		3304DDCFABDAC0EE11CAB10A /* NavigateView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NavigateView.swift; sourceTree = "<group>"; };
 		53BB791CB7FE020013A1DA06 /* DriveView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DriveView.swift; sourceTree = "<group>"; };
@@ -42,6 +51,33 @@
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		A10000000000000000000006 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000000000000000000001 /* RoverNav in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A10000000000000000000007 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000000000000000000002 /* PhroverKit in Frameworks */,
+				A10000000000000000000003 /* RoverNav in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A20000000000000000000005 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A20000000000000000000001 /* PhroverCloud in Frameworks */,
+				A20000000000000000000002 /* PhroverKit in Frameworks */,
+				A20000000000000000000003 /* RoverNav in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		506CD1674AF26B87152896C9 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -53,6 +89,24 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		A10000000000000000000008 /* RoverNavTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = ../../swift/Tests/RoverNavTests;
+			sourceTree = "<group>";
+		};
+		A10000000000000000000009 /* PhroverKitTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = ../../swift/Tests/PhroverKitTests;
+			sourceTree = "<group>";
+		};
+		A20000000000000000000006 /* PhroverCloudTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = ../../swift/Tests/PhroverCloudTests;
+			sourceTree = "<group>";
+		};
+/* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXGroup section */
 		0679AA70E688BDE49922F4CC /* Config */ = {
@@ -77,6 +131,9 @@
 			children = (
 				BA26047283D7828C54281B45 /* PhroverOperator.app */,
 				1E388A91BD26143433D6D93B /* PhroverOperatorUITests.xctest */,
+				A10000000000000000000004 /* RoverNavTests.xctest */,
+				A10000000000000000000005 /* PhroverKitTests.xctest */,
+				A20000000000000000000004 /* PhroverCloudTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -89,6 +146,9 @@
 				A1BD4BBC54CC815649693D27 /* Views */,
 				E6D4EBDBE32E091442C1485C /* Info.plist */,
 				28F1249155F395C83EC95573 /* PhroverOperatorUITests */,
+				A10000000000000000000008 /* RoverNavTests */,
+				A10000000000000000000009 /* PhroverKitTests */,
+				A20000000000000000000006 /* PhroverCloudTests */,
 				498E81954CE42C7331D73EF8 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -117,6 +177,76 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		A1000000000000000000000A /* RoverNavTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A10000000000000000000012 /* Build configuration list for PBXNativeTarget "RoverNavTests" */;
+			buildPhases = (
+				A1000000000000000000000C /* Sources */,
+				A10000000000000000000006 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				A10000000000000000000008 /* RoverNavTests */,
+			);
+			name = RoverNavTests;
+			packageProductDependencies = (
+				A10000000000000000000014 /* RoverNav */,
+			);
+			productName = RoverNavTests;
+			productReference = A10000000000000000000004 /* RoverNavTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		A1000000000000000000000B /* PhroverKitTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A10000000000000000000013 /* Build configuration list for PBXNativeTarget "PhroverKitTests" */;
+			buildPhases = (
+				A1000000000000000000000D /* Sources */,
+				A10000000000000000000007 /* Frameworks */,
+				A10000000000000000000017 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				A10000000000000000000009 /* PhroverKitTests */,
+			);
+			name = PhroverKitTests;
+			packageProductDependencies = (
+				A10000000000000000000015 /* PhroverKit */,
+				A10000000000000000000016 /* RoverNav */,
+			);
+			productName = PhroverKitTests;
+			productReference = A10000000000000000000005 /* PhroverKitTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		A20000000000000000000007 /* PhroverCloudTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A20000000000000000000009 /* Build configuration list for PBXNativeTarget "PhroverCloudTests" */;
+			buildPhases = (
+				A20000000000000000000008 /* Sources */,
+				A20000000000000000000005 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				A20000000000000000000006 /* PhroverCloudTests */,
+			);
+			name = PhroverCloudTests;
+			packageProductDependencies = (
+				A2000000000000000000000A /* PhroverCloud */,
+				A2000000000000000000000B /* PhroverKit */,
+				A2000000000000000000000C /* RoverNav */,
+			);
+			productName = PhroverCloudTests;
+			productReference = A20000000000000000000004 /* PhroverCloudTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 		4F8C499EC87DF88475073805 /* PhroverOperator */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 1616938A1DDFE6B8CEE1806B /* Build configuration list for PBXNativeTarget "PhroverOperator" */;
@@ -165,6 +295,15 @@
 				BuildIndependentTargetsInParallel = YES;
 				LastUpgradeCheck = 1430;
 				TargetAttributes = {
+					A1000000000000000000000A = {
+						CreatedOnToolsVersion = 26.0;
+					};
+					A1000000000000000000000B = {
+						CreatedOnToolsVersion = 26.0;
+					};
+					A20000000000000000000007 = {
+						CreatedOnToolsVersion = 26.0;
+					};
 					ABB35E79788B1C15F8AE64EC = {
 						TestTargetID = 4F8C499EC87DF88475073805;
 					};
@@ -189,11 +328,45 @@
 			targets = (
 				4F8C499EC87DF88475073805 /* PhroverOperator */,
 				ABB35E79788B1C15F8AE64EC /* PhroverOperatorUITests */,
+				A1000000000000000000000A /* RoverNavTests */,
+				A1000000000000000000000B /* PhroverKitTests */,
+				A20000000000000000000007 /* PhroverCloudTests */,
 			);
 		};
 /* End PBXProject section */
 
+/* Begin PBXResourcesBuildPhase section */
+		A10000000000000000000017 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
+		A1000000000000000000000C /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A1000000000000000000000D /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A20000000000000000000008 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		7DC6F2FEFE620BE56F0628E9 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -225,6 +398,120 @@
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
+		A1000000000000000000000E /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = bot.coy.phrover.RoverNavTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		A1000000000000000000000F /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = bot.coy.phrover.RoverNavTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		A10000000000000000000010 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = bot.coy.phrover.PhroverKitTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		A10000000000000000000011 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = bot.coy.phrover.PhroverKitTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		A2000000000000000000000D /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = bot.coy.phrover.PhroverCloudTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		A2000000000000000000000E /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = bot.coy.phrover.PhroverCloudTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
 		1781BA82F228DBBBD70FF718 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -431,6 +718,33 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		A10000000000000000000012 /* Build configuration list for PBXNativeTarget "RoverNavTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A1000000000000000000000E /* Debug */,
+				A1000000000000000000000F /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		A10000000000000000000013 /* Build configuration list for PBXNativeTarget "PhroverKitTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A10000000000000000000010 /* Debug */,
+				A10000000000000000000011 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		A20000000000000000000009 /* Build configuration list for PBXNativeTarget "PhroverCloudTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A2000000000000000000000D /* Debug */,
+				A2000000000000000000000E /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
 		1616938A1DDFE6B8CEE1806B /* Build configuration list for PBXNativeTarget "PhroverOperator" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
@@ -468,6 +782,30 @@
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
+		A10000000000000000000014 /* RoverNav */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = RoverNav;
+		};
+		A10000000000000000000015 /* PhroverKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = PhroverKit;
+		};
+		A10000000000000000000016 /* RoverNav */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = RoverNav;
+		};
+		A2000000000000000000000A /* PhroverCloud */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = PhroverCloud;
+		};
+		A2000000000000000000000B /* PhroverKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = PhroverKit;
+		};
+		A2000000000000000000000C /* RoverNav */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = RoverNav;
+		};
 		26B06C98B9A384470FDD1416 /* RoverNav */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = RoverNav;

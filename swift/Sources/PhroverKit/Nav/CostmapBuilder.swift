@@ -26,6 +26,21 @@ public enum CostmapBuilder {
         }
     }
 
+    static func estimatedFloorHeight(fromWorldHeights heights: [Float]) -> Float {
+        let finite = heights.filter(\.isFinite).sorted()
+        guard !finite.isEmpty else { return 0 }
+        let index = min(finite.count - 1, Int(Double(finite.count - 1) * 0.05))
+        return finite[index]
+    }
+
+    static func isObstacleHeight(_ worldY: Float,
+                                 floorY: Float,
+                                 floorBand: Double = 0.10,
+                                 ceilingBand: Double = 1.8) -> Bool {
+        let height = worldY - floorY
+        return height > Float(floorBand) && height < Float(ceilingBand)
+    }
+
     /// Build a costmap centered on `center` (nav-plane coords) from the mesh anchors.
     public static func build(from meshAnchors: [ARMeshAnchor],
                              center: Vec2,
@@ -46,11 +61,19 @@ public enum CostmapBuilder {
         var map = Costmap(width: cells, height: cells, resolution: params.resolution, origin: origin)
         var observed = ObservedGrid(matching: map)
 
-        // Estimate floor height as the lowest vertex we see (ARKit Y is up).
-        var floorY = Float.infinity
+        // Estimate floor height from transformed mesh geometry (ARKit Y is up).
+        var worldHeights: [Float] = []
         for anchor in meshAnchors {
-            floorY = min(floorY, anchor.transform.columns.3.y - 2.0) // rough; refined below
+            let vertices = anchor.geometry.vertices
+            let buffer = vertices.buffer.contents()
+            for index in 0..<vertices.count {
+                let pointer = buffer.advanced(by: vertices.offset + vertices.stride * index)
+                    .assumingMemoryBound(to: (Float, Float, Float).self).pointee
+                let world = anchor.transform * SIMD4<Float>(pointer.0, pointer.1, pointer.2, 1)
+                worldHeights.append(world.y)
+            }
         }
+        let floorY = estimatedFloorHeight(fromWorldHeights: worldHeights)
 
         for anchor in meshAnchors {
             let geom = anchor.geometry
@@ -64,9 +87,12 @@ public enum CostmapBuilder {
                 let world = t * local
                 let groundPoint = Vec2(Double(world.x), Double(world.z))
                 observed.markObserved(at: groundPoint)
-                let heightAboveFloor = world.y - floorY
-                guard heightAboveFloor > Float(params.floorBand),
-                      heightAboveFloor < Float(params.ceilingBand) else { continue }
+                guard isObstacleHeight(
+                    world.y,
+                    floorY: floorY,
+                    floorBand: params.floorBand,
+                    ceilingBand: params.ceilingBand
+                ) else { continue }
                 map.markObstacle(at: groundPoint)
             }
         }

@@ -52,16 +52,35 @@ protocol OnDeviceBrainResponder {
     func nextAction(prompt: String, context: MissionContext) async throws -> BrainOutput
 }
 
-/// Fallback brain: Apple's on-device Foundation Model, reasoning over a *text* summary of
-/// what's visible. The model itself only sees COCO labels (no color/attribute
-/// understanding — it can't tell "green" from "red"), but it can still emit a free-text
-/// `visualQuery` naming attributes the operator mentioned; whether that's actually
-/// resolved goes to `RoverPerception.groundObject`, which may or may not understand more
-/// than the model does. Keeps the rover responsive with no network at all, at the cost of
-/// the richer understanding `CloudBrain` provides when online.
+public enum OnDeviceBrainAvailability: Equatable, Sendable {
+    case available
+    case deviceNotEligible
+    case appleIntelligenceNotEnabled
+    case modelNotReady
+
+    public var operatorMessage: String? {
+        switch self {
+        case .available:
+            nil
+        case .deviceNotEligible:
+            "Apple Intelligence is not supported on this iPhone. Supported object commands can still run offline."
+        case .appleIntelligenceNotEnabled:
+            "Turn on Apple Intelligence in Settings. Supported object commands can still run offline."
+        case .modelNotReady:
+            "Apple Intelligence is still preparing. Keep the iPhone on Wi-Fi and power. Supported object commands can still run offline."
+        }
+    }
+}
+
+/// Apple's on-device Foundation Model, reasoning over a text summary of detector labels
+/// and locally measured color evidence. It does not inspect camera pixels itself, but it
+/// can emit a free-text `visualQuery` naming other attributes the operator mentioned;
+/// whether those are resolved goes to `RoverPerception.groundObject`. Keeps the rover
+/// responsive with no network at all, at the cost of the richer understanding
+/// `CloudBrain` provides when online.
 @MainActor
 public final class OnDeviceBrain: RoverBrain {
-    private let isAvailableProvider: () -> Bool
+    private let availabilityProvider: () -> OnDeviceBrainAvailability
     private let makeResponder: () -> OnDeviceBrainResponder
 
     /// - Parameter adapter: an optional custom-trained adapter (Apple's adapter training
@@ -69,28 +88,121 @@ public final class OnDeviceBrain: RoverBrain {
     ///   rover missions. `nil` uses the stock system model.
     public init(adapter: SystemLanguageModel.Adapter? = nil) {
         let model = adapter.map { SystemLanguageModel(adapter: $0) } ?? SystemLanguageModel.default
-        isAvailableProvider = {
-            if case .available = model.availability { return true }
-            return false
+        availabilityProvider = {
+            Self.mapAvailability(model.availability)
         }
         makeResponder = {
             FoundationModelsOnDeviceResponder(model: model, instructions: Self.instructions)
         }
     }
 
-    init(isAvailable: @escaping () -> Bool, makeResponder: @escaping () -> OnDeviceBrainResponder) {
-        self.isAvailableProvider = isAvailable
+    init(availability: @escaping () -> OnDeviceBrainAvailability,
+         makeResponder: @escaping () -> OnDeviceBrainResponder) {
+        self.availabilityProvider = availability
         self.makeResponder = makeResponder
     }
 
+    convenience init(isAvailable: @escaping () -> Bool,
+                     makeResponder: @escaping () -> OnDeviceBrainResponder) {
+        self.init(availability: { isAvailable() ? .available : .modelNotReady },
+                  makeResponder: makeResponder)
+    }
+
+    public var availability: OnDeviceBrainAvailability {
+        availabilityProvider()
+    }
+
     public var isAvailable: Bool {
-        isAvailableProvider()
+        availability == .available
     }
 
     public func nextAction(_ context: MissionContext) async throws -> BrainOutput {
-        guard isAvailable else { throw RoverBrainError.unavailable }
+        let availability = availability
+        guard availability == .available else {
+            RuntimeFileLog.append("on_device_brain_availability", fields: [
+                "state": availability.logValue,
+            ])
+            throw RoverBrainError.onDeviceUnavailable(availability)
+        }
         let prompt = promptText(context)
-        return try await makeResponder().nextAction(prompt: prompt, context: context)
+        let output = try await makeResponder().nextAction(prompt: prompt, context: context)
+        return Self.grounded(output, context: context)
+    }
+
+    private static func mapAvailability(
+        _ availability: SystemLanguageModel.Availability
+    ) -> OnDeviceBrainAvailability {
+        switch availability {
+        case .available: .available
+        case .unavailable(.deviceNotEligible): .deviceNotEligible
+        case .unavailable(.appleIntelligenceNotEnabled): .appleIntelligenceNotEnabled
+        case .unavailable(.modelNotReady): .modelNotReady
+        @unknown default: .modelNotReady
+        }
+    }
+
+    private static func grounded(_ output: BrainOutput, context: MissionContext) -> BrainOutput {
+        guard case .navigate(.visualQuery(let query)) = output.decision,
+              !visualQueryIsGrounded(query, context: context) else {
+            return output
+        }
+
+        let fallback: RoverDecision
+        if let operatorTarget = visibleOperatorTarget(in: context) {
+            fallback = .navigate(.visualQuery(operatorTarget))
+        } else if let opening = context.explorationCandidates.first(where: { $0.status == .unexplored }) {
+            fallback = .explore(candidateId: opening.id)
+        } else {
+            fallback = .lookAround(angle: .pi / 6)
+        }
+        RuntimeFileLog.append("mission_brain_target_rejected", fields: [
+            "query": query,
+            "fallback": String(describing: fallback),
+            "reason": "not_grounded_in_current_mission",
+        ])
+        return BrainOutput(decision: fallback)
+    }
+
+    private static func visibleOperatorTarget(in context: MissionContext) -> String? {
+        let utterances = context.memory.currentMissionTurns.map(\.utterance)
+            + [context.utterance].compactMap { $0 }
+        guard let intent = utterances.lazy.compactMap(OfflineObjectMissionIntentParser.parse).first else {
+            return nil
+        }
+        let targetLabel = intent.targetLabel.lowercased()
+        guard context.visibleObjects.contains(where: { $0.label.lowercased() == targetLabel }) else {
+            return nil
+        }
+        return intent.objectQuery
+    }
+
+    private static func visualQueryIsGrounded(_ query: String, context: MissionContext) -> Bool {
+        let missionText = (
+            context.memory.currentMissionTurns.map(\.utterance)
+            + [context.utterance, context.plan].compactMap { $0 }
+        ).joined(separator: " ")
+        let missionTokens = Set(visualIntentTokens(missionText))
+        let queryTokens = visualIntentTokens(query)
+        return !queryTokens.isEmpty && queryTokens.allSatisfy(missionTokens.contains)
+    }
+
+    private static func visualIntentTokens(_ value: String) -> [String] {
+        let stopWords: Set<String> = [
+            "a", "an", "and", "at", "find", "for", "go", "here", "in", "look", "of", "on",
+            "other", "please", "room", "see", "that", "the", "there", "this", "to", "toward",
+            "towards",
+        ]
+        return value
+            .lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty && !stopWords.contains($0) }
+            .map { token in
+                switch token {
+                case "fridge": "refrigerator"
+                case "couch": "sofa"
+                default: token
+                }
+            }
     }
 
     static let instructions = """
@@ -102,8 +214,8 @@ public final class OnDeviceBrain: RoverBrain {
             current plan. For navigateToObject, describe what to drive toward in your own \
             words as visualQuery — including any colors, attributes, or possessives the \
             operator mentioned ("the green chair", "my backpack") — even if that exact \
-            object isn't in the visible-objects list, since visible-objects only reports \
-            coarse categories and grounding the full description happens outside you. If \
+            object isn't in the visible-objects list, since visible-objects reports coarse \
+            categories and local color evidence while full grounding happens outside you. If \
             the target isn't visible here, the remembered-objects list may already have it \
             at a known position (use navigateToMemory or the position), or it may be in an \
             unexplored part of the space: choose explore with an opening id from the \
@@ -134,7 +246,14 @@ public final class OnDeviceBrain: RoverBrain {
         lines.append(context.visibleObjects.isEmpty
             ? "Nothing recognized nearby right now."
             : "Visible now: " + context.visibleObjects
-                .map { "\($0.label) (\(Int($0.confidence * 100))% confidence)" }
+                .map { object in
+                    guard let color = object.colorEvidence.first else {
+                        return "\(object.label) (\(Int(object.confidence * 100))% confidence)"
+                    }
+                    return "\(color.color.rawValue) \(object.label) "
+                        + "(\(Int(object.confidence * 100))% object confidence, "
+                        + "\(Int(color.confidence * 100))% color confidence)"
+                }
                 .joined(separator: ", "))
         if !context.memory.rememberedObjects.isEmpty {
             lines.append("Objects remembered from earlier (may not be visible now): "
@@ -149,8 +268,8 @@ public final class OnDeviceBrain: RoverBrain {
                                   $0.id, $0.worldPoint.x, $0.worldPoint.y, $0.widthMeters, $0.status.rawValue) }
                     .joined(separator: "; "))
         }
-        if !context.memory.turns.isEmpty {
-            lines.append("Recent conversation: " + context.memory.turns.suffix(5)
+        if !context.memory.currentMissionTurns.isEmpty {
+            lines.append("Current mission conversation: " + context.memory.currentMissionTurns.suffix(5)
                 .map { "\"\($0.utterance)\"" }.joined(separator: "; "))
         }
         if let followState = context.followState {

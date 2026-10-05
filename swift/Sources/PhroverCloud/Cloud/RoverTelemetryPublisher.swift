@@ -41,7 +41,6 @@ public final class RoverTelemetryPublisher {
             "vehicleType": "rover",
             "navState": navStateLabel,
             "trackingState": trackingLabel,
-            "forwardClearanceM": ar.forwardClearance.isFinite ? ar.forwardClearance : -1,
         ]
         if let pose = ar.pose {
             payload["poseX"] = pose.position.x

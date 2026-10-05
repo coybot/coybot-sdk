@@ -1,5 +1,18 @@
 import Foundation
 
+public enum PathPlanningFailure: String, Equatable, Sendable {
+    case startOutsideMap = "start_outside_map"
+    case goalOutsideMap = "goal_outside_map"
+    case startBlocked = "start_blocked"
+    case goalBlocked = "goal_blocked"
+    case noConnectedPath = "no_connected_path"
+}
+
+public enum PathPlanningResult: Equatable, Sendable {
+    case path([Vec2])
+    case rejected(PathPlanningFailure)
+}
+
 /// 8-connected A* over a `Costmap`. Returns world-coordinate waypoints (cell
 /// centers) from start to goal, or nil if unreachable. Inflated cell cost is added
 /// as a soft penalty so paths keep clearance from walls when possible.
@@ -46,14 +59,30 @@ public struct AStarPlanner: Sendable {
 
     /// Plan from `start` world pose to `goal` world point.
     public func plan(from start: Vec2, to goal: Vec2, in map: Costmap) -> [Vec2]? {
+        guard case .path(let path) = assess(from: start, to: goal, in: map) else {
+            return nil
+        }
+        return path
+    }
+
+    public func assess(from start: Vec2, to goal: Vec2, in map: Costmap) -> PathPlanningResult {
         let s = map.worldToCell(start)
         let g = map.worldToCell(goal)
         let startCell = Cell(x: s.cx, y: s.cy)
         let goalCell = Cell(x: g.cx, y: g.cy)
 
-        guard map.inBounds(startCell.x, startCell.y),
-              map.inBounds(goalCell.x, goalCell.y),
-              !map.isBlocked(goalCell.x, goalCell.y) else { return nil }
+        guard map.inBounds(startCell.x, startCell.y) else {
+            return .rejected(.startOutsideMap)
+        }
+        guard map.inBounds(goalCell.x, goalCell.y) else {
+            return .rejected(.goalOutsideMap)
+        }
+        guard !map.isBlocked(startCell.x, startCell.y) else {
+            return .rejected(.startBlocked)
+        }
+        guard !map.isBlocked(goalCell.x, goalCell.y) else {
+            return .rejected(.goalBlocked)
+        }
 
         func heuristic(_ c: Cell) -> Double {
             // Octile distance (admissible for 8-connectivity).
@@ -73,7 +102,7 @@ public struct AStarPlanner: Sendable {
 
         while let current = frontier.pop() {
             if current == goalCell {
-                return reconstruct(cameFrom, current, map)
+                return .path(reconstruct(cameFrom, current, map))
             }
             if !closed.insert(current).inserted { continue }
             let cg = gScore[current] ?? .infinity
@@ -99,7 +128,7 @@ public struct AStarPlanner: Sendable {
                 }
             }
         }
-        return nil
+        return .rejected(.noConnectedPath)
     }
 
     private func reconstruct(_ cameFrom: [Cell: Cell], _ end: Cell, _ map: Costmap) -> [Vec2] {

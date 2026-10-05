@@ -27,6 +27,91 @@ final class PhroverOperatorUITests: XCTestCase {
         )
     }
 
+    func testTalk_failedCommandKeepsPushToTalkHittable() throws {
+        let app = XCUIApplication()
+        app.launchArguments.append("-ui-test-failed-command")
+        app.launch()
+
+        let talkTab = app.buttons["Talk"]
+        XCTAssertTrue(talkTab.waitForExistence(timeout: 15))
+        talkTab.tap()
+
+        let failedCard = app.otherElements["last-command-card"]
+        XCTAssertTrue(failedCard.waitForExistence(timeout: 10))
+
+        let recognizedCommand = app.staticTexts["recognized-command-text"]
+        XCTAssertTrue(recognizedCommand.waitForExistence(timeout: 10))
+        XCTAssertEqual(recognizedCommand.label, "Go to our room")
+
+        let mic = app.descendants(matching: .any)
+            .matching(identifier: "push-to-talk-control").element
+        XCTAssertTrue(mic.waitForExistence(timeout: 10))
+        XCTAssertTrue(mic.isHittable)
+        XCTAssertLessThanOrEqual(mic.frame.maxY, talkTab.frame.minY)
+        screenshot(app, name: "talk_failed_command_retry")
+    }
+
+    func testTalkShowsLiveDetectorDiagnostics() throws {
+        let app = XCUIApplication()
+        app.launchArguments.append("-ui-test-perception-diagnostics")
+        app.launch()
+
+        let talkTab = app.buttons["Talk"]
+        XCTAssertTrue(talkTab.waitForExistence(timeout: 15))
+        talkTab.tap()
+
+        let detector = app.staticTexts["detector-status-text"]
+        let visible = app.staticTexts["visible-objects-text"]
+        XCTAssertTrue(detector.waitForExistence(timeout: 10))
+        XCTAssertEqual(detector.label, "Detector: loaded")
+        XCTAssertTrue(visible.waitForExistence(timeout: 10))
+        XCTAssertEqual(visible.label, "Visible: refrigerator 99%")
+    }
+
+    func testTalkShowsModelNotReadyDiagnostic() throws {
+        let app = XCUIApplication()
+        app.launchArguments.append("-ui-test-brain-model-not-ready")
+        app.launch()
+
+        let talkTab = app.buttons["Talk"]
+        XCTAssertTrue(talkTab.waitForExistence(timeout: 15))
+        talkTab.tap()
+
+        let diagnostic = app.staticTexts["brain-availability-message"]
+        XCTAssertTrue(diagnostic.waitForExistence(timeout: 10))
+        XCTAssertTrue(diagnostic.label.contains("Apple Intelligence is still preparing"))
+
+        let mic = app.descendants(matching: .any)
+            .matching(identifier: "push-to-talk-control").element
+        XCTAssertTrue(mic.waitForExistence(timeout: 10))
+        XCTAssertTrue(mic.isHittable)
+        XCTAssertLessThanOrEqual(mic.frame.maxY, talkTab.frame.minY)
+    }
+
+    func testTalkHidesBrainDiagnosticWhenAvailable() throws {
+        let app = XCUIApplication()
+        app.launchArguments.append("-ui-test-brain-available")
+        app.launch()
+
+        let talkTab = app.buttons["Talk"]
+        XCTAssertTrue(talkTab.waitForExistence(timeout: 15))
+        talkTab.tap()
+
+        let mic = app.descendants(matching: .any)
+            .matching(identifier: "push-to-talk-control").element
+        XCTAssertTrue(mic.waitForExistence(timeout: 10))
+        XCTAssertTrue(mic.isHittable)
+        XCTAssertLessThanOrEqual(mic.frame.maxY, talkTab.frame.minY)
+
+        let diagnostic = app.staticTexts["brain-availability-message"]
+        let diagnosticAppears = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == true"),
+            object: diagnostic
+        )
+        diagnosticAppears.isInverted = true
+        XCTAssertEqual(XCTWaiter.wait(for: [diagnosticAppears], timeout: 0.5), .completed)
+    }
+
     /// Gated integration path: drive forward on the D-pad and confirm the command
     /// actually reached the (mocked) WAVE ROVER base — proves the phone->ESP32 control
     /// loop end-to-end with no chassis needed.

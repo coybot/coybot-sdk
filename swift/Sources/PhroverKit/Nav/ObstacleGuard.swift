@@ -1,4 +1,5 @@
 import Foundation
+import RoverNav
 
 /// Safety layer sitting between the planner and the motors. Independent of the global
 /// costmap so it reacts to *dynamic* obstacles (ground crew or a cart crossing its path)
@@ -31,5 +32,33 @@ public struct ObstacleGuard: Sendable {
             if now.timeIntervalSince(last) > watchdogTimeout { return .stopCommsLost }
         }
         return .go
+    }
+
+    enum DepthDecision: Equatable {
+        case allow(WheelCommand, depthSafety: DepthSafetyObservation)
+        case stopDepth(DepthSafetyObservation)
+    }
+
+    func evaluate(command: WheelCommand,
+                  depthSafety: DepthSafetyObservation) -> DepthDecision {
+        switch depthSafety.state {
+        case .clear:
+            return .allow(command, depthSafety: depthSafety)
+        case .caution:
+            guard let limit = depthSafety.speedLimit, limit > 0 else {
+                return .stopDepth(depthSafety)
+            }
+            let maximum = max(abs(command.left), abs(command.right))
+            guard maximum > limit else {
+                return .allow(command, depthSafety: depthSafety)
+            }
+            let scale = limit / maximum
+            return .allow(
+                WheelCommand(left: command.left * scale, right: command.right * scale),
+                depthSafety: depthSafety
+            )
+        case .stop, .unavailable:
+            return .stopDepth(depthSafety)
+        }
     }
 }

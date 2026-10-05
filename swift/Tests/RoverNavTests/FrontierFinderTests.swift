@@ -2,6 +2,58 @@ import XCTest
 @testable import RoverNav
 
 final class FrontierFinderTests: XCTestCase {
+    func testStraightBoundaryDirectionPointsTowardUnknownCells() throws {
+        let size = 7
+        let map = Costmap(width: size, height: size, resolution: 0.1, origin: .zero)
+        var observed = ObservedGrid(matching: map)
+        for cy in 0..<size {
+            for cx in 0...3 {
+                observed.markObserved(at: map.cellCenter(cx, cy))
+            }
+        }
+
+        let frontier = try XCTUnwrap(FrontierFinder.candidates(costmap: map, observed: observed).first)
+        let direction = try XCTUnwrap(frontier.outwardDirection)
+
+        XCTAssertEqual(direction.length, 1, accuracy: 1e-12)
+        XCTAssertEqual(direction.x, 1, accuracy: 1e-12)
+        XCTAssertEqual(direction.y, 0, accuracy: 1e-12)
+    }
+
+    func testRotatedBoundaryDirectionPointsTowardUnknownCells() throws {
+        let size = 7
+        let map = Costmap(width: size, height: size, resolution: 0.1, origin: .zero)
+        var observed = ObservedGrid(matching: map)
+        for cy in 0..<size {
+            for cx in 0..<size where cx + cy <= size - 1 {
+                observed.markObserved(at: map.cellCenter(cx, cy))
+            }
+        }
+
+        let frontier = try XCTUnwrap(FrontierFinder.candidates(costmap: map, observed: observed).first)
+        let direction = try XCTUnwrap(frontier.outwardDirection)
+        let diagonalComponent = 1.0 / Double(2).squareRoot()
+
+        XCTAssertEqual(direction.length, 1, accuracy: 1e-12)
+        XCTAssertEqual(direction.x, diagonalComponent, accuracy: 1e-12)
+        XCTAssertEqual(direction.y, diagonalComponent, accuracy: 1e-12)
+    }
+
+    func testSymmetricBoundaryKeepsFrontierWithoutDirection() throws {
+        let size = 7
+        let map = Costmap(width: size, height: size, resolution: 0.1, origin: .zero)
+        var observed = ObservedGrid(matching: map)
+        for cx in 2...4 {
+            observed.markObserved(at: map.cellCenter(cx, 3))
+        }
+
+        let frontiers = FrontierFinder.candidates(costmap: map, observed: observed)
+
+        XCTAssertEqual(frontiers.count, 1)
+        XCTAssertEqual(frontiers[0].cellCount, 3)
+        XCTAssertNil(frontiers[0].outwardDirection)
+    }
+
     /// A 20x20 map, fully observed on the left half, unobserved on the right, with a wall
     /// along the boundary column broken by two door-sized gaps. The frontier cells are the
     /// free boundary cells inside the gaps — expect exactly two clusters, one per gap.

@@ -14,22 +14,32 @@ struct PhroverOperatorApp: App {
     @State private var ar: ARSessionManager
     @State private var control: RoverControl
     @State private var nav: NavigationController
+    @State private var topology: SessionRoomTopology
+    @State private var roomSessionCoordinator: RoomSessionCoordinator
     @State private var cloud: CloudSession?
 
     init() {
         let ar = ARSessionManager()
         let control = RoverControl()
+        let nav = NavigationController(ar: ar, control: control)
+        let topology = SessionRoomTopology()
         _ar = State(initialValue: ar)
         _control = State(initialValue: control)
-        _nav = State(initialValue: NavigationController(ar: ar, control: control))
+        _nav = State(initialValue: nav)
+        _topology = State(initialValue: topology)
+        _roomSessionCoordinator = State(initialValue: RoomSessionCoordinator(
+            motion: nav,
+            topology: topology,
+            arSession: ar
+        ))
         _cloud = State(initialValue: CloudSession.loadIfConfigured(ar: ar, nav: nav))
     }
 
     var body: some Scene {
         WindowGroup {
-            RootView(ar: ar, control: control, nav: nav, cloud: cloud)
+            RootView(ar: ar, control: control, nav: nav, topology: topology, cloud: cloud)
                 .task {
-                    ar.start()
+                    await roomSessionCoordinator.startIfNeeded()
                     Task {
                         do {
                             try await control.enableFeedbackFlow()
@@ -55,6 +65,7 @@ final class CloudSession {
     /// Vision + tool-use mission brain — plugs into `MissionAgent` via `HybridBrain` once
     /// signed in; `ConversationView` falls back to on-device-only until then.
     let brain: CloudBrain
+    let doorwayEvidenceProvider: CloudDoorwayEvidenceProvider
     private let telemetry: RoverTelemetryPublisher
 
     private init(config: PhroverCloudConfig, ar: ARSessionManager, nav: NavigationController) {
@@ -62,6 +73,7 @@ final class CloudSession {
         mqtt = MQTTService(config: config)
         dialog = ClaudeDialogClient(config: config)
         brain = CloudBrain(config: config)
+        doorwayEvidenceProvider = CloudDoorwayEvidenceProvider(brain: brain)
         telemetry = RoverTelemetryPublisher(ar: ar, nav: nav, mqtt: mqtt)
     }
 
@@ -95,6 +107,7 @@ struct RootView: View {
     let ar: ARSessionManager
     let control: RoverControl
     let nav: NavigationController
+    let topology: SessionRoomTopology
     let cloud: CloudSession?
 
     var body: some View {
@@ -119,7 +132,14 @@ struct RootView: View {
                 .tabItem { Label("Drive", systemImage: "gamecontroller") }
             NavigateView(ar: ar, nav: nav)
                 .tabItem { Label("Navigate", systemImage: "map") }
-            ConversationView(ar: ar, control: control, nav: nav, cloudBrain: cloud?.brain)
+            ConversationView(
+                ar: ar,
+                control: control,
+                nav: nav,
+                topology: topology,
+                cloudBrain: cloud?.brain,
+                doorwayEvidenceProvider: cloud?.doorwayEvidenceProvider
+            )
                 .tabItem { Label("Talk", systemImage: "bubble.left.and.bubble.right") }
         }
     }

@@ -58,4 +58,53 @@ final class AStarPlannerTests: XCTestCase {
         let path = AStarPlanner().plan(from: Vec2(0.5, 0.5), to: Vec2(2.5, 2.5), in: map)
         XCTAssertNil(path)
     }
+
+    func testAssessmentReportsStartOutsideMap() {
+        XCTAssertEqual(
+            AStarPlanner().assess(from: Vec2(-0.1, 0.5), to: Vec2(1, 1), in: emptyRoom()),
+            .rejected(.startOutsideMap)
+        )
+    }
+
+    func testAssessmentReportsGoalOutsideMap() {
+        XCTAssertEqual(
+            AStarPlanner().assess(from: Vec2(0.5, 0.5), to: Vec2(5.1, 1), in: emptyRoom()),
+            .rejected(.goalOutsideMap)
+        )
+    }
+
+    func testAssessmentReportsBlockedStart() {
+        var map = emptyRoom()
+        map.markObstacle(at: Vec2(0.5, 0.5))
+
+        XCTAssertEqual(
+            AStarPlanner().assess(from: Vec2(0.5, 0.5), to: Vec2(1, 1), in: map),
+            .rejected(.startBlocked)
+        )
+    }
+
+    func testAssessmentReportsBlockedGoal() {
+        var map = emptyRoom()
+        map.markObstacle(at: Vec2(1, 1))
+
+        XCTAssertEqual(
+            AStarPlanner().assess(from: Vec2(0.5, 0.5), to: Vec2(1, 1), in: map),
+            .rejected(.goalBlocked)
+        )
+    }
+
+    func testAssessmentReportsDisconnectedPath() {
+        var map = emptyRoom()
+        var y = 0.0
+        while y <= 5.0 {
+            map.markObstacle(at: Vec2(2.5, y))
+            y += 0.05
+        }
+        map.inflate(radius: 0.15)
+
+        XCTAssertEqual(
+            AStarPlanner().assess(from: Vec2(0.5, 0.5), to: Vec2(4.5, 0.5), in: map),
+            .rejected(.noConnectedPath)
+        )
+    }
 }

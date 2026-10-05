@@ -1,18 +1,18 @@
 # Phrover Fixes - July 7, 2026 PDT
 
-This document summarizes the issues we investigated and the fixes committed on branch
-`fix/speech-recognition`. The pulled phone logs use UTC timestamps, so several log entries
+This document summarizes the issues we investigated and the fixes committed across the
+Phrover speech and offline object-mission branches. The pulled phone logs use UTC timestamps, so several log entries
 appear as July 8, 2026 UTC.
 
 ## Current Branch
 
-- Branch: `fix/speech-recognition`
-- Base before this workstream: `main` at `c2e8cf5`
-- Latest behavior fix commit: `0c27586 Fix visual target stopping distance`
-- Latest uncommitted update: runtime mission logging, rover command failure handling,
-  app-start feedback enablement, wider LiDAR clearance sampling, requested-object scan
-  locking, rover command retry handling, a less brittle comms watchdog, and post-turn
-  detector polling during visual-target scan.
+- Branch: `codex/fix-speech-audio-session`
+- Latest offline mission safety commit: `4914a59 Complete session-safe room mission scanning`
+- Apple Intelligence remains the primary brain. Optional cloud inference is second, and a
+  deterministic local parser handles supported object missions only when no configured
+  brain produces the first usable decision.
+- Pre-existing AR-session and depth-safety work remains uncommitted and outside the
+  offline-mission commits.
 
 ## Pulled Logs
 
@@ -545,8 +545,9 @@ Key log findings:
 
 ## Current Implementation Diagrams
 
-The diagrams below describe the implemented Phrover voice-to-motion path on branch
-`fix/speech-recognition` after the visual-target stopping-distance work.
+The diagrams below describe the implemented Phrover voice-to-motion path through
+`4914a59`, including Apple Intelligence-first planning and deterministic offline
+object-mission fallback.
 
 ### Component Diagram
 
@@ -556,21 +557,30 @@ flowchart TD
     UI --> Speech["SpeechIn<br/>Apple on-device speech recognition"]
     Speech --> Agent["MissionAgent<br/>Mission state and target lock"]
 
-    Agent --> Brain{"Brain selection"}
-    Brain -->|"Cloud configured and online"| Cloud["CloudBrain<br/>POST /rover/act"]
-    Brain -->|"Offline or cloud failure"| Local["OnDeviceBrain<br/>Apple Foundation Models"]
+    Agent --> Brain{"HybridBrain"}
+    Brain -->|"Always first"| Local["OnDeviceBrain<br/>Apple Foundation Models"]
+    Local -->|"Unavailable, timeout, or rejection"| Cloud{"Optional cloud configured<br/>and network online?"}
+    Cloud -->|"Yes"| CloudBrain["CloudBrain<br/>POST /rover/act"]
+    Cloud -->|"No, or cloud fails before a decision"| Fallback["OfflineObjectMissionIntentParser<br/>Deterministic supported-object fallback"]
 
     Camera["iPhone RGB camera"] --> AR["ARSessionManager"]
     LiDAR["iPhone LiDAR"] --> AR
     AR -->|"Pose, RGB frame, depth, mesh, clearance"| Context["Mission context"]
     AR --> Detector["RoverYOLO<br/>Vision + Core ML"]
+    Detector --> Color["LocalObjectColorAnalyzer<br/>RGB / YCbCr evidence"]
     Detector --> Context
+    Color --> Context
     Context --> Agent
     Agent --> Memory["MissionMemory<br/>Plan, locations, visible objects"]
+    Fallback --> Lock["Immutable target lock<br/>category + optional color + return flag"]
+    Lock --> Agent
 
     Agent -->|"Target visible at 90%+"| Ground["Target grounding<br/>Image point + LiDAR depth to world point"]
-    Agent -->|"Target unavailable"| Scan["Target search<br/>Wait 1s, pulse-turn +/-30 degrees,<br/>settle, detect again"]
+    Agent -->|"Target unavailable"| Scan["Target search<br/>20-30 degree bounded turn,<br/>settle, consume newer tracked frame"]
     Scan --> Detector
+    Agent -->|"Other room requested"| Topology["SessionRoomTopology<br/>Bounded room/doorway graph"]
+    Topology --> Crossing["Doorway traversal<br/>Generation-scoped crossing"]
+    Crossing --> Scan
     Ground --> Nav["NavigationController"]
 
     Nav --> Costmap["CostmapBuilder<br/>AR mesh obstacles"]
@@ -587,6 +597,9 @@ flowchart TD
 
     Nav -->|"Slow below 0.60 m<br/>Stop command at 0.40 m<br/>Desired settled distance 0.30 m"| Stop["T:0 emergency stop"]
     Stop --> Control
+
+    Agent -->|"Explicit 'come back' only"| Return["Reverse recorded doorway route<br/>then navigate to command start pose"]
+    Return --> Nav
 
     Agent --> Log["Documents/phrover-runtime.log"]
     Nav --> Log
@@ -610,8 +623,12 @@ flowchart TD
         SpeechIn["SpeechIn"]
         SpeechOut["SpeechOut"]
         Agent["MissionAgent"]
-        BrainAdapter["HybridBrain / OnDeviceBrain / CloudBrain"]
+        BrainAdapter["HybridBrain<br/>On-device first, optional cloud second"]
+        OfflineParser["OfflineObjectMissionIntentParser"]
+        TargetMatcher["Visual target lock + matcher"]
+        ColorAnalyzer["LocalObjectColorAnalyzer"]
         Memory["MissionMemory"]
+        Topology["SessionRoomTopology"]
         ARManager["ARSessionManager"]
         Detector["Detector + RoverYOLO model"]
         Nav["NavigationController"]
@@ -673,6 +690,8 @@ flowchart TD
     Agent --> BrainAdapter
     BrainAdapter --> FoundationModels
     BrainAdapter --> CloudAPI
+    BrainAdapter --> OfflineParser
+    OfflineParser --> TargetMatcher
     Agent --> Memory
 
     RGBCamera --> ARKit
@@ -680,11 +699,16 @@ flowchart TD
     ARKit --> ARManager
     ARManager --> Detector
     Detector --> VisionCoreML
+    Detector --> ColorAnalyzer
     VisionCoreML --> Compute
+    ColorAnalyzer --> Compute
     ARManager --> Agent
     Detector --> Agent
+    ColorAnalyzer --> Agent
 
     Agent --> Nav
+    Agent --> Topology
+    Topology --> Nav
     ARManager --> Nav
     Nav --> Mapping
     Mapping --> Planner
@@ -720,13 +744,16 @@ sequenceDiagram
     participant UI as Talk Screen
     participant Speech as SpeechIn
     participant Agent as MissionAgent
-    participant Brain as Hybrid/OnDevice Brain
+    participant Brain as HybridBrain
+    participant Apple as Apple Intelligence
+    participant Fallback as Offline Object Fallback
     participant Detect as RoverYOLO Detector
     participant AR as ARSessionManager
+    participant Rooms as SessionRoomTopology
     participant Nav as NavigationController
     participant Rover as WAVE ROVER
 
-    User->>UI: Hold microphone and say "Go to the table"
+    User->>UI: Hold microphone and state object mission
     UI->>Speech: Capture audio
     Speech-->>Agent: Final transcript
 
@@ -735,22 +762,47 @@ sequenceDiagram
         Nav->>Rover: T:0
     else Navigation command
         Agent->>Brain: Transcript + frame + objects + pose + memory
-        Brain-->>Agent: navigate(visualQuery("table"))
-        Agent->>Agent: Lock target query "table"
+        Brain->>Apple: Request first mission decision
+
+        alt Apple Intelligence returns usable decision
+            Apple-->>Brain: RoverOutput
+            Brain-->>Agent: Execute model decision
+        else Apple unavailable, times out, or rejects
+            opt Cloud configured and network online
+                Brain->>Brain: Try optional CloudBrain second
+            end
+            alt Configured brain returns usable decision
+                Brain-->>Agent: Execute brain decision
+            else No brain decision was produced
+                Brain-->>Agent: Typed brain failure
+                Agent->>Fallback: Parse supported object mission
+                Fallback-->>Agent: category + optional color + other-room + explicit-return
+            end
+        end
+
+        Agent->>Agent: Lock original target attributes for entire mission
 
         Agent->>Detect: Detect current RGB frame
-        Detect-->>Agent: Labels, confidence, bounding boxes
+        Detect-->>Agent: Category, confidence, bounds, local color evidence
 
-        alt Table matched at confidence >= 90%
+        alt Locked category and optional color match thresholds
             Agent->>AR: Unproject bounding-box center
             AR-->>Agent: World target using LiDAR depth
         else Target not detected
-            loop Up to 12 scan steps
-                Agent->>Agent: Wait and poll detector for 1 second
-                Agent->>Nav: Pulse-turn 30 degrees left/right
+            loop Bounded 20-30 degree scan steps
+                Agent->>Nav: Slow relative-heading turn
                 Nav->>Rover: Short wheel command
                 Nav->>Rover: Stop and settle
-                Agent->>Detect: Detect stable frame again
+                Agent->>AR: Wait for newer normal frame in current generation
+                Agent->>Detect: Detect settled frame again
+            end
+
+            opt Other-room mission and target still absent
+                Agent->>Rooms: Select unvisited safe doorway route
+                Agent->>Nav: Traverse doorway
+                Nav->>Rover: Bounded crossing motion
+                Agent->>AR: Verify current session generation
+                Agent->>Detect: Scan newly entered room
             end
         end
 
@@ -779,23 +831,107 @@ sequenceDiagram
             Nav-->>Agent: failed
             Agent->>Agent: Reacquire target or controlled recovery
         end
+
+        opt Command explicitly requested "come back" or "go back"
+            Agent->>Rooms: Reverse recorded doorway route
+            Agent->>Nav: Traverse reverse steps, then command start pose
+            Nav->>Rover: Motion with normal safety and transport checks
+            Nav-->>Agent: returned
+        end
     end
 ```
 
 ## Remaining Notes
 
-- Older builds only wrote brain errors, not every spoken status message. That is why the
-  exact busy-thinking phrase did not appear in the pulled log. The latest uncommitted
-  update adds `Documents/phrover-runtime.log` for normal voice/navigation/LiDAR events.
-- To analyze the next phone run, pull app Documents again and inspect:
-  - `phrover-runtime.log`
-  - `phrover-brain-errors.log`
-- Remaining uncommitted files at the time this summary was written:
-  - `docs/phrover-fixes-2026-07-08.md`
-  - `swift/Sources/PhroverKit/Config/RoverConfig.swift`
-  - `swift/Sources/PhroverKit/Nav/NavigationController.swift`
-  - `swift/Sources/PhroverKit/RoverSDK/RoverControl.swift`
-  - `swift/Sources/PhroverKit/Voice/MissionAgent.swift`
-  - `swift/Tests/PhroverKitTests/MissionAgentTests.swift`
-  - `swift/Tests/PhroverKitTests/NavigationSafetyTests.swift`
-  - `swift/Tests/PhroverKitTests/RoverControlTests.swift`
+- Runtime analysis uses both `Documents/phrover-runtime.log` and
+  `Documents/phrover-brain-errors.log`.
+- Unit and simulator coverage proves deterministic ordering, parsing, target locking,
+  cancellation, session-generation safety, topology routing, and telemetry contracts.
+  It does not prove physical camera orientation, LiDAR grounding, doorway traversability,
+  rover HTTP reliability, braking distance, or return accuracy.
+
+## 2026-08-10 Offline Object Mission Verification
+
+### Automated Evidence
+
+- Five focused session-safety regressions passed in
+  `/private/tmp/phrover-task7-final-safety-green-20260810.xcresult`.
+- MissionAgent, RoomTransitionMission, and SessionRoomTopology affected suites passed in
+  `/private/tmp/phrover-task7-affected-final2-20260810.xcresult`.
+- Full SDK regression: 317/317 passed with no failures or skips in
+  `/private/tmp/phrover-offline-object-full-final-20260810.xcresult`.
+- `git diff --check` passed.
+- Provisioned generic iOS build succeeded at
+  `/private/tmp/phrover-offline-object-build-final-20260810/Build/Products/Debug-iphoneos/PhroverOperator.app`.
+- Built bundle identifier: `bot.coy.phrover`; signing team: `64FVJWYNQ7`.
+- Independent final review found no P0-P2 issues and accepted nil-frame fail-closed
+  behavior, session/cancellation ownership, blocked-recovery responsiveness, and the
+  fresh-frame room-transition test contract.
+
+### Physical Acceptance Still Required
+
+The four rover missions below must be observed on the connected iPhone 15 Pro before
+the physical feature is considered complete:
+
+1. `Go to the refrigerator` stops near 0.30 m and remains there.
+2. `Go to the refrigerator and come back` returns to the command start pose.
+3. `Go to the black chair in the other room` searches bounded rooms and remains at the matching chair.
+4. The same other-room mission with `and come back`, while cloud is unavailable, reverses the recorded doorway route and returns.
+
+After each run, inspect the structured `mission_brain_selected`,
+`mission_offline_fallback_*`, `mission_attribute_*`, `mission_room_*`,
+`mission_doorway_*`, `mission_return_route_*`, `mission_completed` or
+`mission_failed`, and `rover_request` events. Do not infer physical success from the
+simulator test results.
+
+The August 10 install attempt could not start because CoreDevice listed the intended
+iPhone 15 Pro (`FC11C836-4978-5B20-9170-16EAD18568BE`) as unavailable. `devicectl`
+returned error `1011`: `CoreDeviceService was unable to locate a device matching the
+requested device identifier`. The connected iPhone 15 Pro Max was intentionally left
+untouched. Install, launch, log pull, and all four physical missions remain pending.
+
+## 2026-08-10 Visible Target Staging Recovery
+
+### Failure Evidence
+
+- The latest physical `Go to refrigerator` run detected and grounded the refrigerator,
+  while the rover link continued returning HTTP `200`.
+- The projected object point and every configured `0.30`-`1.20` m collinear stand-off
+  were planner-unreachable. The old fallback then submitted the known-unreachable object
+  point anyway, immediately failed with `No path to goal`, and returned the UI from
+  `Thinking...` to `Ready` without a rover action.
+- The same frame contained reachable exploration openings, but the offline object mission
+  did not use them to approach the locked target.
+
+### Repair
+
+- Visual goal selection now returns no goal when both the projected object point and all
+  safe stand-offs are unreachable; it never submits the known-bad object coordinate.
+- The offline object mission ranks unexplored openings by existing planner reachability
+  and reduction in distance to the locked target. It requires at least `0.10` m progress.
+- The rover may use at most three distinct staging openings. After each staging arrival,
+  it waits for a newer normally tracked frame, reacquires the same requested object, and
+  retries the normal `0.30` m target approach.
+- Cancellation, mapping-session generation, navigation failure, rover transport failure,
+  and the existing depth/obstacle safety states terminate staging through their existing
+  authoritative paths.
+- Added structured events: `mission_target_staging_started`,
+  `mission_target_staging_candidate`, `mission_target_staging_selected`,
+  `mission_target_staging_completed`, and `mission_target_staging_exhausted`.
+
+### Verification
+
+- Focused staging, candidate-ranking, de-duplication, attempt-limit, transport-failure,
+  and session-reset tests passed.
+- The complete `MissionAgentTests` suite passed.
+- The first full SDK run exposed one timing-sensitive cancellation-test failure; that test
+  passed in isolation, and the second full SDK run passed at
+  `/Users/hungmai/Library/Developer/Xcode/DerivedData/PhroverOperator-fddpasjqbvmpvydqermesnrnjsro/Logs/Test/Test-PhroverSDKTests-2026.08.10_11-53-06--0700.xcresult`.
+- `git diff --check` passed.
+- A signed iPhone 15 Pro build succeeded at
+  `/private/tmp/PhroverOperator-device-build/Build/Products/Debug-iphoneos/PhroverOperator.app`.
+- Installation on iPhone 15 Pro `FC11C836-4978-5B20-9170-16EAD18568BE` succeeded and
+  `devicectl` confirmed bundle `bot.coy.phrover` version `1.0` is installed.
+- Launch is still blocked by iOS because the development profile has not been explicitly
+  trusted on this phone. Physical `Go to refrigerator` acceptance and the post-fix log
+  sequence remain pending; no physical motion success is claimed.

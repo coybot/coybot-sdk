@@ -212,7 +212,14 @@ private final class SimPerception: RoverPerception {
 
     func detectObjects() -> [PerceivedObject] {
         guard world.chairVisible else { return [] }
-        return [PerceivedObject(label: "chair", confidence: 0.9, normalizedPoint: CGPoint(x: 0.5, y: 0.5))]
+        return [
+            PerceivedObject(
+                label: "chair",
+                confidence: 0.9,
+                normalizedPoint: CGPoint(x: 0.5, y: 0.5),
+                colorEvidence: [ObjectColorEvidence(color: .green, confidence: 0.70)]
+            )
+        ]
     }
 
     func unproject(normalizedPoint: CGPoint) -> Vec2? {

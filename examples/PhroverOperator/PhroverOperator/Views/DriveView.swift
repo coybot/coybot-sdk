@@ -51,7 +51,6 @@ struct DriveView: View {
                 Text(String(format: "Pose  x %.2f  y %.2f  yaw %.0f°",
                             p.position.x, p.position.y, p.yaw * 180 / .pi))
             }
-            Text(String(format: "Forward clearance: %.2f m", ar.forwardClearance))
         }
         .font(.system(.footnote, design: .monospaced))
         .frame(maxWidth: .infinity, alignment: .leading)

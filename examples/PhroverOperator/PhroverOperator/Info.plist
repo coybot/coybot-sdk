@@ -20,6 +20,8 @@
     <string>$(CURRENT_PROJECT_VERSION)</string>
     <key>LSRequiresIPhoneOS</key>
     <true/>
+    <key>UILaunchScreen</key>
+    <dict/>
     <key>UIApplicationSceneManifest</key>
     <dict>
         <key>UIApplicationSupportsMultipleScenes</key>
@@ -49,6 +51,8 @@
     <string>Phrover Operator uses the camera and LiDAR for navigation, mapping, and obstacle avoidance.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>Phrover Operator listens for spoken commands so you can talk to the rover.</string>
+    <key>NSMotionUsageDescription</key>
+    <string>Phrover Operator uses phone motion sensors to measure safe search turns.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
     <string>Phrover Operator converts your speech to text on-device to understand spoken commands.</string>
     <key>NSBonjourServices</key>

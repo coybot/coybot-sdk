@@ -7,8 +7,8 @@ on:
   pull_request:
 
 jobs:
-  # RoverNav is pure Foundation — builds/tests on a bare macOS runner, no Xcode
-  # destination or iOS Simulator needed. Fastest signal, runs first.
+  # RoverNav is pure Foundation — it builds on a bare macOS runner, with no Xcode
+  # destination or iOS Simulator needed. Fastest compile signal, runs first.
   rovernav-smoke:
     runs-on: macos-latest
     steps:
@@ -16,8 +16,8 @@ jobs:
       - run: swift build --target RoverNav
 
   # PhroverKit/PhroverCloud import ARKit, which doesn't exist on macOS, so the rest of
-  # the package (and its full test suite, including RoverNavTests) needs an iOS
-  # destination via xcodebuild rather than plain `swift build`/`swift test`.
+  # the package tests need an iOS destination via xcodebuild rather than plain
+  # `swift test`.
   xcodebuild-ios:
     runs-on: macos-latest
     steps:
@@ -26,15 +26,10 @@ jobs:
         run: xcodebuild -version
       - name: Pick an available iPhone simulator
         id: sim
+        run: echo "udid=$(scripts/test-swift-sdk.sh --print-udid)" >> "$GITHUB_OUTPUT"
+      - name: Run regular Swift SDK tests
         run: |
-          UDID=$(xcrun simctl list devices available -j \
-            | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; print(next(e['udid'] for k,v in d.items() if 'iOS' in k for e in v if e['isAvailable'] and 'iPhone' in e['name']))")
-          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
-      - name: Build all three products + run RoverNavTests
-        run: |
-          xcodebuild test -scheme coybot-sdk-Package \
-            -destination "id=${{ steps.sim.outputs.udid }}" \
-            -only-testing:RoverNavTests
+          SIM_UDID="${{ steps.sim.outputs.udid }}" scripts/test-swift-sdk.sh
       - name: Build the PhroverOperator example app
         working-directory: examples/PhroverOperator
         run: |

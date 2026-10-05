@@ -55,11 +55,16 @@ public struct Frontier: Equatable, Sendable {
     /// over a sliver of unmapped floor at the map's edge.
     public let widthMeters: Double
     public let cellCount: Int
+    public let outwardDirection: Vec2?
 
-    public init(centroid: Vec2, widthMeters: Double, cellCount: Int) {
+    public init(centroid: Vec2,
+                widthMeters: Double,
+                cellCount: Int,
+                outwardDirection: Vec2? = nil) {
         self.centroid = centroid
         self.widthMeters = widthMeters
         self.cellCount = cellCount
+        self.outwardDirection = outwardDirection
     }
 }
 
@@ -112,15 +117,24 @@ public enum FrontierFinder {
 
                 var minX = Int.max, maxX = Int.min, minY = Int.max, maxY = Int.min
                 var sum = Vec2.zero
+                var outward = Vec2.zero
                 for (x, y) in members {
                     sum = sum + costmap.cellCenter(x, y)
                     minX = min(minX, x); maxX = max(maxX, x)
                     minY = min(minY, y); maxY = max(maxY, y)
+                    if x > 0, !observed.isObserved(x - 1, y) { outward.x -= 1 }
+                    if x < w - 1, !observed.isObserved(x + 1, y) { outward.x += 1 }
+                    if y > 0, !observed.isObserved(x, y - 1) { outward.y -= 1 }
+                    if y < h - 1, !observed.isObserved(x, y + 1) { outward.y += 1 }
                 }
                 let extent = Double(max(maxX - minX, maxY - minY) + 1) * costmap.resolution
+                let outwardDirection: Vec2? = outward.length == 0
+                    ? nil
+                    : outward * (1.0 / outward.length)
                 result.append(Frontier(centroid: sum * (1.0 / Double(members.count)),
                                        widthMeters: extent,
-                                       cellCount: members.count))
+                                       cellCount: members.count,
+                                       outwardDirection: outwardDirection))
             }
         }
         // Big openings first — a stable, meaningful order for prompt rendering.

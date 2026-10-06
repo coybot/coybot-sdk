@@ -24,12 +24,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: xcodebuild version
         run: xcodebuild -version
-      - name: Pick an available iPhone simulator
+      - name: Pick an available iOS 26+ iPhone simulator
         id: sim
         run: echo "udid=$(scripts/test-swift-sdk.sh --print-udid)" >> "$GITHUB_OUTPUT"
       - name: Run regular Swift SDK tests
         run: |
           SIM_UDID="${{ steps.sim.outputs.udid }}" scripts/test-swift-sdk.sh
+      - name: Verify Silent Search log checker fixtures
+        run: scripts/tests/test-verify-silent-search-logs.sh
       - name: Build the PhroverOperator example app
         working-directory: examples/PhroverOperator
         run: |
@@ -41,3 +43,9 @@ jobs:
           xcodebuild test -scheme PhroverOperator \
             -destination "id=${{ steps.sim.outputs.udid }}" \
             -only-testing:PhroverOperatorUITests/PhroverOperatorUITests/testLaunch_showsAuthOrTabs
+      - name: Run focused Silent Search scanner-timeout scenario
+        working-directory: examples/PhroverOperator
+        run: |
+          xcodebuild test -scheme PhroverOperator \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            -only-testing:PhroverOperatorUITests/SilentSearchUITests/testScannerTimeoutOffersRetryAndAbort

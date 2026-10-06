@@ -724,6 +724,82 @@ final class NavigationSafetyTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(navigationCommandCount, 1)
     }
 
+    // MARK: - Typed results, path policies and rotation stall (Silent Search API)
+
+    func testPolicyRejectedPlanFailsTypedAndPublishesSafetyStates() async {
+        let (navigation, ar) = makeNavigation()
+        ingestTrackedPose(into: ar, yaw: 0, sequence: 1)
+        let states = navigation.safetyStates()
+        let received = Task { () -> [NavigationSafetyState] in
+            var iterator = states.makeAsyncIterator()
+            var result: [NavigationSafetyState] = []
+            for _ in 0..<3 {
+                if let state = await iterator.next() { result.append(state) }
+            }
+            return result
+        }
+
+        let result = await navigation.navigateAndWait(to: Vec2(1, 0), policy: RejectingPathPolicy())
+
+        let violation = PathPolicyViolation.outsideSector(pointIndex: 0)
+        XCTAssertEqual(result, .failed(.pathRejected(violation)))
+        XCTAssertEqual(navigation.state, .failed(NavigationController.pathPolicyRejectionMessage))
+        XCTAssertTrue(navigation.path.isEmpty)
+        XCTAssertEqual(navigationCommandCount, 0)
+        let published = await received.value
+        XCTAssertEqual(published, [.idle, .moving, .failed(.pathRejected(violation))])
+    }
+
+    func testAdmittingPolicyPlansAndSupersededNavigationReturnsCancelled() async {
+        let (navigation, ar) = makeNavigation()
+        ingestTrackedPose(into: ar, yaw: 0, sequence: 1)
+        TestURLProtocol.delay = 0.05
+
+        let pending = Task { await navigation.navigateAndWait(to: Vec2(1, 0), policy: UnrestrictedPathPolicy()) }
+        try? await Task.sleep(for: .milliseconds(10))
+        await navigation.cancelAndWait()
+
+        let result = await pending.value
+        XCTAssertEqual(result, .cancelled)
+        XCTAssertEqual(navigation.state, .idle)
+        XCTAssertEqual(navigation.safetyState, .idle)
+    }
+
+    func testFailureMessagesMapToTypedFailures() {
+        func failure(_ message: String) -> NavigationFailure {
+            NavigationController.navigationFailure(forMessage: message, policyViolation: nil)
+        }
+        XCTAssertEqual(failure("No ARKit pose yet — move the device to establish tracking."), .noPose)
+        XCTAssertEqual(failure("No path to goal."), .noPath)
+        XCTAssertEqual(failure("No path to goal after replanning."), .noPath)
+        XCTAssertEqual(failure("Rover command link lost."), .commsLost)
+        XCTAssertEqual(failure("Rover may be tipping."), .tipping)
+        XCTAssertEqual(failure("Rover command failed: Timed out talking to rover."), .commandFailed)
+        XCTAssertEqual(failure("Navigation stalled."), .stalled)
+        XCTAssertEqual(failure("Obstacle ahead at 0.30 m."), .obstacle)
+        XCTAssertEqual(failure("Depth safety stop: blind_swept_volume."), .obstacle)
+        XCTAssertEqual(failure("AR tracking did not recover in time."), .trackingLost)
+        XCTAssertEqual(
+            NavigationController.navigationFailure(
+                forMessage: NavigationController.pathPolicyRejectionMessage,
+                policyViolation: .invalidPoint(pointIndex: 3)
+            ),
+            .pathRejected(.invalidPoint(pointIndex: 3))
+        )
+    }
+
+    func testCommandedRotationWithoutYawProgressStopsAndFailsStalled() async {
+        let (navigation, ar) = makeNavigation(depthSafetyState: { _ in .clear })
+        ingestTrackedPose(into: ar, yaw: 0, sequence: 1)
+
+        // The pose never changes, so the commanded turn makes no yaw progress.
+        let result = await navigation.rotateAndWait(by: .pi / 2)
+
+        XCTAssertEqual(result, .failed(.stalled))
+        XCTAssertEqual(navigation.state, .failed("Navigation stalled."))
+        XCTAssertGreaterThanOrEqual(navigationCommandCount, 1)
+    }
+
     private func makeNavigation(
         trackingRecoveryTimeout: TimeInterval = RoverConfig.navigationTrackingRecoveryTimeout,
         depthRecoveryTimeout: TimeInterval = RoverConfig.scanDepthRecoveryTimeout,
@@ -876,5 +952,11 @@ private enum FakeCommandError: LocalizedError {
 
     var errorDescription: String? {
         "Timed out talking to rover."
+    }
+}
+
+private struct RejectingPathPolicy: PathAdmissibilityPolicy {
+    func evaluate(path: [Vec2]) -> PathAdmissibilityResult {
+        .rejected(.outsideSector(pointIndex: 0))
     }
 }

@@ -1,6 +1,14 @@
 import Foundation
 import RoverNav
 
+/// Coarse motion-safety state for observers that only care whether the rover is moving
+/// and, if it stopped on a failure, which kind (Silent Search's operator UI).
+public enum NavigationSafetyState: Equatable, Sendable {
+    case idle
+    case moving
+    case failed(NavigationFailure)
+}
+
 /// Autonomy orchestrator. Runs the closed loop:
 ///
 ///   ARKit pose ─┐
@@ -14,8 +22,16 @@ import RoverNav
 @MainActor
 public final class NavigationController {
     public enum State: Equatable, Sendable { case idle, planning, driving, arrived, failed(String) }
-    public private(set) var state: State = .idle
+    public private(set) var state: State = .idle {
+        didSet { publishSafetyState(Self.safetyState(for: state, policyViolation: lastPolicyViolation)) }
+    }
     public private(set) var path: [Vec2] = []
+    public private(set) var safetyState: NavigationSafetyState = .idle
+    private var safetyStateContinuations: [UUID: AsyncStream<NavigationSafetyState>.Continuation] = [:]
+    /// Constrains every plan (initial and replans) of the current navigation, if set.
+    private var activePolicy: (any PathAdmissibilityPolicy)?
+    /// Why the latest plan was rejected by `activePolicy`, if it was.
+    private var lastPolicyViolation: PathPolicyViolation?
 
     private let ar: ARSessionManager
     private let control: RoverControl
@@ -92,13 +108,102 @@ public final class NavigationController {
 
     /// Begin autonomously driving to a nav-plane goal.
     public func navigate(to goal: Vec2) {
-        startNavigation(to: goal, stoppingAtForwardClearance: nil)
+        startNavigation(to: goal, stoppingAtForwardClearance: nil, policy: nil)
     }
 
     /// Drive toward a locked visual target and stop at the requested LiDAR stand-off.
     public func navigate(to goal: Vec2, stoppingAtForwardClearance clearance: Double) {
-        startNavigation(to: goal, stoppingAtForwardClearance: clearance)
+        startNavigation(to: goal, stoppingAtForwardClearance: clearance, policy: nil)
     }
+
+    /// Drive to `goal` and wait for the outcome. `policy`, if given, must admit every plan —
+    /// the initial one and each replan — or navigation stops with `.pathRejected`. A newer
+    /// navigation, rotation or stop supersedes this one and it returns `.cancelled`.
+    public func navigateAndWait(
+        to goal: Vec2,
+        stoppingAtForwardClearance clearance: Double? = nil,
+        policy: (any PathAdmissibilityPolicy)? = nil
+    ) async -> NavigationResult {
+        let (task, token) = startNavigation(to: goal, stoppingAtForwardClearance: clearance, policy: policy)
+        await awaitOwnedOperation(task)
+        return navigationResult(for: token)
+    }
+
+    /// `rotate(by:)`, returning the typed outcome.
+    public func rotateAndWait(by angle: Double) async -> NavigationResult {
+        let (task, token) = startRotation(by: angle)
+        await awaitOwnedOperation(task)
+        return navigationResult(for: token)
+    }
+
+    /// Stop, and return once the rover has been told to stop.
+    public func cancelAndWait() async {
+        await stopAndWait()
+    }
+
+    /// Every change of `safetyState`, starting with the current one.
+    public func safetyStates() -> AsyncStream<NavigationSafetyState> {
+        let id = UUID()
+        return AsyncStream { continuation in
+            safetyStateContinuations[id] = continuation
+            continuation.yield(safetyState)
+            continuation.onTermination = { @Sendable [weak self] _ in
+                Task { @MainActor in self?.safetyStateContinuations[id] = nil }
+            }
+        }
+    }
+
+    private func publishSafetyState(_ newState: NavigationSafetyState) {
+        guard safetyState != newState else { return }
+        safetyState = newState
+        for continuation in safetyStateContinuations.values { continuation.yield(newState) }
+    }
+
+    private func navigationResult(for token: OperationToken) -> NavigationResult {
+        guard isCurrentOperation(token) else { return .cancelled }
+        switch state {
+        case .arrived: return .arrived
+        case .failed(let message):
+            return .failed(Self.navigationFailure(forMessage: message, policyViolation: lastPolicyViolation))
+        case .idle, .planning, .driving: return .cancelled
+        }
+    }
+
+    static func safetyState(for state: State, policyViolation: PathPolicyViolation?) -> NavigationSafetyState {
+        switch state {
+        case .idle, .arrived: .idle
+        case .planning, .driving: .moving
+        case .failed(let message): .failed(navigationFailure(forMessage: message, policyViolation: policyViolation))
+        }
+    }
+
+    /// Typed reason for a failure state. The failure sites set human-readable messages; this
+    /// maps them back so callers (Silent Search) can branch without parsing text themselves.
+    static func navigationFailure(forMessage message: String,
+                                  policyViolation: PathPolicyViolation?) -> NavigationFailure {
+        if message.hasPrefix(Self.pathPolicyRejectionMessage), let policyViolation {
+            return .pathRejected(policyViolation)
+        }
+        if message.hasPrefix("No ARKit pose") { return .noPose }
+        if message.hasPrefix("No path to goal") || message.hasPrefix(Self.pathPolicyRejectionMessage) {
+            return .noPath
+        }
+        if message.hasPrefix("Rover command link lost") { return .commsLost }
+        if message.hasPrefix("Rover may be tipping") { return .tipping }
+        if message.hasPrefix("Rover command failed") { return .commandFailed }
+        if message.hasPrefix("Navigation stalled") || message.hasPrefix("Scan turn moved")
+            || message.hasPrefix("Rover moved unexpectedly") {
+            return .stalled
+        }
+        if message.hasPrefix("Obstacle") || message.hasPrefix("Depth safety")
+            || message.hasPrefix("I can’t safely see") {
+            return .obstacle
+        }
+        // What remains is AR tracking, relative-heading and fresh-frame readiness.
+        return .trackingLost
+    }
+
+    static let pathPolicyRejectionMessage = "Path rejected by navigation policy."
 
     public func assessGoal(_ goal: Vec2) -> NavigationGoalAssessment {
         guard let start = ar.pose?.position else {
@@ -137,8 +242,15 @@ public final class NavigationController {
         return NavigationGoalAssessment(goal: goal, isReachable: true, pathDistance: distance)
     }
 
-    private func startNavigation(to goal: Vec2, stoppingAtForwardClearance: Double?) {
+    @discardableResult
+    private func startNavigation(
+        to goal: Vec2,
+        stoppingAtForwardClearance: Double?,
+        policy: (any PathAdmissibilityPolicy)?
+    ) -> (Task<Void, Never>, OperationToken) {
         let handoff = claimOperation()
+        activePolicy = policy
+        lastPolicyViolation = nil
         state = .planning
         let task = Task {
             await handoff.predecessor?.value
@@ -174,9 +286,14 @@ public final class NavigationController {
             case .path:
                 break
             case .rejected(let reason):
-                self.setStateIfCurrent(.failed("No path to goal."), operation: handoff.token)
+                self.setStateIfCurrent(
+                    .failed(self.lastPolicyViolation == nil ? "No path to goal." : Self.pathPolicyRejectionMessage),
+                    operation: handoff.token
+                )
                 RuntimeFileLog.append("nav_planning_failed", fields: [
-                    "rejection_reason": Self.navigationRejection(for: reason).rawValue
+                    "rejection_reason": self.lastPolicyViolation == nil
+                        ? Self.navigationRejection(for: reason).rawValue
+                        : "path_policy_rejected"
                 ])
                 self.clearLoopIfCurrent(handoff.token)
                 return
@@ -201,6 +318,7 @@ public final class NavigationController {
             self.clearLoopIfCurrent(handoff.token)
         }
         installLoop(task, operation: handoff.token)
+        return (task, handoff.token)
     }
 
     public func preparePlanningContext(
@@ -268,6 +386,11 @@ public final class NavigationController {
     /// Uses the same command cadence/watchdog as `drive()`, but does not treat forward
     /// clearance as a hard stop because this is an in-place search turn, not forward motion.
     public func rotate(by angle: Double) async {
+        let (task, _) = startRotation(by: angle)
+        await awaitOwnedOperation(task)
+    }
+
+    private func startRotation(by angle: Double) -> (Task<Void, Never>, OperationToken) {
         let handoff = claimOperation()
         let task = Task {
             await handoff.predecessor?.value
@@ -300,7 +423,7 @@ public final class NavigationController {
             self.clearLoopIfCurrent(handoff.token)
         }
         installLoop(task, operation: handoff.token)
-        await awaitOwnedOperation(task)
+        return (task, handoff.token)
     }
 
     /// Rotate in short pulses for camera-based target search. Stopping between pulses
@@ -520,9 +643,12 @@ public final class NavigationController {
             if replanCounter % 10 == 0,
                case .rejected(let rejection) = planAndStore(from: pose.position, to: goal) {
                 guard await stopTransportForActiveOperation(operation) else { return }
-                setStateIfCurrent(.failed("No path to goal after replanning."), operation: operation)
+                setStateIfCurrent(
+                    .failed(lastPolicyViolation == nil ? "No path to goal after replanning." : Self.pathPolicyRejectionMessage),
+                    operation: operation
+                )
                 RuntimeFileLog.append("nav_safety_stop", fields: [
-                    "reason": "replan_failed",
+                    "reason": lastPolicyViolation == nil ? "replan_failed" : "path_policy_rejected",
                     "rejection_reason": Self.navigationRejection(for: rejection).rawValue,
                     "distance_to_goal": Self.formatMeters(distanceToGoal)
                 ])
@@ -818,8 +944,17 @@ public final class NavigationController {
         let result = planner.assess(from: from, to: to, in: costmap)
         guard case .path(let p) = result else {
             path.removeAll()
+            lastPolicyViolation = nil
             return result
         }
+        if let activePolicy,
+           case .rejected(let violation) = activePolicy.evaluate(path: [from] + p + [to]) {
+            path.removeAll()
+            lastPolicyViolation = violation
+            RuntimeFileLog.append("nav_path_policy_rejected", fields: ["violation": "\(violation)"])
+            return .rejected(.noConnectedPath)
+        }
+        lastPolicyViolation = nil
         path = p
         return result
     }
@@ -861,6 +996,9 @@ public final class NavigationController {
     private func performContinuousRotation(to targetYaw: Double,
                                            operation: OperationToken) async {
         var hasSentCommand = false
+        // A commanded turn whose yaw error stops shrinking (wheels stalled, rover wedged)
+        // fails closed instead of driving the motors indefinitely.
+        var progressWatchdog = DriveProgressWatchdog(timeout: 2.5, minimumProgress: 0.05)
         while isOperationActive(operation) {
             guard let pose = ar.pose else {
                 guard await stopTransportForActiveOperation(operation) else { return }
@@ -883,6 +1021,17 @@ public final class NavigationController {
                 operation: operation
             ) else { return }
             guard isOperationActive(operation) else { return }
+            if progressWatchdog.observe(distanceToGoal: abs(error), now: Date(), commanded: true) {
+                guard await stopTransportForActiveOperation(operation) else { return }
+                setStateIfCurrent(.failed("Navigation stalled."), operation: operation)
+                RuntimeFileLog.append("nav_safety_stop", fields: [
+                    "reason": "no_yaw_progress",
+                    "target_yaw_deg": Self.formatDegrees(targetYaw),
+                    "yaw_error_deg": Self.formatDegrees(error),
+                    "timeout": "2.50"
+                ])
+                return
+            }
             RuntimeFileLog.append("nav_rotate_tick", fields: [
                 "pose_x": Self.formatMeters(pose.position.x),
                 "pose_y": Self.formatMeters(pose.position.y),

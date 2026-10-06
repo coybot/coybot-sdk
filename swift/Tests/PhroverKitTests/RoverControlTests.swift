@@ -135,6 +135,29 @@ final class RoverControlTests: XCTestCase {
         XCTAssertEqual(payload["L"] as? Double, -0.25)
         XCTAssertEqual(payload["R"] as? Double, 0.25)
     }
+
+    func testProbeLinkUsesFeedbackFlowCommandAndRefreshesAcknowledgement() async throws {
+        StubURLProtocol.results = [
+            .success((Data(), HTTPURLResponse(url: URL(string: "http://192.168.4.1/js")!,
+                                              statusCode: 204,
+                                              httpVersion: nil,
+                                              headerFields: nil)!))
+        ]
+        let control = RoverControl(session: URLSession(configuration: .stubbed))
+
+        try await control.probeLink()
+
+        let requestURL = try XCTUnwrap(StubURLProtocol.lastRequest?.url)
+        let json = try XCTUnwrap(URLComponents(url: requestURL, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "json" })?.value)
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        XCTAssertEqual(payload["T"] as? Int, 131)
+        XCTAssertEqual(payload["cmd"] as? Int, 1)
+        XCTAssertNil(payload["L"])
+        XCTAssertNil(payload["R"])
+        let lastAckAt = await control.lastAckAt
+        XCTAssertNotNil(lastAckAt)
+    }
 }
 
 private extension URLSessionConfiguration {

@@ -1,0 +1,11 @@
+[2026-08-11T12:00:00Z] silent_search_mission mission=00000000-0000-0000-0000-000000000001 marker=SILENT_SEARCH_01 role=a
+[2026-08-11T12:00:01Z] silent_search_calibration_accepted mission=00000000-0000-0000-0000-000000000001 marker=SILENT_SEARCH_01 role=a sample_count=3
+[2026-08-11T12:00:02Z] silent_search_protocol direction=outgoing kind=offer mission=00000000-0000-0000-0000-000000000001 marker=SILENT_SEARCH_01 outcome=accepted role=a sequence=1
+[2026-08-11T12:00:04Z] silent_search_protocol direction=outgoing kind=searchCommit mission=00000000-0000-0000-0000-000000000001 marker=SILENT_SEARCH_01 outcome=accepted role=a sequence=2
+[2026-08-11T12:00:06Z] silent_search_target_evidence confidence_basis_points=9500 mission=00000000-0000-0000-0000-000000000001 marker=SILENT_SEARCH_01 role=a sample_count=1
+[2026-08-11T12:00:07Z] silent_search_target_confirmed confidence_basis_points=9600 mission=00000000-0000-0000-0000-000000000001 marker=SILENT_SEARCH_01 role=a sample_count=3
+[2026-08-11T12:00:08Z] silent_search_protocol direction=outgoing kind=status mission=00000000-0000-0000-0000-000000000001 marker=SILENT_SEARCH_01 outcome=accepted role=a sequence=3
+[2026-08-11T12:00:10Z] silent_search_protocol direction=outgoing kind=decision mission=00000000-0000-0000-0000-000000000001 marker=SILENT_SEARCH_01 outcome=accepted role=a sequence=4
+[2026-08-11T12:00:11Z] silent_search_protocol direction=outgoing kind=converge mission=00000000-0000-0000-0000-000000000001 marker=SILENT_SEARCH_01 outcome=accepted role=a sequence=5
+[2026-08-11T12:00:13Z] silent_search_convergence mission=00000000-0000-0000-0000-000000000001 marker=SILENT_SEARCH_01 role=a stage=arrived
+[2026-08-11T12:00:14Z] silent_search_terminal mission=00000000-0000-0000-0000-000000000001 marker=SILENT_SEARCH_01 result=success role=a

@@ -18,6 +18,18 @@ public final class Detector {
         public let boundingBox: CGRect // normalized, Vision coords
     }
 
+    public struct FrameDetections: Sendable {
+        public let frameID: ARFrameID
+        public let monotonicTimestamp: TimeInterval
+        public let detections: [Detection]
+
+        public init(frameID: ARFrameID, monotonicTimestamp: TimeInterval, detections: [Detection]) {
+            self.frameID = frameID
+            self.monotonicTimestamp = monotonicTimestamp
+            self.detections = detections
+        }
+    }
+
     private var request: VNCoreMLRequest?
     private let primaryDetection: ((CVPixelBuffer) -> [Detection])?
     private let screenLocalizer: ScreenLocalizing?
@@ -29,6 +41,7 @@ public final class Detector {
     private var lastScreenInferenceAt: TimeInterval?
     public var isLoaded: Bool { request != nil }
     public var isScreenFallbackLoaded: Bool { screenLocalizer?.isLoaded == true }
+    public private(set) var supportedCanonicalLabels: Set<String> = []
 
     /// Loads Xcode's compiled `.mlmodelc` when available, with source model fallback for
     /// package contexts that still ship `.mlpackage`/`.mlmodel` resources.
@@ -53,8 +66,9 @@ public final class Detector {
             } else {
                 loadURL = try await MLModel.compileModel(at: modelURL)
             }
-            let model = try VNCoreMLModel(for: MLModel(contentsOf: loadURL,
-                                                       configuration: Self.modelConfiguration()))
+            let coreMLModel = try MLModel(contentsOf: loadURL, configuration: Self.modelConfiguration())
+            supportedCanonicalLabels = Self.canonicalLabels(from: coreMLModel.modelDescription.classLabels ?? [])
+            let model = try VNCoreMLModel(for: coreMLModel)
             let req = VNCoreMLRequest(model: model)
             req.imageCropAndScaleOption = .scaleFill
             request = req
@@ -82,6 +96,12 @@ public final class Detector {
         self.fallbackInterval = fallbackInterval
     }
 
+    /// Test seam with a scripted primary detector and no screen fallback.
+    convenience init(supportedLabels: Set<String>, detectionHandler: @escaping (CVPixelBuffer) -> [Detection]) {
+        self.init(primaryDetection: detectionHandler, screenLocalizer: nil, now: { ProcessInfo.processInfo.systemUptime })
+        supportedCanonicalLabels = supportedLabels
+    }
+
     static func modelResourceURL(modelName: String, bundle: Bundle = .module) -> URL? {
         bundle.url(forResource: modelName, withExtension: "mlmodelc")
             ?? bundle.url(forResource: modelName, withExtension: "mlpackage")
@@ -95,6 +115,10 @@ public final class Detector {
         // or mission perception work that is winding down during app lifecycle changes.
         configuration.computeUnits = .cpuAndNeuralEngine
         return configuration
+    }
+
+    static func canonicalLabels(from classLabels: [Any]) -> Set<String> {
+        Set(classLabels.compactMap { $0 as? String })
     }
 
     /// Runs the model on the buffer rotated upright by `orientation` (normally
@@ -160,6 +184,13 @@ public final class Detector {
         RuntimeFileLog.append("detector_inference_state_changed", fields: [
             "enabled": enabled ? "true" : "false",
         ])
+    }
+
+    /// Detects on a coherent AR frame, keeping its identity and timestamp, in the frame's
+    /// own upright orientation.
+    public func detect(_ snapshot: ARFrameSnapshot) -> FrameDetections {
+        FrameDetections(frameID: snapshot.id, monotonicTimestamp: snapshot.timestamp,
+                        detections: detect(snapshot.image, orientation: snapshot.imageOrientation))
     }
 
     private func detect(_ pixelBuffer: CVPixelBuffer,

@@ -1,6 +1,11 @@
 import Foundation
 import RoverNav
 
+public enum RoverCommandLinkReadiness: Equatable, Sendable {
+    case available
+    case unavailable
+}
+
 /// Low-level driver for the WAVE ROVER ESP32 over WiFi HTTP.
 ///
 /// Speaks the Waveshare JSON command protocol: commands are sent as
@@ -45,6 +50,34 @@ public actor RoverControl {
     /// Ask the base to stream continuous chassis + IMU feedback (parsed by `RoverFeedback`).
     public func enableFeedbackFlow() async throws {
         try await sendJSON(["T": RoverConfig.Opcode.feedbackFlowOn, "cmd": 1])
+    }
+
+    /// Verify the command link without issuing a wheel-motion opcode.
+    public func probeLink() async throws {
+        try await sendJSON(["T": RoverConfig.Opcode.feedbackFlowOn, "cmd": 1])
+    }
+
+    public func commandLinkReadiness() -> AsyncStream<RoverCommandLinkReadiness> {
+        AsyncStream { continuation in
+            let task = Task {
+                var previous: RoverCommandLinkReadiness?
+                while !Task.isCancelled {
+                    let readiness: RoverCommandLinkReadiness
+                    do {
+                        try await probeLink()
+                        readiness = .available
+                    } catch {
+                        readiness = .unavailable
+                    }
+                    if readiness != previous, readiness == .available || previous != nil {
+                        continuation.yield(readiness)
+                    }
+                    previous = readiness
+                    try? await Task.sleep(for: .seconds(1))
+                }
+            }
+            continuation.onTermination = { @Sendable _ in task.cancel() }
+        }
     }
 
     // MARK: - Transport

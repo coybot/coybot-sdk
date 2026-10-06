@@ -11,46 +11,95 @@ import PhroverCloud
 /// straight to manual/voice driving using only on-device intelligence.
 @main
 struct PhroverOperatorApp: App {
-    @State private var ar: ARSessionManager
-    @State private var control: RoverControl
-    @State private var nav: NavigationController
-    @State private var topology: SessionRoomTopology
-    @State private var roomSessionCoordinator: RoomSessionCoordinator
-    @State private var cloud: CloudSession?
+    private enum Runtime {
+        case scripted(ScriptedSilentSearchViewModel)
+        case live(LiveAppRuntime)
+    }
+
+    @State private var runtime: Runtime
+
+    init() {
+        let arguments = ProcessInfo.processInfo.arguments
+        if arguments.contains("-ui-testing"),
+           let index = arguments.firstIndex(of: "-silent-search-scenario"),
+           arguments.indices.contains(index + 1),
+           let scenario = SilentSearchLaunchScenario(rawValue: arguments[index + 1]) {
+            _runtime = State(initialValue: .scripted(ScriptedSilentSearchViewModel(scenario: scenario)))
+        } else {
+            _runtime = State(initialValue: .live(LiveAppRuntime()))
+        }
+    }
+
+    var body: some Scene {
+        WindowGroup {
+            switch runtime {
+            case let .scripted(viewModel):
+                TabView {
+                    SilentSearchView(viewModel: viewModel)
+                        .tabItem { Label("Silent Search", systemImage: "qrcode.viewfinder") }
+                        .accessibilityIdentifier("silent_search_tab")
+                }
+            case let .live(live):
+                RootView(
+                    ar: live.ar, control: live.control, nav: live.nav, topology: live.topology,
+                    cloud: live.cloud, silentSearch: live.silentSearch
+                )
+                .task { await live.start() }
+            }
+        }
+    }
+}
+
+@Observable
+@MainActor
+final class LiveAppRuntime {
+    let ar: ARSessionManager
+    let control: RoverControl
+    let nav: NavigationController
+    let topology: SessionRoomTopology
+    let cloud: CloudSession?
+    private let roomSessionCoordinator: RoomSessionCoordinator
+    private(set) var silentSearch: LiveSilentSearchViewModel?
+    private var started = false
 
     init() {
         let ar = ARSessionManager()
         let control = RoverControl()
         let nav = NavigationController(ar: ar, control: control)
         let topology = SessionRoomTopology()
-        _ar = State(initialValue: ar)
-        _control = State(initialValue: control)
-        _nav = State(initialValue: nav)
-        _topology = State(initialValue: topology)
-        _roomSessionCoordinator = State(initialValue: RoomSessionCoordinator(
+        self.ar = ar
+        self.control = control
+        self.nav = nav
+        self.topology = topology
+        roomSessionCoordinator = RoomSessionCoordinator(
             motion: nav,
             topology: topology,
             arSession: ar
-        ))
-        _cloud = State(initialValue: CloudSession.loadIfConfigured(ar: ar, nav: nav))
+        )
+        cloud = CloudSession.loadIfConfigured(ar: ar, nav: nav)
     }
 
-    var body: some Scene {
-        WindowGroup {
-            RootView(ar: ar, control: control, nav: nav, topology: topology, cloud: cloud)
-                .task {
-                    await roomSessionCoordinator.startIfNeeded()
-                    Task {
-                        do {
-                            try await control.enableFeedbackFlow()
-                            RuntimeFileLog.append("feedback_flow_enabled")
-                        } catch {
-                            RuntimeFileLog.append("feedback_flow_failed", fields: [
-                                "error": error.localizedDescription
-                            ])
-                        }
-                    }
-                }
+    func start() async {
+        guard !started else { return }
+        started = true
+        // Starts the AR session (generation-tracked reset) as well as room topology.
+        await roomSessionCoordinator.startIfNeeded()
+        async let feedback: Void = enableFeedback()
+        let detector = await Detector()
+        silentSearch = LiveSilentSearchViewModel.compose(
+            ar: ar, control: control, navigation: nav, detector: detector
+        )
+        await feedback
+    }
+
+    private func enableFeedback() async {
+        do {
+            try await control.enableFeedbackFlow()
+            RuntimeFileLog.append("feedback_flow_enabled")
+        } catch {
+            RuntimeFileLog.append("feedback_flow_failed", fields: [
+                "error": error.localizedDescription
+            ])
         }
     }
 }
@@ -109,6 +158,7 @@ struct RootView: View {
     let nav: NavigationController
     let topology: SessionRoomTopology
     let cloud: CloudSession?
+    let silentSearch: LiveSilentSearchViewModel?
 
     var body: some View {
         Group {
@@ -141,6 +191,11 @@ struct RootView: View {
                 doorwayEvidenceProvider: cloud?.doorwayEvidenceProvider
             )
                 .tabItem { Label("Talk", systemImage: "bubble.left.and.bubble.right") }
+            if let silentSearch {
+                SilentSearchView(viewModel: silentSearch)
+                    .tabItem { Label("Silent Search", systemImage: "qrcode.viewfinder") }
+                    .accessibilityIdentifier("silent_search_tab")
+            }
         }
     }
 }

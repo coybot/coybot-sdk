@@ -199,3 +199,13 @@ final class PhroverOperatorUITests: XCTestCase {
         try? shot.pngRepresentation.write(to: URL(fileURLWithPath: "\(dir)/\(name).png"))
     }
 }
+
+extension XCUIApplication {
+    @MainActor
+    static func launchingSilentSearch(scenario: String) -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchArguments = ["-ui-testing", "-silent-search-scenario", scenario]
+        app.launch()
+        return app
+    }
+}

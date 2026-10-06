@@ -9,6 +9,20 @@
       <BuildActionEntries>
          <BuildActionEntry
             buildForTesting = "YES"
+            buildForRunning = "NO"
+            buildForProfiling = "NO"
+            buildForArchiving = "NO"
+            buildForAnalyzing = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "16E000000000000000000001"
+               BuildableName = "PhroverOperatorTests.xctest"
+               BlueprintName = "PhroverOperatorTests"
+               ReferencedContainer = "container:PhroverOperator.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
+         <BuildActionEntry
+            buildForTesting = "YES"
             buildForRunning = "YES"
             buildForProfiling = "YES"
             buildForArchiving = "YES"
@@ -52,8 +66,19 @@
             ReferencedContainer = "container:PhroverOperator.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
-      <Testables>
-         <TestableReference
+       <Testables>
+          <TestableReference
+             skipped = "NO"
+             parallelizable = "YES">
+             <BuildableReference
+                BuildableIdentifier = "primary"
+                BlueprintIdentifier = "16E000000000000000000001"
+                BuildableName = "PhroverOperatorTests.xctest"
+                BlueprintName = "PhroverOperatorTests"
+                ReferencedContainer = "container:PhroverOperator.xcodeproj">
+             </BuildableReference>
+          </TestableReference>
+          <TestableReference
             skipped = "NO"
             parallelizable = "NO">
             <BuildableReference

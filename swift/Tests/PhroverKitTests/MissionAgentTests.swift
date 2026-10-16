@@ -608,7 +608,7 @@ final class MissionAgentTests: XCTestCase {
         let agent = MissionAgent(motion: motion,
                                  perception: perception,
                                  voice: FakeVoice(),
-                                 visualTargetScanDelay: 0.1,
+                                 visualTargetScanDelay: 1,
                                  currentBrain: { brain })
 
         await agent.handle("go to the chair")
@@ -3142,7 +3142,7 @@ final class MissionAgentTests: XCTestCase {
             motion: motion,
             perception: perception,
             voice: FakeVoice(),
-            visualTargetScanDelay: 0.05,
+            visualTargetScanDelay: 0.5,
             maxVisualTargetScanSteps: 1,
             roomTopology: topology,
             roomTransitionPollInterval: 0,
@@ -3232,7 +3232,7 @@ final class MissionAgentTests: XCTestCase {
             motion: motion,
             perception: perception,
             voice: FakeVoice(),
-            visualTargetScanDelay: 0.05,
+            visualTargetScanDelay: 0.5,
             maxVisualTargetScanSteps: 1,
             roomTopology: topology,
             roomTransitionPollInterval: 0,

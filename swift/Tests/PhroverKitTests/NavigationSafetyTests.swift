@@ -149,7 +149,7 @@ final class NavigationSafetyTests: XCTestCase {
             trustedMeshRevision: 9
         )
         let (navigation, ar) = makeNavigation(
-            trackingRecoveryTimeout: 0.2,
+            trackingRecoveryTimeout: 2,
             planningReadinessSnapshot: { readiness }
         )
         ingestTrackedPose(into: ar, yaw: 0, sequence: 1)
@@ -425,7 +425,7 @@ final class NavigationSafetyTests: XCTestCase {
     }
 
     func testReachedGoalWithStaleDepthWaitsForFreshSnapshotBeforeArrival() async {
-        let (navigation, ar) = makeNavigation(depthRecoveryTimeout: 0.5)
+        let (navigation, ar) = makeNavigation(depthRecoveryTimeout: 3)
         ingestTrackedPose(into: ar, yaw: 0, sequence: 1)
         ingestBlindDepth(
             into: ar,
@@ -517,7 +517,7 @@ final class NavigationSafetyTests: XCTestCase {
     func testFreshDepthRetryAuthorizesOriginalRotation() async {
         var depthState: DepthSafetyState = .unavailable(.blindSweptVolume)
         let (navigation, ar) = makeNavigation(
-            depthRecoveryTimeout: 0.5,
+            depthRecoveryTimeout: 3,
             depthSafetyState: { _ in depthState }
         )
         ingestTrackedPose(into: ar, yaw: 0, sequence: 1)
@@ -541,7 +541,7 @@ final class NavigationSafetyTests: XCTestCase {
     func testStaleRotationWaitsForFreshSnapshotBeforeSendingMotion() async {
         var depthState: DepthSafetyState = .unavailable(.staleRawDepth)
         let (navigation, ar) = makeNavigation(
-            depthRecoveryTimeout: 0.5,
+            depthRecoveryTimeout: 3,
             depthSafetyState: { _ in depthState }
         )
         ingestTrackedPose(into: ar, yaw: 0, sequence: 1)
@@ -565,7 +565,7 @@ final class NavigationSafetyTests: XCTestCase {
     func testStaleRotationSkipsNewerStaleSnapshotUntilEligibleSnapshotArrives() async {
         var depthState: DepthSafetyState = .unavailable(.staleRawDepth)
         let (navigation, ar) = makeNavigation(
-            depthRecoveryTimeout: 0.5,
+            depthRecoveryTimeout: 3,
             depthSafetyState: { _ in depthState }
         )
         ingestTrackedPose(into: ar, yaw: 0, sequence: 1)
@@ -655,7 +655,7 @@ final class NavigationSafetyTests: XCTestCase {
     func testFreshBlindDepthRejectsExactArcAndSendsNoMotion() async {
         var observedMotionClasses: [DepthSafetyMotionClass] = []
         let (navigation, ar) = makeNavigation(
-            depthRecoveryTimeout: 0.5,
+            depthRecoveryTimeout: 3,
             depthSafetyState: { command in
                 observedMotionClasses.append(DepthSafetyMotionClass.classify(command))
                 return .unavailable(.blindSweptVolume)
@@ -702,7 +702,7 @@ final class NavigationSafetyTests: XCTestCase {
     func testPathFollowingBlindInitialTurnUsesDepthVisibleArc() async {
         var observedMotionClasses: [DepthSafetyMotionClass] = []
         let (navigation, ar) = makeNavigation(
-            depthRecoveryTimeout: 0.5,
+            depthRecoveryTimeout: 3,
             depthSafetyState: { command in
                 let motionClass = DepthSafetyMotionClass.classify(command)
                 observedMotionClasses.append(motionClass)

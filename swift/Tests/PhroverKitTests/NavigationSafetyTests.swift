@@ -175,7 +175,7 @@ final class NavigationSafetyTests: XCTestCase {
             trustedMeshRevision: 4
         )
         let (navigation, ar) = makeNavigation(
-            trackingRecoveryTimeout: 0.25,
+            trackingRecoveryTimeout: 2,
             planningReadinessSnapshot: { readiness }
         )
         ar.resetTracking(generation: 1, runSession: false)

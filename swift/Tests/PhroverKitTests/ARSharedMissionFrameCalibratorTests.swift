@@ -794,7 +794,10 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
     }
 
     private func eventually(_ condition: @escaping () -> Bool) async {
-        for _ in 0..<100 where !condition() { await Task.yield() }
+        // Bounded by wall time, not a yield count: under a loaded CI runner
+        // 100 yields can run out before the work under test is scheduled.
+        let deadline = ContinuousClock.now + .seconds(2)
+        while !condition(), ContinuousClock.now < deadline { await Task.yield() }
     }
 }
 

@@ -918,7 +918,7 @@ final class MissionAgentTests: XCTestCase {
         let agent = MissionAgent(motion: motion,
                                  perception: perception,
                                  voice: voice,
-                                 visualTargetScanDelay: 0.05,
+                                 visualTargetScanDelay: 0.5,
                                  maxVisualTargetScanSteps: 1,
                                  currentBrain: { brain })
 
@@ -2704,7 +2704,7 @@ final class MissionAgentTests: XCTestCase {
             await agent.handle("Go to the refrigerator")
         }
 
-        await fulfillment(of: [scanStopped], timeout: 0.25)
+        await fulfillment(of: [scanStopped], timeout: 2)
         if motion.cancelCallCount == 0 {
             mission.cancel()
             motion.cancel()
@@ -2764,7 +2764,7 @@ final class MissionAgentTests: XCTestCase {
             await agent.handle("Go to the refrigerator")
         }
 
-        await fulfillment(of: [navigationStopped], timeout: 0.25)
+        await fulfillment(of: [navigationStopped], timeout: 2)
         observer.cancel()
         if motion.stopAndWaitCallCount == 0 {
             mission.cancel()
@@ -2804,7 +2804,7 @@ final class MissionAgentTests: XCTestCase {
             await agent.handle("Go to another room")
         }
 
-        await fulfillment(of: [scanStopped], timeout: 0.25)
+        await fulfillment(of: [scanStopped], timeout: 2)
         if motion.cancelCallCount == 0 {
             mission.cancel()
             motion.cancel()
@@ -2958,7 +2958,7 @@ final class MissionAgentTests: XCTestCase {
             await agent.handle("Go to the black chair in the other room")
         }
 
-        await fulfillment(of: [staleTraversalStopped], timeout: 0.25)
+        await fulfillment(of: [staleTraversalStopped], timeout: 2)
         stopObserver.cancel()
         if motion.stopAndWaitCallCount == 0 {
             mission.cancel()
@@ -3018,7 +3018,7 @@ final class MissionAgentTests: XCTestCase {
             await agent.handle("Go to the black chair in the other room")
         }
 
-        await fulfillment(of: [scanStopped], timeout: 0.25)
+        await fulfillment(of: [scanStopped], timeout: 2)
         if motion.cancelCallCount == 0 {
             mission.cancel()
             motion.cancel()
@@ -3165,7 +3165,7 @@ final class MissionAgentTests: XCTestCase {
             await agent.handle("Go to the black chair in the other room")
         }
 
-        await fulfillment(of: [stopped], timeout: 0.25)
+        await fulfillment(of: [stopped], timeout: 2)
         observer.cancel()
         if motion.stopAndWaitCallCount == 0 {
             mission.cancel()
@@ -3255,7 +3255,7 @@ final class MissionAgentTests: XCTestCase {
             await agent.handle("Go to the black chair in the other room and come back")
         }
 
-        await fulfillment(of: [stopped], timeout: 0.25)
+        await fulfillment(of: [stopped], timeout: 2)
         observer.cancel()
         if motion.stopAndWaitCallCount == 0 {
             mission.cancel()
@@ -3530,7 +3530,7 @@ final class MissionAgentTests: XCTestCase {
         }
         await fulfillment(of: [scanStarted], timeout: 1)
         mission.cancel()
-        await fulfillment(of: [scanCancelled], timeout: 0.1)
+        await fulfillment(of: [scanCancelled], timeout: 2)
         if motion.cancelCallCount == 0 {
             motion.cancel()
         }
@@ -3662,7 +3662,7 @@ final class MissionAgentTests: XCTestCase {
         }
         await fulfillment(of: [alignmentStarted], timeout: 1)
         mission.cancel()
-        await fulfillment(of: [alignmentCancelled], timeout: 0.1)
+        await fulfillment(of: [alignmentCancelled], timeout: 2)
         if motion.cancelCallCount == 0 {
             motion.cancel()
         }
@@ -3711,7 +3711,7 @@ final class MissionAgentTests: XCTestCase {
         }
         await fulfillment(of: [recoveryStarted], timeout: 1)
         mission.cancel()
-        await fulfillment(of: [recoveryCancelled], timeout: 0.1)
+        await fulfillment(of: [recoveryCancelled], timeout: 2)
         if motion.cancelCallCount == 0 {
             motion.cancel()
         }

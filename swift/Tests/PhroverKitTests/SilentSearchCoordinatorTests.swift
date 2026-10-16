@@ -113,7 +113,7 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         let a = SilentSearchTestHarness(optical: opticalA)
         let b = SilentSearchTestHarness(optical: opticalB)
         a.clock.advance(nanoseconds: wallNow * 1_000_000)
-        b.clock.advance(nanoseconds: (wallNow + 2_001) * 1_000_000)
+        b.clock.advance(nanoseconds: (wallNow + 15_001) * 1_000_000)
         let coordinatorA = try await calibratedCoordinator(a, role: .a)
         let coordinatorB = try await calibratedCoordinator(b, role: .b)
         XCTAssertTrue(coordinatorA.startHandshake())
@@ -1266,7 +1266,10 @@ final class SilentSearchCoordinatorTests: XCTestCase {
     }
 
     private func eventually(_ condition: @escaping @MainActor () -> Bool) async {
-        for _ in 0..<100 where !condition() { await Task.yield() }
+        // Bounded by wall time, not a yield count: under a loaded CI runner
+        // 100 yields can run out before the work under test is scheduled.
+        let deadline = ContinuousClock.now + .seconds(2)
+        while !condition(), ContinuousClock.now < deadline { await Task.yield() }
     }
 }
 

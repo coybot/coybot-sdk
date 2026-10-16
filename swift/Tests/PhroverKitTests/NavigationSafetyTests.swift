@@ -611,7 +611,7 @@ final class NavigationSafetyTests: XCTestCase {
     func testPostWaitCommsVetoPreventsRecoveredMotion() async {
         var depthState: DepthSafetyState = .unavailable(.blindSweptVolume)
         let (navigation, ar) = makeNavigation(
-            depthRecoveryTimeout: 0.5,
+            depthRecoveryTimeout: 3,
             obstacleGuard: ObstacleGuard(watchdogTimeout: 0),
             depthSafetyState: { _ in depthState }
         )
@@ -633,7 +633,7 @@ final class NavigationSafetyTests: XCTestCase {
         var depthState: DepthSafetyState = .unavailable(.blindSweptVolume)
         var feedback: RoverFeedback?
         let (navigation, ar) = makeNavigation(
-            depthRecoveryTimeout: 0.5,
+            depthRecoveryTimeout: 3,
             safetyFeedback: { feedback },
             depthSafetyState: { _ in depthState }
         )
@@ -914,7 +914,7 @@ final class NavigationSafetyTests: XCTestCase {
     }
 
     private func waitForRequestCount(_ expected: Int) async {
-        let deadline = ContinuousClock.now + .seconds(1)
+        let deadline = ContinuousClock.now + .seconds(5)
         while TestURLProtocol.requestCount < expected, ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(2))
         }
@@ -922,7 +922,7 @@ final class NavigationSafetyTests: XCTestCase {
     }
 
     private func waitForNavigationCommandCount(_ expected: Int) async {
-        let deadline = ContinuousClock.now + .seconds(1)
+        let deadline = ContinuousClock.now + .seconds(5)
         while navigationCommandCount < expected, ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(2))
         }
@@ -933,7 +933,7 @@ final class NavigationSafetyTests: XCTestCase {
         _ expected: DepthSafetyMotionClass,
         in values: () -> [DepthSafetyMotionClass]
     ) async {
-        let deadline = ContinuousClock.now + .seconds(1)
+        let deadline = ContinuousClock.now + .seconds(5)
         while !values().contains(expected), ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(2))
         }

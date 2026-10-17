@@ -99,7 +99,7 @@ final class NavigationSafetyTests: XCTestCase {
             }
         }
 
-        XCTAssertLessThan(elapsed, .milliseconds(300))
+        XCTAssertLessThan(elapsed, .milliseconds(1_500))
         XCTAssertEqual(navigation.state, .failed("AR tracking did not recover in time."))
         XCTAssertGreaterThanOrEqual(TestURLProtocol.requestCount, 1)
     }

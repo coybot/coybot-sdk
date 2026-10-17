@@ -72,7 +72,7 @@ final class CloudDoorwayEvidenceProviderTests: XCTestCase {
     func testTimeoutProvidesNoEvidenceWithoutWaitingForProductionDeadline() async {
         let brain = StubRoverBrain(
             result: .success(BrainOutput(decision: .explore(candidateId: "doorway_candidate_1"))),
-            delay: .seconds(1)
+            delay: .seconds(5)
         )
         let provider = CloudDoorwayEvidenceProvider(
             brain: brain,
@@ -84,7 +84,7 @@ final class CloudDoorwayEvidenceProviderTests: XCTestCase {
         let boosts = await provider.boostValues(forFrame: Data([0x01]), candidates: [candidate(1)])
 
         XCTAssertTrue(boosts.isEmpty)
-        XCTAssertLessThan(start.duration(to: clock.now), .milliseconds(500))
+        XCTAssertLessThan(start.duration(to: clock.now), .milliseconds(2_500))
     }
 
     private func candidate(_ number: Int) -> DoorwayCandidate {

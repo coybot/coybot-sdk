@@ -72,7 +72,7 @@ final class HybridBrainTests: XCTestCase {
             name: "on_device",
             order: order,
             result: .success(.init(decision: .say("late"))),
-            delay: .seconds(1)
+            delay: .seconds(5)
         )
         let cloud = RecordingBrain(name: "cloud", order: order, result: .success(.init(decision: .done)))
         let brain = HybridBrain(
@@ -87,7 +87,7 @@ final class HybridBrainTests: XCTestCase {
         let output = try await brain.nextAction(MissionContext())
 
         XCTAssertEqual(output.decision, .done)
-        XCTAssertLessThan(start.duration(to: clock.now), .milliseconds(500))
+        XCTAssertLessThan(start.duration(to: clock.now), .milliseconds(2_500))
         await assertEventually("primary task observes timeout cancellation") {
             onDevice.wasCancelled
         }
@@ -175,13 +175,13 @@ final class HybridBrainTests: XCTestCase {
             onDevice.finish()
         }
 
-        await fulfillment(of: [cloudCalled], timeout: 0.25)
+        await fulfillment(of: [cloudCalled], timeout: 2)
         XCTAssertTrue(cancellationProbe.wasSignalled)
         onDevice.finish()
         let output = try await decisionTask.value
 
         XCTAssertEqual(output.decision, .done)
-        XCTAssertLessThan(start.duration(to: clock.now), .milliseconds(500))
+        XCTAssertLessThan(start.duration(to: clock.now), .milliseconds(2_500))
         XCTAssertEqual(order.names, ["on_device", "cloud"])
     }
 

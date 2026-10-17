@@ -1266,10 +1266,7 @@ final class SilentSearchCoordinatorTests: XCTestCase {
     }
 
     private func eventually(_ condition: @escaping @MainActor () -> Bool) async {
-        // Bounded by wall time, not a yield count: under a loaded CI runner
-        // 100 yields can run out before the work under test is scheduled.
-        let deadline = ContinuousClock.now + .seconds(2)
-        while !condition(), ContinuousClock.now < deadline { await Task.yield() }
+        for _ in 0..<100 where !condition() { await Task.yield() }
     }
 }
 

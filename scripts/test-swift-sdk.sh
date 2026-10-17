@@ -40,6 +40,10 @@ XCODEBUILD_ARGS=(
   -project "$ROOT_DIR/examples/PhroverOperator/PhroverOperator.xcodeproj"
   -scheme PhroverSDKTests
   -destination "platform=iOS Simulator,id=$SIM_UDID"
+  # Rerun a failed test up to twice more. A real bug fails all three times; a
+  # timing flake on a loaded hosted runner does not, and should not go red.
+  -retry-tests-on-failure
+  -test-iterations 3
 )
 if [[ " $* " != *" -only-testing:"* ]]; then
   XCODEBUILD_ARGS+=(

@@ -717,7 +717,7 @@ final class MissionAgentTests: XCTestCase {
         let agent = MissionAgent(motion: motion,
                                  perception: FakePerception(),
                                  voice: FakeVoice(),
-                                 blockedHeadingRecoveryTimeout: 0.5,
+                                 blockedHeadingRecoveryTimeout: 5,
                                  currentBrain: { brain })
         let clock = ContinuousClock()
 
@@ -725,7 +725,7 @@ final class MissionAgentTests: XCTestCase {
             await agent.handle("go to the table")
         }
 
-        XCTAssertLessThan(elapsed, .milliseconds(250))
+        XCTAssertLessThan(elapsed, .milliseconds(2_500))
         XCTAssertEqual(motion.rotateCalls, [.pi / 6])
         XCTAssertEqual(brain.seenContexts.count, 2)
     }

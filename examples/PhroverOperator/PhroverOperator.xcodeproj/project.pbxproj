@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		19A000000000000000000001 /* ConversationViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 19B000000000000000000001 /* ConversationViewModelTests.swift */; };
+		19A000000000000000000002 /* ConversationViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 19B000000000000000000002 /* ConversationViewModel.swift */; };
 		A10000000000000000000001 /* RoverNav in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000014 /* RoverNav */; };
 		A10000000000000000000002 /* PhroverKit in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000015 /* PhroverKit */; };
 		A10000000000000000000003 /* RoverNav in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000016 /* RoverNav */; };
@@ -50,6 +52,8 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		19B000000000000000000001 /* ConversationViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationViewModelTests.swift; sourceTree = "<group>"; };
+		19B000000000000000000002 /* ConversationViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationViewModel.swift; sourceTree = "<group>"; };
 		A10000000000000000000004 /* RoverNavTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = RoverNavTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A10000000000000000000005 /* PhroverKitTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PhroverKitTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A20000000000000000000004 /* PhroverCloudTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PhroverCloudTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -154,6 +158,7 @@
 		16D000000000000000000001 /* PhroverOperatorTests */ = {
 			isa = PBXGroup;
 			children = (
+				19B000000000000000000001 /* ConversationViewModelTests.swift */,
 				16B000000000000000000007 /* CalibrationPreviewModelTests.swift */,
 				16B000000000000000000005 /* SilentSearchMapTransformTests.swift */,
 			);
@@ -207,6 +212,7 @@
 		FA5A7BCA302EDDB229C36BF6 /* App */ = {
 			isa = PBXGroup;
 			children = (
+				19B000000000000000000002 /* ConversationViewModel.swift */,
 				6B7B6DA99859F472611A5565 /* PhroverOperatorApp.swift */,
 				16B000000000000000000008 /* CalibrationPreviewModel.swift */,
 				16B000000000000000000001 /* SilentSearchViewModel.swift */,
@@ -434,6 +440,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				19A000000000000000000002 /* ConversationViewModel.swift in Sources */,
 				8FFCFF02ACA403C6A45A7CD2 /* PhroverOperatorApp.swift in Sources */,
 				16A000000000000000000007 /* CalibrationPreviewModel.swift in Sources */,
 				16A000000000000000000008 /* CalibrationCameraPreview.swift in Sources */,
@@ -460,6 +467,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				19A000000000000000000001 /* ConversationViewModelTests.swift in Sources */,
 				16A000000000000000000006 /* CalibrationPreviewModelTests.swift in Sources */,
 				16A000000000000000000005 /* SilentSearchMapTransformTests.swift in Sources */,
 			);

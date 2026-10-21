@@ -128,6 +128,7 @@ public enum SilentSearchMotionFailure: Equatable, Sendable {
     case tracking
     case positionToleranceExceeded
     case headingToleranceExceeded
+    case rotationResolutionInsufficient
 }
 
 public enum SilentSearchMotionResult: Equatable, Sendable {

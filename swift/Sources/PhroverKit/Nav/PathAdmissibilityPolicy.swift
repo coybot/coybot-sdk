@@ -22,6 +22,7 @@ public enum NavigationFailure: Equatable, Sendable {
     case commsLost
     case tipping
     case stalled
+    case rotationResolutionInsufficient
     case commandFailed
     case trackingLost
     case cancelled

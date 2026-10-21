@@ -94,6 +94,7 @@ public final class NavigationSilentSearchMotion: SilentSearchMotion {
             case .commsLost, .commandFailed: .failed(.commandLink)
             case .tipping: .failed(.tipping)
             case .stalled: .failed(.stalled)
+            case .rotationResolutionInsufficient: .failed(.rotationResolutionInsufficient)
             case .trackingLost: .failed(.tracking)
             case .cancelled: .cancelled
             }

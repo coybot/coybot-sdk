@@ -3,6 +3,12 @@ import CoreGraphics
 @testable import PhroverKit
 
 final class PerceptionDebugSummaryTests: XCTestCase {
+    func testRawPersonScoreIsNotPresentedAsCertainOrVerifiedPresence() {
+        let detections = [Detector.Detection(label: "person", confidence: 1, boundingBox: .zero)]
+        XCTAssertEqual(PerceptionDebugSummary.rawPredictions(detections), "person score 1.0000 (unverified)")
+        XCTAssertFalse(PerceptionDebugSummary.rawPredictions(detections).contains("100%"))
+        XCTAssertEqual(PerceptionDebugSummary.rawPredictions([]), "none")
+    }
     func testVisibleObjectSummaryShowsTopLabelsAndConfidence() {
         let objects = [
             PerceivedObject(label: "chair", confidence: 0.752, normalizedPoint: CGPoint(x: 0.1, y: 0.2)),

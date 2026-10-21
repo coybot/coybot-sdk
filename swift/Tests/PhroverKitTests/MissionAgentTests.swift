@@ -10,6 +10,141 @@ import RoverNav
 /// only be verified on a real device (see rover/README.md status notes).
 @MainActor
 final class MissionAgentTests: XCTestCase {
+    func testOldOfflineNavigationCleanupCannotCancelNewMotionAfterConfirmedHandoff() async throws {
+        let motion = FakeMotion()
+        motion.navigateOutcome = .driving
+        let perception = FakePerception()
+        perception.objects = [PerceivedObject(label: "refrigerator", confidence: 0.99,
+                                               normalizedPoint: CGPoint(x: 0.5, y: 0.5))]
+        let started = expectation(description: "old offline navigation started")
+        motion.onNavigate = { _ in started.fulfill() }
+        let agent = MissionAgent(motion: motion, perception: perception, voice: FakeVoice()) { nil }
+        let mission = Task { await agent.handle("Go to the refrigerator") }
+        await fulfillment(of: [started], timeout: 1)
+        try await agent.cancelCurrentMissionAndWait()
+        let cancellationsAtHandoff = motion.cancelCallCount
+        motion.state = .driving // A new owner has acquired the shared motion controller.
+        await mission.value
+        XCTAssertEqual(motion.cancelCallCount, cancellationsAtHandoff)
+        XCTAssertEqual(motion.state, .driving)
+    }
+
+    func testOldRoomTraversalCleanupCannotCancelNewMotionAfterConfirmedHandoff() async throws {
+        let topology = SessionRoomTopology(telemetry: { _, _ in })
+        topology.startSession(generation: 1, initialPose: Pose2D(position: .zero, yaw: 0))
+        let motion = FakeMotion()
+        motion.navigateOutcome = .driving
+        let perception = FakePerception()
+        perception.frontiers = [doorwayFrontier()]
+        let started = expectation(description: "old doorway crossing started")
+        motion.onNavigate = { _ in started.fulfill() }
+        let agent = MissionAgent(motion: motion, perception: perception, voice: FakeVoice(),
+                                 roomTopology: topology) { nil }
+        let mission = Task { await agent.handle("Go to another room") }
+        await fulfillment(of: [started], timeout: 1)
+        try await agent.cancelCurrentMissionAndWait()
+        let cancellationsAtHandoff = motion.cancelCallCount
+        motion.state = .driving
+        await mission.value
+        XCTAssertEqual(motion.cancelCallCount, cancellationsAtHandoff)
+        XCTAssertEqual(motion.state, .driving)
+    }
+
+    func testStaleScanCancellationHandlerCannotStopNewMotionAfterConfirmedHandoff() async throws {
+        let motion = FakeMotion()
+        motion.scanRotationUsesIndependentTask = true
+        let started = expectation(description: "old offline scan started")
+        motion.onScanRotate = { _ in started.fulfill() }
+        let agent = MissionAgent(motion: motion, perception: FakePerception(), voice: FakeVoice(),
+                                 visualTargetScanDelay: 0, maxVisualTargetScanSteps: 1) { nil }
+        let mission = Task { await agent.handle("Go to the refrigerator") }
+        await fulfillment(of: [started], timeout: 1)
+        mission.cancel() // Its MainActor cleanup can arrive after the acknowledged stop.
+        try await agent.cancelCurrentMissionAndWait()
+        let cancellationsAtHandoff = motion.cancelCallCount
+        motion.state = .driving
+        await mission.value
+        XCTAssertEqual(motion.cancelCallCount, cancellationsAtHandoff)
+        XCTAssertEqual(motion.state, .driving)
+    }
+
+    func testOldBrainCompletionAfterConfirmedStopCannotOverwriteNewMissionPhase() async throws {
+        let firstBrain = BlockingBrain()
+        let secondBrain = BlockingBrain()
+        var brain: RoverBrain = firstBrain
+        var phases: [MissionAgent.Phase] = []
+        let motion = FakeMotion()
+        let agent = MissionAgent(motion: motion, perception: FakePerception(), voice: FakeVoice(),
+                                 phaseDidChange: { phases.append($0) }) { brain }
+        let first = Task { await agent.handle("first mission") }
+        await firstBrain.waitUntilEntered()
+        try await agent.cancelCurrentMissionAndWait()
+        XCTAssertEqual(motion.confirmedStopCount, 1)
+        brain = secondBrain
+        let second = Task { await agent.handle("second mission") }
+        await secondBrain.waitUntilEntered()
+        let currentPhases = phases
+        XCTAssertEqual(agent.phase, .thinking)
+        firstBrain.finishAll(with: .done)
+        await first.value
+        XCTAssertEqual(agent.phase, .thinking)
+        XCTAssertEqual(phases, currentPhases, "An old generation cannot emit idle into the new mission's UI")
+        secondBrain.finishAll(with: .done)
+        await second.value
+        XCTAssertEqual(agent.phase, .idle)
+        XCTAssertEqual(Array(phases.suffix(2)), [.acting, .idle], "Current mission completion must still publish idle")
+    }
+
+    func testDirectCancellationInvalidatesMissionBeforeAwaitingConfirmedStop() async throws {
+        let motion = FakeMotion()
+        motion.suspendConfirmedStop = true
+        let brain = BlockingBrain()
+        let agent = MissionAgent(motion: motion, perception: FakePerception(), voice: FakeVoice()) { brain }
+        let mission = Task { await agent.handle("go to chair") }
+        await brain.waitUntilEntered()
+        let cancellation = Task { try await agent.cancelCurrentMissionAndWait() }
+        await motion.waitUntilStopRequested()
+        XCTAssertEqual(agent.phase, .acting, "Mission must not report idle before motor stop acknowledgement")
+        brain.finishAll(with: .navigate(.worldPoint(Vec2(4, 5))))
+        await mission.value
+        XCTAssertTrue(motion.navigateCalls.isEmpty)
+        motion.finishConfirmedStop()
+        try await cancellation.value
+        XCTAssertEqual(motion.confirmedStopCount, 1)
+        XCTAssertEqual(agent.phase, .idle)
+    }
+
+    func testFailedMissionStopDoesNotReleaseOwnership() async {
+        let motion = FakeMotion()
+        motion.confirmedStopError = FakeBrainError.modelUnavailable
+        let brain = FakeBrain(script: [.done])
+        let agent = MissionAgent(motion: motion, perception: FakePerception(), voice: FakeVoice()) { brain }
+        do {
+            try await agent.cancelCurrentMissionAndWait()
+            XCTFail("Expected stop error")
+        } catch {
+            XCTAssertEqual(error as? FakeBrainError, .modelUnavailable)
+        }
+        await agent.handle("new mission")
+        XCTAssertTrue(brain.seenContexts.isEmpty)
+    }
+
+    func testBrainStopDecisionAwaitsMotorStopAcknowledgement() async {
+        let motion = FakeMotion()
+        motion.suspendConfirmedStop = true
+        let brain = FakeBrain(script: [.stop])
+        let agent = MissionAgent(motion: motion, perception: FakePerception(), voice: FakeVoice()) { brain }
+        var completed = false
+        let mission = Task { await agent.handle("never mind"); completed = true }
+        await motion.waitUntilStopRequested()
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertFalse(completed)
+        XCTAssertEqual(agent.phase, .acting)
+        motion.finishConfirmedStop()
+        await mission.value
+        XCTAssertEqual(agent.phase, .idle)
+    }
+
     func testPlainFollowRequestsAreRecognisedWithoutABrain() {
         let cases: [(String, String?)] = [
             ("follow me", "person"),
@@ -1088,7 +1223,7 @@ final class MissionAgentTests: XCTestCase {
         )
     }
 
-    func testUnqualifiedChairLogsColorEvidenceAsNotRequired() {
+    func testUnqualifiedChairLogsColorEvidenceAsNotRequired() async {
         let intent = OfflineObjectMissionIntent(
             objectQuery: "chair",
             targetLabel: "chair",
@@ -1101,11 +1236,11 @@ final class MissionAgentTests: XCTestCase {
             confidence: 0.90,
             normalizedPoint: CGPoint(x: 0.5, y: 0.5)
         )
-        let logBefore = runtimeLog()
+        let logBefore = await runtimeLog()
 
         _ = MissionAgent.bestVisualTargetMatch(intent: intent, objects: [chair])
 
-        let logDelta = String(runtimeLog().dropFirst(logBefore.count))
+        let logDelta = String((await runtimeLog()).dropFirst(logBefore.count))
         XCTAssertTrue(logDelta.contains("mission_attribute_match"))
         XCTAssertTrue(logDelta.contains("color_confidence=not_required"))
         XCTAssertFalse(logDelta.contains("color_confidence=1.00"))
@@ -2375,7 +2510,7 @@ final class MissionAgentTests: XCTestCase {
             ]
         }
         var statuses: [MissionCommandStatus] = []
-        let logBefore = runtimeLog()
+        let logBefore = await runtimeLog()
         let agent = MissionAgent(
             motion: motion,
             perception: perception,
@@ -2396,7 +2531,7 @@ final class MissionAgentTests: XCTestCase {
         guard case .succeeded = statuses.last else {
             return XCTFail("Expected the opposite-direction scan to find the target")
         }
-        let logDelta = String(runtimeLog().dropFirst(logBefore.count))
+        let logDelta = String((await runtimeLog()).dropFirst(logBefore.count))
         XCTAssertTrue(logDelta.contains("mission_target_scan_rotation_retry"))
     }
 
@@ -2446,7 +2581,7 @@ final class MissionAgentTests: XCTestCase {
         }
         let brain = ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
         var statuses: [MissionCommandStatus] = []
-        let logBefore = runtimeLog()
+        let logBefore = await runtimeLog()
         let agent = MissionAgent(
             motion: motion,
             perception: perception,
@@ -2475,7 +2610,7 @@ final class MissionAgentTests: XCTestCase {
         guard case .succeeded = statuses.last else {
             return XCTFail("Expected other-room target navigation to succeed")
         }
-        let logDelta = String(runtimeLog().dropFirst(logBefore.count))
+        let logDelta = String((await runtimeLog()).dropFirst(logBefore.count))
         XCTAssertTrue(logDelta.contains("mission_offline_room_searched"))
         XCTAssertTrue(logDelta.contains("mission_offline_doorway_crossed"))
         XCTAssertTrue(logDelta.contains("target=black chair"))
@@ -2524,7 +2659,7 @@ final class MissionAgentTests: XCTestCase {
         }
         let brain = ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
         var statuses: [MissionCommandStatus] = []
-        let logBefore = runtimeLog()
+        let logBefore = await runtimeLog()
         let agent = MissionAgent(
             motion: motion,
             perception: perception,
@@ -2549,7 +2684,7 @@ final class MissionAgentTests: XCTestCase {
         guard case .succeeded = statuses.last else {
             return XCTFail("Expected explicit doorway return to succeed")
         }
-        let logDelta = String(runtimeLog().dropFirst(logBefore.count))
+        let logDelta = String((await runtimeLog()).dropFirst(logBefore.count))
         XCTAssertTrue(logDelta.contains("mission_offline_return_route_started"))
         XCTAssertTrue(logDelta.contains("mission_offline_return_route_step"))
         XCTAssertTrue(logDelta.contains("mission_offline_return_route_completed"))
@@ -2589,7 +2724,7 @@ final class MissionAgentTests: XCTestCase {
         let brain = ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
         let voice = FakeVoice()
         var statuses: [MissionCommandStatus] = []
-        let logBefore = runtimeLog()
+        let logBefore = await runtimeLog()
         let agent = MissionAgent(
             motion: motion,
             perception: perception,
@@ -2618,7 +2753,7 @@ final class MissionAgentTests: XCTestCase {
             return XCTFail("Expected bounded room search exhaustion to fail")
         }
         XCTAssertFalse(voice.spoken.isEmpty)
-        let logDelta = String(runtimeLog().dropFirst(logBefore.count))
+        let logDelta = String((await runtimeLog()).dropFirst(logBefore.count))
         XCTAssertTrue(logDelta.contains("mission_offline_doorway_marked_searched"))
         XCTAssertTrue(logDelta.contains("mission_offline_fallback_failed"))
         XCTAssertTrue(logDelta.contains("reason=search_exhausted"))
@@ -2642,7 +2777,7 @@ final class MissionAgentTests: XCTestCase {
             topology.reset(forSessionGeneration: 14)
         }
         var statuses: [MissionCommandStatus] = []
-        let logBefore = runtimeLog()
+        let logBefore = await runtimeLog()
         let agent = MissionAgent(
             motion: motion,
             perception: perception,
@@ -2666,7 +2801,7 @@ final class MissionAgentTests: XCTestCase {
         guard case .failed = statuses.last else {
             return XCTFail("Expected session replacement to abort the fallback mission")
         }
-        let logDelta = String(runtimeLog().dropFirst(logBefore.count))
+        let logDelta = String((await runtimeLog()).dropFirst(logBefore.count))
         XCTAssertTrue(logDelta.contains("mission_offline_fallback_failed"))
         XCTAssertTrue(logDelta.contains("reason=session_generation_changed"))
     }
@@ -2687,7 +2822,7 @@ final class MissionAgentTests: XCTestCase {
             topology.reset(forSessionGeneration: 32)
         }
         var statuses: [MissionCommandStatus] = []
-        let logBefore = runtimeLog()
+        let logBefore = await runtimeLog()
         let agent = MissionAgent(
             motion: motion,
             perception: perception,
@@ -2714,10 +2849,8 @@ final class MissionAgentTests: XCTestCase {
         guard case .failed = statuses.last else {
             return XCTFail("Expected the stale same-room scan to fail")
         }
-        XCTAssertTrue(
-            String(runtimeLog().dropFirst(logBefore.count))
-                .contains("reason=session_generation_changed")
-        )
+        let logDelta = String((await runtimeLog()).dropFirst(logBefore.count))
+        XCTAssertTrue(logDelta.contains("reason=session_generation_changed"))
     }
 
     func testSameRoomFallbackStopsTargetNavigationWhenSessionGenerationChanges() async {
@@ -3000,7 +3133,7 @@ final class MissionAgentTests: XCTestCase {
             topology.reset(forSessionGeneration: 18)
         }
         var statuses: [MissionCommandStatus] = []
-        let logBefore = runtimeLog()
+        let logBefore = await runtimeLog()
         let agent = MissionAgent(
             motion: motion,
             perception: perception,
@@ -3029,7 +3162,7 @@ final class MissionAgentTests: XCTestCase {
         guard case .failed = statuses.last else {
             return XCTFail("Expected stale post-doorway scan to fail the mission")
         }
-        let logDelta = String(runtimeLog().dropFirst(logBefore.count))
+        let logDelta = String((await runtimeLog()).dropFirst(logBefore.count))
         XCTAssertTrue(logDelta.contains("reason=session_generation_changed"))
     }
 
@@ -3137,7 +3270,7 @@ final class MissionAgentTests: XCTestCase {
             if call == 2 { topology.reset(forSessionGeneration: 22) }
         }
         var statuses: [MissionCommandStatus] = []
-        let logBefore = runtimeLog()
+        let logBefore = await runtimeLog()
         let agent = MissionAgent(
             motion: motion,
             perception: perception,
@@ -3176,10 +3309,8 @@ final class MissionAgentTests: XCTestCase {
         guard case .failed = statuses.last else {
             return XCTFail("Expected stale target navigation to fail")
         }
-        XCTAssertTrue(
-            String(runtimeLog().dropFirst(logBefore.count))
-                .contains("reason=session_generation_changed")
-        )
+        let logDelta = String((await runtimeLog()).dropFirst(logBefore.count))
+        XCTAssertTrue(logDelta.contains("reason=session_generation_changed"))
     }
 
     func testOtherRoomFinalReturnStopsWhenSessionGenerationChanges() async {
@@ -3227,7 +3358,7 @@ final class MissionAgentTests: XCTestCase {
             }
         }
         var statuses: [MissionCommandStatus] = []
-        let logBefore = runtimeLog()
+        let logBefore = await runtimeLog()
         let agent = MissionAgent(
             motion: motion,
             perception: perception,
@@ -3266,10 +3397,8 @@ final class MissionAgentTests: XCTestCase {
         guard case .failed = statuses.last else {
             return XCTFail("Expected stale final return to fail")
         }
-        XCTAssertTrue(
-            String(runtimeLog().dropFirst(logBefore.count))
-                .contains("reason=session_generation_changed")
-        )
+        let logDelta = String((await runtimeLog()).dropFirst(logBefore.count))
+        XCTAssertTrue(logDelta.contains("reason=session_generation_changed"))
     }
 
     func testBrainUnavailableRejectsUnsupportedCommandWithoutMotion() async {
@@ -3752,7 +3881,7 @@ final class MissionAgentTests: XCTestCase {
             topology.reset(forSessionGeneration: 40)
         }
         var statuses: [MissionCommandStatus] = []
-        let logBefore = runtimeLog()
+        let logBefore = await runtimeLog()
         let agent = MissionAgent(
             motion: motion,
             perception: perception,
@@ -3778,10 +3907,8 @@ final class MissionAgentTests: XCTestCase {
         guard case .failed = statuses.last else {
             return XCTFail("Expected stale return recovery to fail")
         }
-        XCTAssertTrue(
-            String(runtimeLog().dropFirst(logBefore.count))
-                .contains("reason=session_generation_changed")
-        )
+        let logDelta = String((await runtimeLog()).dropFirst(logBefore.count))
+        XCTAssertTrue(logDelta.contains("reason=session_generation_changed"))
     }
 
     func testCallerCancellationImmediatelyBeforeOfflineReturnSuccessWinsTerminalBoundary() async {
@@ -3962,7 +4089,10 @@ final class MissionAgentTests: XCTestCase {
         XCTAssertEqual(agent.phase, .idle)
     }
 
-    private func runtimeLog() -> String {
+    private func runtimeLog() async -> String {
+        // Runtime logging is queued off the control actor; drain accepted writes
+        // before comparing telemetry produced during a mission.
+        await RuntimeFileLog.flush()
         guard let url = RuntimeFileLog.logFileURL else { return "" }
         return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
     }
@@ -4192,6 +4322,35 @@ private final class BlockingBrain: RoverBrain {
 
 @MainActor
 private final class FakeMotion: RoverMotion {
+    var suspendConfirmedStop = false
+    var confirmedStopError: Error?
+    private(set) var confirmedStopCount = 0
+    private var stopRequested = false
+    private var stopRequestWaiter: CheckedContinuation<Void, Never>?
+    private var confirmedStopWaiter: CheckedContinuation<Void, Never>?
+
+    func stopAndConfirm() async throws {
+        confirmedStopCount += 1
+        stopRequested = true
+        stopRequestWaiter?.resume()
+        stopRequestWaiter = nil
+        if suspendConfirmedStop {
+            await withCheckedContinuation { confirmedStopWaiter = $0 }
+        }
+        if let confirmedStopError { throw confirmedStopError }
+        await stopAndWait()
+        cancel()
+    }
+
+    func waitUntilStopRequested() async {
+        if stopRequested { return }
+        await withCheckedContinuation { stopRequestWaiter = $0 }
+    }
+
+    func finishConfirmedStop() {
+        confirmedStopWaiter?.resume()
+        confirmedStopWaiter = nil
+    }
     var state: NavigationController.State = .idle
     private(set) var navigateCalls: [Vec2] = []
     private(set) var navigateStopClearances: [Double] = []

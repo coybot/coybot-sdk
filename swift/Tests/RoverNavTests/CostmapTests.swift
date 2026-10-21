@@ -33,4 +33,22 @@ final class CostmapTests: XCTestCase {
         // A mid-range cell picked up some cost gradient.
         XCTAssertGreaterThan(map.cost(c.cx + 2, c.cy), 0)
     }
+
+    func testSegmentClearanceRejectsTouchedOccupiedOrInflatedCells() {
+        var map = Costmap(width: 10, height: 10, resolution: 0.1)
+        map.setCost(5, 5, Costmap.lethal)
+        XCTAssertTrue(map.isSegmentClear(from: Vec2(0.15, 0.35), to: Vec2(0.85, 0.35), margin: 0.02))
+        XCTAssertFalse(map.isSegmentClear(from: Vec2(0.15, 0.55), to: Vec2(0.85, 0.55), margin: 0))
+
+        map.setCost(5, 5, 1)
+        XCTAssertFalse(map.isSegmentClear(from: Vec2(0.15, 0.48), to: Vec2(0.85, 0.48), margin: 0.02),
+            "Even a low-cost inflated cell must block the follow readiness probe")
+    }
+
+    func testSegmentClearanceFailsClosedAtMapBoundaryAndForInvalidInputs() {
+        let map = Costmap(width: 10, height: 10, resolution: 0.1)
+        XCTAssertFalse(map.isSegmentClear(from: Vec2(0.02, 0.5), to: Vec2(0.2, 0.5), margin: 0.02))
+        XCTAssertFalse(map.isSegmentClear(from: Vec2(.nan, 0.5), to: Vec2(0.2, 0.5), margin: 0))
+        XCTAssertFalse(map.isSegmentClear(from: Vec2(0.2, 0.5), to: Vec2(0.3, 0.5), margin: -0.01))
+    }
 }

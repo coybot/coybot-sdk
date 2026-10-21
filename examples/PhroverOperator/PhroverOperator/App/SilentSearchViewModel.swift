@@ -509,6 +509,7 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
         case .tracking: "Navigation failed: AR tracking lost."
         case .positionToleranceExceeded: "Navigation failed: position tolerance not reached."
         case .headingToleranceExceeded: "Navigation failed: heading tolerance not reached."
+        case .rotationResolutionInsufficient: "Rotation stopped: observed response is too coarse for the remaining angle."
         }
     }
 
@@ -755,7 +756,7 @@ final class LiveSilentSearchSafetyMonitor: SilentSearchSafetyMonitoring {
                     switch failure {
                     case .commsLost, .commandFailed: yield(.transportFailed)
                     case .obstacle, .tipping, .stalled: yield(.reactiveSafetyFailed)
-                    case .noPose, .noPath, .pathRejected, .trackingLost, .cancelled: break
+                    case .noPose, .noPath, .pathRejected, .trackingLost, .cancelled, .rotationResolutionInsufficient: break
                     }
                 }
             }

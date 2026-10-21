@@ -7,6 +7,54 @@ import RoverNav
 
 @MainActor
 final class ARSessionManagerTests: XCTestCase {
+    func testSnapshotPreservesDepthConfidenceOrientationAndIngressEvidence() throws {
+        var image: CVPixelBuffer?
+        var confidence: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 8, 6, kCVPixelFormatType_32BGRA, nil, &image)
+        CVPixelBufferCreate(kCFAllocatorDefault, 8, 6, kCVPixelFormatType_OneComponent8, nil, &confidence)
+        let ar = ARSessionManager()
+        ar.resetTracking(generation: 4, runSession: false)
+        let uptime = ProcessInfo.processInfo.systemUptime
+        ar.ingestForTesting(image: try XCTUnwrap(image), timestamp: uptime,
+            cameraTransform: matrix_identity_float4x4, intrinsics: matrix_identity_float3x3,
+            imageResolution: CGSize(width: 8, height: 6), depthMap: nil, trackingQuality: .normal,
+            depthConfidenceMap: confidence, depthSource: .sceneDepth, imageOrientation: .left)
+        let snapshot = try XCTUnwrap(ar.latestSnapshot)
+        XCTAssertTrue(snapshot.depthConfidenceMap === confidence)
+        XCTAssertEqual(snapshot.depthSource, .sceneDepth)
+        XCTAssertEqual(snapshot.imageOrientation, .left)
+        XCTAssertEqual(ar.sourceHighWater?.frameID, snapshot.id)
+        XCTAssertEqual(ar.sourceHighWater?.sourceTimestamp, uptime)
+        XCTAssertEqual(ar.turnPoseEvidence(from: snapshot.id, through: snapshot.id)?.count, 1)
+        ar.interruptionBeganForTesting()
+        XCTAssertNil(ar.turnPoseEvidence(from: snapshot.id, through: snapshot.id))
+        ar.resetTracking(generation: 5, runSession: false)
+        XCTAssertNil(ar.sourceHighWater)
+    }
+
+    func testSnapshotGroundingRetainsNonLidarFloorAndPersonFallback() throws {
+        var image: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 20, 20, kCVPixelFormatType_32BGRA, nil, &image)
+        var transform = matrix_identity_float4x4
+        transform.columns.3.y = 1
+        let frame = ARFrameSnapshot(id: .init(generation: 1, sequence: 1), timestamp: 1,
+            image: try XCTUnwrap(image), cameraTransform: transform,
+            cameraIntrinsics: simd_float3x3(columns: (SIMD3(10, 0, 0), SIMD3(0, 10, 0), SIMD3(10, 10, 1))),
+            imageResolution: CGSize(width: 20, height: 20), depthMap: nil,
+            pose: .init(position: .zero, yaw: 0), trackingQuality: .normal,
+            imageOrientation: .up, floorHeight: 0)
+        let box = CGRect(x: 0.3, y: 0.1, width: 0.4, height: 0.6)
+        let floor = try XCTUnwrap(ARSessionManager.groundPoint(boundingBox: box, label: "chair", in: frame))
+        XCTAssertEqual(floor.x, 0, accuracy: 1e-5)
+        XCTAssertEqual(floor.y, -1.25, accuracy: 1e-5)
+        let withoutFloor = ARFrameSnapshot(id: frame.id, timestamp: frame.timestamp, image: frame.image,
+            cameraTransform: frame.cameraTransform, cameraIntrinsics: frame.cameraIntrinsics,
+            imageResolution: frame.imageResolution, depthMap: nil, pose: frame.pose, trackingQuality: .normal,
+            imageOrientation: frame.imageOrientation)
+        XCTAssertNotNil(ARSessionManager.groundPoint(boundingBox: box, label: "person", in: withoutFloor))
+        XCTAssertNil(ARSessionManager.groundPoint(boundingBox: box, label: "chair", in: withoutFloor))
+    }
+
     func testPlainObservationsAreMonotonicWithinExplicitGeneration() {
         let ar = ARSessionManager()
         ar.resetTracking(generation: 4, runSession: false)

@@ -17,12 +17,30 @@ struct ConversationView: View {
     let topology: SessionRoomTopology
     let cloudBrain: CloudBrain?
     let doorwayEvidenceProvider: CloudDoorwayEvidenceProvider?
+    private let scripted: Bool
+    private let mayStartFollow: @MainActor () -> Bool
+    @State private var model: ConversationViewModel
+
+    init(ar: ARSessionManager, control: RoverControl, nav: NavigationController,
+         topology: SessionRoomTopology, cloudBrain: CloudBrain?,
+         doorwayEvidenceProvider: CloudDoorwayEvidenceProvider?,
+         model: ConversationViewModel? = nil, scripted: Bool = false,
+         mayStartFollow: @escaping @MainActor () -> Bool = { true }) {
+        self.ar = ar
+        self.control = control
+        self.nav = nav
+        self.topology = topology
+        self.cloudBrain = cloudBrain
+        self.doorwayEvidenceProvider = doorwayEvidenceProvider
+        self.scripted = scripted
+        self.mayStartFollow = mayStartFollow
+        _model = State(initialValue: model ?? ConversationViewModel())
+    }
 
     @Environment(\.scenePhase) private var scenePhase
     @State private var speechIn = SpeechIn()
     @State private var speechOut = SpeechOut()
     @State private var agent: MissionAgent?
-    @State private var missionPhase: MissionAgent.Phase = .idle
     @State private var lastCommand = ConversationView.makeInitialLastCommandState()
     @State private var authorized = false
     @State private var navigationDebug = NavigationDebugSummary()
@@ -39,14 +57,34 @@ struct ConversationView: View {
                         Text(statusLabel).font(.headline)
                     }
 
-                    LiveCameraDebugPanel(
-                        ar: ar,
-                        summary: navigationDebug,
-                        perception: perception,
-                        detectorLoaded: detectorLoaded,
-                        fixtureVisibleObjects: Self.perceptionDiagnosticsFixture()
-                    )
-                        .frame(maxWidth: 320)
+                    if !scripted {
+                        LiveCameraDebugPanel(
+                            ar: ar,
+                            summary: navigationDebug,
+                            perception: perception,
+                            detectorLoaded: detectorLoaded,
+                            detector: detector,
+                            trackedFrame: model.trackedPersonFrameID,
+                            fixtureVisibleObjects: Self.perceptionDiagnosticsFixture()
+                        )
+                            .frame(maxWidth: 320)
+                    }
+
+                    if !model.status.isEmpty {
+                        Text(model.status)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: 320, alignment: .leading)
+                            .accessibilityIdentifier("talk_follow_status")
+                    }
+                    if let message = model.errorMessage {
+                        Text(message).foregroundStyle(.red)
+                    }
+                    if model.showsStopFollowing {
+                        Button("Stop Following", role: .destructive) {
+                            Task { await model.stopFollowing() }
+                        }
+                        .accessibilityIdentifier("talk_stop_following")
+                    }
 
                     if let message = brainAvailability?.operatorMessage {
                         Text(message)
@@ -93,7 +131,7 @@ struct ConversationView: View {
                         .accessibilityIdentifier("recognized-command-text")
                 }
 
-                if agent != nil {
+                if agent != nil && model.status.isEmpty && model.errorMessage == nil {
                     Text(phaseStatusLabel)
                         .font(.subheadline)
                         .padding(.horizontal, 18)
@@ -119,7 +157,7 @@ struct ConversationView: View {
         .padding(.horizontal)
         .padding(.top, 20)
         .task {
-            authorized = await speechIn.requestAuthorization()
+            guard !scripted else { return }
             let detector = await Detector()
             detector.setInferenceEnabled(scenePhase == .active)
             let perception = ARPerceptionSource(ar: ar, detector: detector)
@@ -136,9 +174,6 @@ struct ConversationView: View {
             let telemetry: MissionTelemetrySink = { event, fields in
                 RuntimeFileLog.append(event, fields: fields)
             }
-            // "follow me" needs a follower; without one the agent can only say it can't.
-            let follower = FollowController(perception: perception,
-                                            drive: LocalRoverDrive(ar: ar, control: control))
             let brain: RoverBrain = HybridBrain(
                 cloud: cloudBrain,
                 onDevice: onDevice,
@@ -148,11 +183,10 @@ struct ConversationView: View {
                 motion: nav,
                 perception: perception,
                 voice: voice,
-                follower: follower,
                 roomTopology: topology,
                 doorwayEvidenceProvider: doorwayEvidenceProvider,
                 phaseDidChange: { phase in
-                    missionPhase = phase
+                    model.receiveMissionPhase(phase)
                 },
                 roomTransitionStateDidChange: { state in
                     navigationDebug.apply(state)
@@ -162,9 +196,35 @@ struct ConversationView: View {
                 },
                 missionTelemetry: telemetry
             ) { brain }
+            let followClock = SystemFollowClock()
+            let follow = FollowMeCoordinator(
+                perception: ARFollowMePerceptionSource(ar: ar, detector: detector),
+                motion: NavigationFollowMeMotion(navigation: nav), clock: followClock,
+                configuration: .continuous
+            )
+            guard let agent else { return }
+            let router = OperatorCommandRouter(mission: agent, follow: follow,
+                                               mayStartFollow: mayStartFollow, clock: followClock)
+            model.configure(submit: { await router.submit($0) },
+                            stop: { await router.stop() }, followState: { follow.state },
+                            targetFrame: { follow.trackedPersonFrameID },
+                            readySignalClearance: { follow.readySignalClearance },
+                            inhibit: { follow.inhibitMotion() },
+                            submitFinalized: { text, receivedAt in
+                                await router.submit(text, finalizedTextReceivedAt: receivedAt)
+                            }, monotonic: { followClock.now })
+            authorized = await speechIn.requestAuthorization()
+        }
+        .onDisappear {
+            model.prepareToLeave()
+            Task { _ = await model.leaveTalk() }
         }
         .onChange(of: scenePhase) { _, phase in
             detector?.setInferenceEnabled(phase == .active)
+            if phase != .active {
+                model.prepareToLeave()
+                Task { _ = await model.leaveTalk() }
+            }
         }
     }
 
@@ -206,6 +266,7 @@ struct ConversationView: View {
     }
 
     private var statusLabel: String {
+        if scripted { return "" }
         if !authorized { return "Enable Speech Recognition in Settings" }
         switch speechIn.state {
         case .listening: return "Listening…"
@@ -229,7 +290,7 @@ struct ConversationView: View {
             return speechIn.partialTranscript.isEmpty ? "Listening…" : "Processing speech…"
         }
         if speechIn.state == .processing { return "Processing speech…" }
-        return phaseLabel(missionPhase)
+        return phaseLabel(model.missionPhase)
     }
 
     private var commandText: String? {
@@ -255,7 +316,7 @@ struct ConversationView: View {
             }) { captureID, utterance in
                 lastCommand.finalizeCapture(captureID)
                 Task { @MainActor in
-                    await agent?.handle(utterance)
+                    await model.submitFinalSpeech(utterance)
                 }
             }
         } catch {
@@ -271,12 +332,17 @@ private struct LiveCameraDebugPanel: View {
     let summary: NavigationDebugSummary
     let perception: ARPerceptionSource?
     let detectorLoaded: Bool
+    let detector: Detector?
+    let trackedFrame: ARFrameID?
     let fixtureVisibleObjects: String?
 
     @Environment(\.displayScale) private var displayScale
     @State private var previewImage: UIImage?
     @State private var visibleObjects = "none"
-    @State private var lastDetectionAt = Date.distantPast
+    @State private var predictions: [Detector.Detection] = []
+    @State private var personVerification: [PersonBodyVerifier.Decision]?
+    @State private var previewFrame: ARFrameID?
+    @State private var previewAge: TimeInterval?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -285,6 +351,27 @@ private struct LiveCameraDebugPanel: View {
                     Image(uiImage: previewImage)
                         .resizable()
                         .scaledToFit()
+                        .overlay {
+                            GeometryReader { geometry in
+                                ForEach(predictions.indices, id: \.self) { index in
+                                    let detection = predictions[index]
+                                    let box = detection.boundingBox.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+                                    let checked = PerceptionDebugSummary.verification(forDetectionAt: index,
+                                        in: predictions, decisions: personVerification)?.accepted ?? false
+                                    if !box.isNull, box.width > 0, box.height > 0 {
+                                        Rectangle().stroke(checked ? Color.green : Color.orange, lineWidth: 1)
+                                            .frame(width: box.width * geometry.size.width, height: box.height * geometry.size.height)
+                                            .overlay(alignment: .topLeading) {
+                                                Text("\(detection.label) (raw)")
+                                                    .font(.system(size: 8, design: .monospaced))
+                                                    .foregroundStyle(.black)
+                                                    .background(checked ? Color.green.opacity(0.8) : Color.orange.opacity(0.8))
+                                            }
+                                            .position(x: box.midX * geometry.size.width, y: (1 - box.midY) * geometry.size.height)
+                                    }
+                                }
+                            }
+                        }
                 } else {
                     ZStack {
                         Color.black.opacity(0.08)
@@ -319,6 +406,18 @@ private struct LiveCameraDebugPanel: View {
                 Text("Target: \(summary.targetText)")
                 Text("Transition: \(summary.transitionText)")
                     .lineLimit(2)
+                Text(personVerification == nil || personVerification?.contains(where: \.verificationUnavailable) == true
+                     ? "Person check: unavailable — no verified candidate" :
+                    ((personVerification?.filter(\.accepted).count ?? 0) == 0 ? "Person check: none body-verified" :
+                        "Person check: \(personVerification?.filter(\.accepted).count ?? 0) body candidate(s)"))
+                if let trackedFrame {
+                    Text("Follow target: acquired • frame \(trackedFrame.generation):\(trackedFrame.sequence)")
+                } else {
+                    Text("Follow target: none")
+                }
+                if let previewFrame, let previewAge {
+                    Text("Frame: \(previewFrame.generation):\(previewFrame.sequence) • age \(String(format: "%.0f", previewAge * 1000)) ms")
+                }
             }
             .font(.system(.caption2, design: .monospaced))
             .foregroundStyle(.secondary)
@@ -348,24 +447,43 @@ private struct LiveCameraDebugPanel: View {
     @MainActor
     private func refreshLoop() async {
         while !Task.isCancelled {
-            refresh()
+            await refresh()
             try? await Task.sleep(for: .milliseconds(500))
         }
     }
 
     @MainActor
-    private func refresh() {
-        guard let buffer = ar.latestPixelBuffer else {
+    private func refresh() async {
+        guard let snapshot = ar.latestSnapshot else {
             previewImage = nil
+            predictions = []
+            personVerification = nil
+            previewFrame = nil
+            previewAge = nil
+            visibleObjects = "none"
             return
         }
-        previewImage = Self.previewImage(from: buffer, scale: displayScale)
-        guard fixtureVisibleObjects == nil,
-              detectorLoaded,
-              let perception,
-              Date().timeIntervalSince(lastDetectionAt) >= 1 else { return }
-        lastDetectionAt = Date()
-        visibleObjects = PerceptionDebugSummary.visibleObjects(perception.detectObjects())
+        guard let detector else {
+            previewImage = Self.previewImage(from: snapshot.image, scale: displayScale)
+            predictions = []
+            personVerification = nil
+            previewFrame = nil
+            previewAge = nil
+            return
+        }
+        guard let evaluation = await detector.followPreviewEvaluationAsync(
+            snapshot, at: ProcessInfo.processInfo.systemUptime), !Task.isCancelled,
+            ar.sessionGeneration == evaluation.snapshot.id.generation else { return }
+        previewImage = Self.previewImage(from: evaluation.snapshot.image, scale: displayScale)
+        predictions = evaluation.receipt.frame.detections
+        personVerification = evaluation.receipt.personVerification
+        previewFrame = evaluation.snapshot.id
+        let age = ProcessInfo.processInfo.systemUptime - evaluation.snapshot.timestamp
+        previewAge = age.isFinite && age >= 0 ? age : nil
+        visibleObjects = PerceptionDebugSummary.visibleObjects(predictions.map {
+            PerceivedObject(label: $0.label, confidence: $0.confidence,
+                normalizedPoint: CGPoint(x: $0.boundingBox.midX, y: $0.boundingBox.midY))
+        })
     }
 
     private static func previewImage(from pixelBuffer: CVPixelBuffer, scale: CGFloat) -> UIImage? {

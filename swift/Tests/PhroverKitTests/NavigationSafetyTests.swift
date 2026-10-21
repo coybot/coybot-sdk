@@ -451,9 +451,9 @@ final class NavigationSafetyTests: XCTestCase {
             depthRecoveryTimeout: 0.03,
             depthSafetyState: { _ in .unavailable(.staleRawDepth) }
         )
+        let logBefore = await runtimeLog()
         ingestTrackedPose(into: ar, yaw: 0, sequence: 1)
         ingestBlindDepth(into: ar)
-        let logBefore = runtimeLog()
 
         navigation.navigate(to: Vec2(0.10, 0))
         while navigation.state == .planning || navigation.state == .driving {
@@ -465,7 +465,7 @@ final class NavigationSafetyTests: XCTestCase {
             .failed("Depth safety stop at arrival: stale_raw_depth.")
         )
         XCTAssertEqual(navigationCommandCount, 0)
-        let logDelta = String(runtimeLog().dropFirst(logBefore.count))
+        let logDelta = String((await runtimeLog()).dropFirst(logBefore.count))
         XCTAssertTrue(logDelta.contains("nav_arrival_depth_retry_timeout"))
         XCTAssertTrue(logDelta.contains("depth_state=stale_raw_depth"))
     }
@@ -594,7 +594,7 @@ final class NavigationSafetyTests: XCTestCase {
         )
         ingestTrackedPose(into: ar, yaw: 0, sequence: 1)
         ingestBlindDepth(into: ar)
-        let logBefore = runtimeLog()
+        let logBefore = await runtimeLog()
 
         await navigation.rotate(by: .pi / 2)
 
@@ -603,7 +603,7 @@ final class NavigationSafetyTests: XCTestCase {
             .failed("Depth safety stop while rotating: stale_raw_depth.")
         )
         XCTAssertEqual(navigationCommandCount, 0)
-        let logDelta = String(runtimeLog().dropFirst(logBefore.count))
+        let logDelta = String((await runtimeLog()).dropFirst(logBefore.count))
         XCTAssertTrue(logDelta.contains("nav_scan_depth_retry_timeout"))
         XCTAssertTrue(logDelta.contains("depth_state=stale_raw_depth"))
     }
@@ -909,7 +909,12 @@ final class NavigationSafetyTests: XCTestCase {
                   let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 return false
             }
-            return payload["T"] as? Int == RoverConfig.Opcode.speedControl
+            guard payload["T"] as? Int == RoverConfig.Opcode.speedControl,
+                  let left = payload["L"] as? NSNumber,
+                  let right = payload["R"] as? NSNumber else { return false }
+            // WAVE ROVER stops through T:1 with zero wheel speeds. Only count
+            // commands that could move the rover in these safety assertions.
+            return left.doubleValue != 0 || right.doubleValue != 0
         }.count
     }
 
@@ -940,7 +945,8 @@ final class NavigationSafetyTests: XCTestCase {
         XCTAssertTrue(values().contains(expected))
     }
 
-    private func runtimeLog() -> String {
+    private func runtimeLog() async -> String {
+        await RuntimeFileLog.flush()
         guard let url = RuntimeFileLog.logFileURL else { return "" }
         return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
     }

@@ -112,6 +112,24 @@ final class PhroverOperatorUITests: XCTestCase {
         XCTAssertEqual(XCTWaiter.wait(for: [diagnosticAppears], timeout: 0.5), .completed)
     }
 
+    func testTalkOffersPressAndHoldMicrophoneWithoutTextEntry() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-ui-testing", "-talk-scenario", "ready"]
+        app.launch()
+        XCTAssertTrue(app.descendants(matching: .any)["push-to-talk-control"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.descendants(matching: .any)["talk_command_field"].exists)
+        XCTAssertFalse(app.buttons["talk_send_command"].exists)
+    }
+
+    func testLeavingTalkAfterFollowStopsBeforeShowingDrive() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-ui-testing", "-talk-scenario", "searching"]
+        app.launch()
+        XCTAssertTrue(app.buttons["talk_stop_following"].waitForExistence(timeout: 5))
+        app.buttons["Drive"].tap()
+        XCTAssertFalse(app.buttons["talk_stop_following"].waitForExistence(timeout: 2))
+    }
+
     /// Gated integration path: drive forward on the D-pad and confirm the command
     /// actually reached the (mocked) WAVE ROVER base — proves the phone->ESP32 control
     /// loop end-to-end with no chassis needed.

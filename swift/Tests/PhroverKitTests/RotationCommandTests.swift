@@ -82,8 +82,8 @@ final class RotationCommandTests: XCTestCase {
         }
         XCTAssertEqual(TestURLProtocol.requestRecords.count, 1)
         XCTAssertEqual(
-            Self.requestOpcode(from: firstRequest.url),
-            RoverConfig.Opcode.emergencyStop,
+            Self.isStoppedCommand(firstRequest.url),
+            true,
             "scan A's first request must be its preflight transport stop"
         )
         XCTAssertNil(
@@ -122,8 +122,8 @@ final class RotationCommandTests: XCTestCase {
         }
         XCTAssertEqual(TestURLProtocol.requestRecords.count, 2)
         XCTAssertEqual(
-            Self.requestOpcode(from: secondRequest.url),
-            RoverConfig.Opcode.emergencyStop,
+            Self.isStoppedCommand(secondRequest.url),
+            true,
             "scan B must perform its own preflight transport stop after the handoff"
         )
         XCTAssertEqual(secondRequest.statusCode, 200)
@@ -157,6 +157,30 @@ final class RotationCommandTests: XCTestCase {
             navigation.state,
             .failed("AR tracking is not ready — keep the phone still and try again.")
         )
+    }
+
+    func testFollowAdmissionDrainsGenericPreflightStopBeforeStarting() async {
+        TestURLProtocol.reset()
+        TestURLProtocol.delay = 0.20
+        let navigation = makeNavigation(ar: ARSessionManager())
+        let rotation = Task { await navigation.rotateAndWait(by: .pi / 6) }
+        await waitForRequestCount(1)
+        XCTAssertNil(TestURLProtocol.requestRecords.first?.statusCode)
+
+        TestURLProtocol.delay = 0
+        let follow = Task { await navigation.navigateForFollow(to: Vec2(1, 0), stoppingAtForwardClearance: 1.25) }
+        for _ in 0..<50 { await Task.yield() }
+        XCTAssertEqual(TestURLProtocol.requestCount, 1,
+            "Follow admission must wait for the generic controller's suspended preflight stop")
+
+        let rotationResult = await rotation.value
+        let followResult = await follow.value
+        XCTAssertEqual(rotationResult, .cancelled)
+        XCTAssertEqual(followResult, .failed(.noPose))
+        XCTAssertTrue(TestURLProtocol.requestURLs.allSatisfy(Self.isStoppedCommand))
+        XCTAssertGreaterThanOrEqual(TestURLProtocol.requestCount, 2,
+            "Follow still requires its own confirmed admission stop")
+        XCTAssertEqual(navigation.safetyState, .failed(.noPose))
     }
 
     func testLeftRotationUsesMinimumPhysicalTurnSpeed() {
@@ -397,7 +421,16 @@ final class RotationCommandTests: XCTestCase {
     }
 
     private var navigationCommandCount: Int {
-        TestURLProtocol.requestURLs.filter { Self.requestOpcode(from: $0) == RoverConfig.Opcode.speedControl }.count
+        TestURLProtocol.requestURLs.filter { Self.requestOpcode(from: $0) == RoverConfig.Opcode.speedControl && !Self.isStoppedCommand($0) }.count
+    }
+
+    private static func isStoppedCommand(_ url: URL) -> Bool {
+        guard let value = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "json" })?.value,
+              let data = value.data(using: .utf8),
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        return payload["T"] as? Int == RoverConfig.Opcode.speedControl &&
+            payload["L"] as? Double == 0 && payload["R"] as? Double == 0
     }
 
     private static func requestOpcode(from url: URL) -> Int? {

@@ -3,10 +3,75 @@ import CoreVideo
 import XCTest
 import simd
 import RoverNav
+import Observation
 @testable import PhroverKit
 
 @MainActor
 final class ARSessionManagerTests: XCTestCase {
+    func testRetiredMeshAnchorsAreRemovedEvenWhenTrackingIsLimited() throws {
+        let ar = ARSessionManager()
+        ar.resetTracking(generation: 1, runSession: false)
+        for sequence in 1...3 {
+            XCTAssertTrue(ar.ingest(.init(pose: Pose2D(position: .zero, yaw: 0),
+                frameSequence: UInt64(sequence), timestamp: Double(sequence),
+                trackingQuality: .normal, sessionGeneration: 1)))
+        }
+        let retired = try meshIdentity()
+        let retained = try meshIdentity()
+        ar.session(ar.session, didAdd: [retired, retained])
+        XCTAssertEqual(ar.meshAnchors.count, 2)
+        ar.sessionWasInterrupted(ar.session)
+        (ar as ARSessionDelegate).session?(ar.session, didRemove: [retired])
+        XCTAssertEqual(ar.meshAnchors.map(\.identifier), [retained.identifier])
+        (ar as ARSessionDelegate).session?(ar.session, didRemove: [retained])
+        XCTAssertTrue(ar.meshAnchors.isEmpty)
+    }
+
+    func testBackgroundDepthResultsCannotSurviveResetOrInterruption() async throws {
+        for reset in [true, false] {
+            let oldStarted = expectation(description: "old projection started")
+            let newStarted = expectation(description: "new projection started")
+            let published = expectation(description: "new projection published")
+            let oldGate = DispatchSemaphore(value: 0)
+            let newGate = DispatchSemaphore(value: 0)
+            defer { oldGate.signal(); newGate.signal() }
+            let ar = ARSessionManager(relativeHeadingTelemetry: { _, _ in }, depthProjection: { input in
+                if input.timestamp == 12 {
+                    oldStarted.fulfill()
+                    _ = oldGate.wait(timeout: .now() + 3)
+                } else {
+                    newStarted.fulfill()
+                    _ = newGate.wait(timeout: .now() + 3)
+                }
+                return DepthSafetyProcessor.project(input)
+            })
+            ar.resetTracking(generation: 1, runSession: false)
+            let map = makeDepth(2)
+            ar.enqueueDepthSafety(rawDepthMap: map, intrinsics: matrix_identity_float3x3,
+                cameraTransform: matrix_identity_float4x4, timestamp: 12)
+            await fulfillment(of: [oldStarted], timeout: 2)
+
+            if reset {
+                ar.resetTracking(generation: 2, runSession: false)
+            } else {
+                ar.sessionWasInterrupted(ar.session)
+                ar.sessionInterruptionEnded(ar.session)
+            }
+            ar.enqueueDepthSafety(rawDepthMap: map, intrinsics: matrix_identity_float3x3,
+                cameraTransform: matrix_identity_float4x4, timestamp: 13)
+            oldGate.signal()
+            await fulfillment(of: [newStarted], timeout: 2)
+            XCTAssertNil(ar.latestDepthSafetySnapshot, "Old projection must not repopulate a resumed session")
+            XCTAssertEqual(ar.depthSnapshotVersion, 0)
+
+            withObservationTracking { _ = ar.depthSnapshotVersion } onChange: { published.fulfill() }
+            newGate.signal()
+            await fulfillment(of: [published], timeout: 2)
+            XCTAssertEqual(ar.latestDepthSafetySnapshot?.timestamp, 13)
+            XCTAssertEqual(ar.depthSnapshotVersion, 1)
+        }
+    }
+
     func testSnapshotPreservesDepthConfidenceOrientationAndIngressEvidence() throws {
         var image: CVPixelBuffer?
         var confidence: CVPixelBuffer?
@@ -484,4 +549,15 @@ final class ARSessionManagerTests: XCTestCase {
         value.columns.3 = SIMD4<Float>(x, 0, z, 1)
         return value
     }
+}
+
+// Decode an identity-only mesh anchor through ARKit's public NSSecureCoding
+// interface. These lifecycle tests never inspect the absent geometry.
+private func meshIdentity() throws -> ARMeshAnchor {
+    let data = try NSKeyedArchiver.archivedData(withRootObject: ARAnchor(transform: matrix_identity_float4x4),
+        requiringSecureCoding: true)
+    let decoder = try NSKeyedUnarchiver(forReadingFrom: data)
+    decoder.setClass(ARMeshAnchor.self, forClassName: "ARAnchor")
+    defer { decoder.finishDecoding() }
+    return try XCTUnwrap(decoder.decodeObject(of: ARMeshAnchor.self, forKey: NSKeyedArchiveRootObjectKey))
 }

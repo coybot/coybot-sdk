@@ -165,3 +165,31 @@ final class ConversationViewModel {
         }
     }
 }
+
+/// Shares the lifetime of the view's detector, agent and speech objects.
+@Observable
+@MainActor
+final class ConversationRuntimeLifetime {
+    private(set) var runtimeReady = false
+    private var runtimeInitialization: UUID?
+    func beginRuntimeInitialization() -> UUID? {
+        guard !runtimeReady, runtimeInitialization == nil else { return nil }
+        let token = UUID()
+        runtimeInitialization = token
+        return token
+    }
+    func completeRuntimeInitialization(_ token: UUID) -> Bool {
+        guard runtimeInitialization == token, !runtimeReady else { return false }
+        runtimeInitialization = nil
+        runtimeReady = true
+        return true
+    }
+    func abandonRuntimeInitialization(_ token: UUID) {
+        if runtimeInitialization == token { runtimeInitialization = nil }
+    }
+    func invalidateRuntimeInitialization() { runtimeInitialization = nil }
+
+    private(set) var speechEpoch: UInt64 = 0
+    func invalidateSpeechCapture() { speechEpoch &+= 1 }
+    func acceptsSpeechCapture(from epoch: UInt64) -> Bool { speechEpoch == epoch }
+}

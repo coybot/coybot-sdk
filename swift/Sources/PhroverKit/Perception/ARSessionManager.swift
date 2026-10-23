@@ -99,6 +99,12 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     public private(set) var meshAnchors: [ARMeshAnchor] = []
     /// Nearest obstacle distance (m) in a forward cone from the latest depth frame.
     private(set) var latestDepthSafetySnapshot: DepthSafetySnapshot?
+    @ObservationIgnored private let depthProjection: @Sendable (DepthSafetyProcessor.Input) -> DepthSafetySnapshot
+    @ObservationIgnored private lazy var depthProcessor = DepthSafetyProcessor(evaluate: depthProjection) { [weak self] snapshot in
+        guard let self, self.acceptsObservations else { return }
+        self.latestDepthSafetySnapshot = snapshot
+        self.depthSnapshotVersion &+= 1
+    }
     public private(set) var depthSnapshotVersion: UInt64 = 0
     public var depthSnapshotTimestamp: TimeInterval? { latestDepthSafetySnapshot?.timestamp }
     public private(set) var trackingState: ARCamera.TrackingState = .notAvailable
@@ -185,6 +191,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     private var lastRejectedMeshLogAt = Date.distantPast
 
     public override init() {
+        depthProjection = DepthSafetyProcessor.project
         relativeHeadingTelemetry = { event, fields in
             RuntimeFileLog.append(event, fields: fields)
         }
@@ -192,7 +199,9 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         session.delegate = self
     }
 
-    init(relativeHeadingTelemetry: @escaping RoomTopologyTelemetrySink) {
+    init(relativeHeadingTelemetry: @escaping RoomTopologyTelemetrySink,
+         depthProjection: @escaping @Sendable (DepthSafetyProcessor.Input) -> DepthSafetySnapshot = DepthSafetyProcessor.project) {
+        self.depthProjection = depthProjection
         self.relativeHeadingTelemetry = relativeHeadingTelemetry
         super.init()
         session.delegate = self
@@ -300,6 +309,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     }
 
     func resetTracking(generation: UInt64, runSession: Bool) {
+        depthProcessor.invalidate()
         hasResetTracking = true
         acceptsObservations = false
         sessionGeneration = generation
@@ -356,6 +366,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     }
 
     public func pause() {
+        depthProcessor.invalidate()
         session.pause()
         motionManager.stopDeviceMotionUpdates()
     }
@@ -433,6 +444,15 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         depthSnapshotVersion &+= 1
     }
 
+    func enqueueDepthSafety(rawDepthMap: CVPixelBuffer,
+                            intrinsics: simd_float3x3,
+                            intrinsicsImageSize: CGSize? = nil,
+                            cameraTransform: simd_float4x4,
+                            timestamp: TimeInterval) {
+        depthProcessor.submit(.init(rawDepthMap: rawDepthMap, intrinsics: intrinsics,
+            imageResolution: intrinsicsImageSize, cameraTransform: cameraTransform, timestamp: timestamp))
+    }
+
     func depthSafetyObservation(
         for command: WheelCommand,
         at timestamp: TimeInterval = ProcessInfo.processInfo.systemUptime
@@ -470,7 +490,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
             RuntimeFileLog.append("image_orientation", fields: ["exif": "\(orientation.rawValue)"])
         }
         if let rawDepth = frame.sceneDepth {
-            ingestDepthSafety(
+            enqueueDepthSafety(
                 rawDepthMap: rawDepth.depthMap,
                 intrinsics: frame.camera.intrinsics,
                 intrinsicsImageSize: frame.camera.imageResolution,
@@ -478,6 +498,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
                 timestamp: frame.timestamp
             )
         } else {
+            depthProcessor.invalidate()
             latestDepthSafetySnapshot = nil
         }
         let depth = frame.smoothedSceneDepth ?? frame.sceneDepth
@@ -515,6 +536,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     }
 
     private func suspendObservations() {
+        depthProcessor.invalidate()
         turnEvidence.clear()
         acceptsObservations = false
         planningReadinessTracker.suspend()
@@ -614,6 +636,21 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     public func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
         collectMesh(anchors)
         collectFloor(anchors)
+    }
+
+    public func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
+        let retired = Set(anchors.map(\.identifier))
+        let previousCount = meshAnchors.count
+        meshAnchors.removeAll { retired.contains($0.identifier) }
+        if meshAnchors.count != previousCount {
+            // Removal is valid even during tracking loss. It is not a new trusted
+            // geometry observation and must not satisfy a recovery refresh gate.
+            RuntimeFileLog.append("nav_mesh_removed", fields: [
+                "removed_count": String(previousCount - meshAnchors.count),
+                "remaining_count": String(meshAnchors.count),
+                "session_generation": String(sessionGeneration)
+            ])
+        }
     }
 
     private func collectFloor(_ anchors: [ARAnchor]) {

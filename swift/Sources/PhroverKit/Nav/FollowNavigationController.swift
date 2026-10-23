@@ -13,6 +13,7 @@ final class FollowNavigationController {
     private enum RotationMode { case continuous, scan, followScan }
 
     var onStateChange: ((State, [Vec2]) -> Void)?
+    var onSafetyStateChange: ((NavigationSafetyState) -> Void)?
     var onFailure: ((FollowMotionFailureDelivery) -> Void)?
     var hasUnconfirmedStop: Bool { stopUnconfirmed }
     public private(set) var state: State = .idle { didSet { onStateChange?(state, path) } }
@@ -43,9 +44,11 @@ final class FollowNavigationController {
     private var pendingFollowTurnBurst: FollowTurnBurstFence?
     private var pendingFollowTurnBurstDrain: FollowTurnBurstDrain?
     var followTurnBurstPendingStatus: FollowTurnBurstPendingStatus? { pendingFollowTurnBurst?.status }
+    private let depthSafetyObservation: (WheelCommand) -> DepthSafetyObservation
+    private struct DepthSafetyStop: Error {}
     private let currentForwardClearance: () -> Double
     private let makePlan: (Vec2, Vec2) -> [Vec2]?
-    private let readySignalCostmap: ((Vec2) -> Costmap)?
+    private let readySignalCostmap: (@MainActor (Vec2) async -> Costmap?)?
     private let currentLastAck: () async -> Date?
     private let sendCommand: (WheelCommand) async throws -> Void
     private let sendFollowBurstCommand: (WheelCommand) async -> RoverCommandDiagnosticResult
@@ -207,7 +210,8 @@ final class FollowNavigationController {
         }
     }
 
-    public init(ar: ARSessionManager, control: RoverControl) {
+    init(ar: ARSessionManager, control: RoverControl,
+         depthSafetyObservation: ((WheelCommand) -> DepthSafetyObservation)? = nil) {
         let planner = AStarPlanner()
         currentPose = { ar.pose }
         currentPoseSample = { ar.latestSnapshot.map(NavigationPoseSample.init(snapshot:)) }
@@ -236,11 +240,12 @@ final class FollowNavigationController {
             }
         }
         currentForwardClearance = { ar.forwardClearance }
+        self.depthSafetyObservation = depthSafetyObservation ?? { ar.depthSafetyObservation(for: $0) }
         makePlan = { start, goal in
             let costmap = CostmapBuilder.build(from: ar.meshAnchors, center: start)
             return planner.plan(from: start, to: goal, in: costmap)
         }
-        readySignalCostmap = { CostmapBuilder.build(from: ar.meshAnchors, center: $0) }
+        readySignalCostmap = { await CostmapBuilder.buildAsync(from: ar.meshAnchors, center: $0) }
         currentLastAck = { await control.lastAckAt }
         sendCommand = Self.diagnosticSender(legacy: { try await control.sendNavigation($0) },
             receipt: { await control.sendNavigationWithReceipt($0) })
@@ -255,8 +260,9 @@ final class FollowNavigationController {
 
     init(currentPose: @escaping () -> Pose2D?,
          forwardClearance: @escaping () -> Double,
+         depthSafetyObservation: ((WheelCommand) -> DepthSafetyObservation)? = nil,
          plan: @escaping (Vec2, Vec2) -> [Vec2]?,
-         readySignalCostmap: ((Vec2) -> Costmap)? = nil,
+         readySignalCostmap: (@MainActor (Vec2) async -> Costmap?)? = nil,
          lastAckAt: @escaping () async -> Date?,
          sendCommand: @escaping (WheelCommand) async throws -> Void,
          stopRover: @escaping () async throws -> Void,
@@ -282,6 +288,11 @@ final class FollowNavigationController {
         self.sourceHealth = sourceHealth
         self.turnPoseEvidence = turnPoseEvidence
         self.currentForwardClearance = forwardClearance
+        // Legacy fixtures supply scalar clearance; production always uses AR depth provenance.
+        self.depthSafetyObservation = depthSafetyObservation ?? { command in
+            .init(state: .clear, clearance: forwardClearance(), supportCount: 0, sampleAge: 0,
+                  requiredStoppingDistance: 0, motionClass: .classify(command), speedLimit: nil)
+        }
         self.makePlan = plan
         self.readySignalCostmap = readySignalCostmap
         self.currentLastAck = lastAckAt
@@ -421,19 +432,90 @@ final class FollowNavigationController {
         FollowMotionTaskScope.evidence?.ownedGeneration = reservation
         do { try await confirmStop() } catch { return .failed(.commandFailed) }
         guard operationGeneration == reservation, !Task.isCancelled, recoveryAuthorized else { return .cancelled }
-        let startSample = readFollowPose()
-        guard followPoseRejection(startSample, at: sourceNow()) == nil, let start = startSample.pose else {
+        var startSample = readFollowPose()
+        guard followPoseRejection(startSample, at: sourceNow()) == nil, let initialStart = startSample.pose else {
             return .failed(currentPoseSample == nil ? .noPose : .trackingLost)
         }
+        let start = initialStart
         let direction = Vec2(cos(start.yaw), sin(start.yaw))
-        let goal = start.position + direction * 0.10
-        guard let planned = makePlan(start.position, goal), !planned.isEmpty else { return .failed(.noPath) }
-        if let map = readySignalCostmap?(start.position) {
-            // Check the actual swept segment in the inflated grid. Cell-center waypoints
-            // are quantized by 10 cm; they are not measured rover displacement.
-            guard map.isSegmentClear(from: start.position,
-                to: start.position + direction * 0.12, margin: 0.02) else { return .failed(.noPath) }
+        if let readySignalCostmap {
+            let planningStarted = sourceNow()
+            let sourceGeneration = startSample.frameID?.generation
+            let map = await readySignalCostmap(start.position)
+            guard operationGeneration == reservation, !Task.isCancelled, recoveryAuthorized,
+                  FollowMotionTaskScope.evidence?.fenced != true, !stopUnconfirmed else { return .cancelled }
+            guard let map else {
+                let evidence = FollowMotionTaskScope.evidence
+                evidence?.readyDiagnosticFields["ready_path_rejection"] = .string("map_unavailable")
+                evidence?.recordFailure(.noPath, cause: .readyMapUnavailable)
+                return .failed(.noPath)
+            }
+            let planningElapsed = sourceNow() - planningStarted
+            guard planningElapsed.isFinite, planningElapsed >= 0,
+                  planningElapsed <= RoverConfig.navigationTrackingFreshness else {
+                let evidence = FollowMotionTaskScope.evidence
+                evidence?.readyDiagnosticFields.merge([
+                    "ready_path_rejection": .string("map_stale"),
+                    "ready_path_preflight_s": .number(planningElapsed),
+                    "ready_path_maximum_age_s": .number(RoverConfig.navigationTrackingFreshness)
+                ]) { _, new in new }
+                evidence?.recordFailure(.stalled, cause: .readyMapStale)
+                return .failed(.stalled)
+            }
+            // Revalidate liveness without rebasing onto a different AR world frame.
+            // The map, corridor and pulse retain the same pre-build origin.
+            startSample = readFollowPose()
+            guard followPoseRejection(startSample, at: sourceNow(), expectedGeneration: sourceGeneration) == nil,
+                  let current = startSample.pose else { return .failed(.trackingLost) }
+            let yawShift = abs(normalizeAngle(current.yaw - start.yaw))
+            let sweptRadius = 0.12 + CostmapBuilder.Params().inflationRadius
+            let poseUncertainty = current.position.distance(to: start.position)
+                + 2 * sweptRadius * abs(sin(yawShift / 2))
+            let evidence = FollowMotionTaskScope.evidence
+            guard poseUncertainty <= 0.02, yawShift <= 0.10 else {
+                evidence?.readyDiagnosticFields.merge([
+                    "ready_preflight_pose_shift_m": .number(current.position.distance(to: start.position)),
+                    "ready_preflight_yaw_shift_rad": .number(yawShift),
+                    "ready_preflight_pose_uncertainty_m": .number(poseUncertainty)
+                ]) { _, new in new }
+                evidence?.recordFailure(.stalled, cause: .readyPreSendPoseShift)
+                return .failed(.stalled)
+            }
+            let goal = start.position + direction * 0.10
+            let assessment = AStarPlanner().assess(from: start.position, to: goal, in: map)
+            // Check the actual swept segment in the inflated grid; quantized cell
+            // centers are not measured rover displacement.
+            let corridorClear = map.isSegmentClear(from: start.position,
+                to: start.position + direction * 0.12, margin: 0.02 + poseUncertainty)
+            let rejection: String?
+            switch assessment {
+            case .path(let points): rejection = points.isEmpty ? "empty_path" : (corridorClear ? nil : "corridor_blocked")
+            case .rejected(let failure): rejection = failure.rawValue
+            }
+            let startCell = map.worldToCell(start.position)
+            let goalCell = map.worldToCell(goal)
+            let fields: [String: FollowDiagnosticValue] = [
+                "ready_path_rejection": rejection.map(FollowDiagnosticValue.string) ?? .null,
+                "ready_path_preflight_s": .number(sourceNow() - planningStarted),
+                "ready_start_cell_cost": .number(Double(map.cost(startCell.cx, startCell.cy))),
+                "ready_goal_cell_cost": .number(Double(map.cost(goalCell.cx, goalCell.cy))),
+                "ready_corridor_clear": .bool(corridorClear),
+                "ready_preflight_pose_uncertainty_m": .number(poseUncertainty),
+                "ready_source_age_s": startSample.sourceTimestamp.map { .number(sourceNow() - $0) } ?? .null,
+                "ready_map_resolution_m": .number(map.resolution)
+            ]
+            evidence?.readyDiagnosticFields.merge(fields) { _, new in new }
+            diagnosticEmitter?.emit(.init(event: "follow_ready.path_preflight", context: .init(
+                sessionGeneration: evidence?.context.request?.sessionGeneration,
+                operationID: evidence?.context.controllerOperationID, purpose: "followReady",
+                outcome: rejection == nil ? "accepted" : "rejected", reason: rejection), payload: fields))
+            if rejection != nil {
+                evidence?.recordFailure(.noPath, cause: .readyPathBlocked)
+                return .failed(.noPath)
+            }
         } else {
+            let goal = start.position + direction * 0.10
+            guard let planned = makePlan(start.position, goal), !planned.isEmpty else { return .failed(.noPath) }
             // Exact-path test/custom planning seam without a costmap remains fail-closed.
             guard planned.allSatisfy({ point in
                   let delta = point - start.position
@@ -599,6 +681,7 @@ final class FollowNavigationController {
                     sendValidUntil: validUntil)
                 guard operationGeneration == ownedGeneration, !Task.isCancelled,
                       FollowMotionTaskScope.evidence?.fenced != true, !stopUnconfirmed, recoveryAuthorized else { return .cancelled }
+                if pulse.send.result.failure is DepthSafetyStop { return .failed(.obstacle) }
                 if pulse.send.result.failure != nil { return .failed(.commandFailed) }
                 let pulseReturnUptime = sourceNow()
                 let pulseReturnedElapsed = now().timeIntervalSince(started)
@@ -1685,6 +1768,23 @@ final class FollowNavigationController {
                         acknowledgementUTC: nil, attempts: 0, outcome: Task.isCancelled ? "cancelled" : "fenced"),
                         failure: Task.isCancelled ? FollowTurnBurstTransportDenial.cancelled : .fenced)
                 }
+                let safeCommand: WheelCommand
+                switch guardLayer.evaluate(command: command, depthSafety: depthSafetyObservation(command)) {
+                case .allow(let limited, _): safeCommand = limited
+                case .stopDepth:
+                    runtime?.fail(.obstacle)
+                    evidence?.recordFailure(.obstacle)
+                    fence.inhibit(at: entry)
+                    return RoverCommandDiagnosticResult(receipt: .init(httpStatus: nil, acknowledged: false,
+                        acknowledgementUTC: nil, attempts: 0, outcome: "depth_safety_stop"), failure: DepthSafetyStop())
+                }
+                // The depth provider can invoke callbacks; do not arm a replaced owner.
+                guard recoveryAuthorized, !Task.isCancelled, operationGeneration == owner, evidence?.fenced != true,
+                      !stopUnconfirmed, pendingFollowTurnBurst == nil,
+                      evidence?.targetYaw == nil || followTurnSourceGate.latest?.pose?.yaw == preparedYaw else {
+                    return RoverCommandDiagnosticResult(receipt: .init(httpStatus: nil, acknowledged: false,
+                        acknowledgementUTC: nil, attempts: 0, outcome: "fenced"), failure: FollowTurnBurstTransportDenial.fenced)
+                }
                 guard let epoch = fence.arm(entry: entry, budget: requestedBudget) else {
                     return RoverCommandDiagnosticResult(receipt: .init(httpStatus: nil, acknowledged: false,
                         acknowledgementUTC: nil, attempts: 0, outcome: "invalid_budget"),
@@ -1694,7 +1794,7 @@ final class FollowNavigationController {
                 pendingFollowTurnBurstDrain = drain
                 arming.arm(epoch)
                 evidence?.burstTrace?.senderEntry(entry, deadline: deadline, budget: requestedBudget)
-                let result = await sendFollowBurstCommand(command)
+                let result = await sendFollowBurstCommand(safeCommand)
                 // Capture/cancel synchronously at the actual sender return, not
                 // after the task-local wrapper's next actor resumption.
                 response = sourceNow()
@@ -1972,6 +2072,7 @@ final class FollowNavigationController {
         var progressWatchdog = DriveProgressWatchdog(timeout: 2.5, minimumProgress: 0.05)
         while !Task.isCancelled {
             guard let pose = currentPose() else {
+                liveFollowGoal = nil
                 try? await stopRover()
                 path = []
                 let result = NavigationResult.failed(.trackingLost)
@@ -1992,6 +2093,7 @@ final class FollowNavigationController {
             } ?? .inactive
 
             if case .arrived = targetApproachDecision, let targetStopDistance {
+                liveFollowGoal = nil
                 try? await stopRover()
                 let result = NavigationResult.arrived
                 finish(result)
@@ -2010,6 +2112,7 @@ final class FollowNavigationController {
             replanCounter += 1
             if replanCounter % 10 == 0,
                let failure = planAndStore(from: pose.position, to: goal, policy: activePolicy) {
+                liveFollowGoal = nil
                 try? await stopRover()
                 path = []
                 let result = NavigationResult.failed(failure)
@@ -2032,6 +2135,7 @@ final class FollowNavigationController {
             case .go:
                 break
             case .stopObstacle(let clearance):
+                liveFollowGoal = nil
                 try? await stopRover()
                 if isFollowGoal {
                     let result = NavigationResult.failed(.obstacle)
@@ -2053,6 +2157,7 @@ final class FollowNavigationController {
                 activePolicy = nil
                 return state == .arrived ? .arrived : .failed(.obstacle)
             case .stopCommsLost:
+                liveFollowGoal = nil
                 try? await stopRover()
                 let result = NavigationResult.failed(.commsLost)
                 finish(result)
@@ -2062,6 +2167,7 @@ final class FollowNavigationController {
                 ])
                 return result
             case .stopTipping:
+                liveFollowGoal = nil
                 try? await stopRover()
                 let result = NavigationResult.failed(.tipping)
                 finish(result)
@@ -2071,7 +2177,7 @@ final class FollowNavigationController {
 
             let out = pursuit.step(pose: pose, path: path)
             if out.reachedGoal {
-                if isFollowGoal { liveFollowGoal = nil }
+                liveFollowGoal = nil
                 try? await stopRover()
                 let result = NavigationResult.arrived
                 finish(result)
@@ -2086,6 +2192,7 @@ final class FollowNavigationController {
             if progressWatchdog.observe(distanceToGoal: distanceToGoal,
                                         now: now,
                                         commanded: isCommanded) {
+                liveFollowGoal = nil
                 try? await stopRover()
                 let result = NavigationResult.failed(.stalled)
                 finish(result)
@@ -2104,8 +2211,18 @@ final class FollowNavigationController {
             telemetry["path_points"] = "\(path.count)"
             telemetry["target_approach_slowed"] = command == out.command ? "false" : "true"
             RuntimeFileLog.append("nav_drive_tick", fields: telemetry)
+            let safeCommand: WheelCommand
+            switch guardLayer.evaluate(command: command, depthSafety: depthSafetyObservation(command)) {
+            case .allow(let limited, _): safeCommand = limited
+            case .stopDepth:
+                liveFollowGoal = nil
+                try? await stopRover()
+                finish(.failed(.obstacle))
+                return .failed(.obstacle)
+            }
+            guard !Task.isCancelled, FollowMotionTaskScope.evidence?.fenced != true, !stopUnconfirmed else { break }
             do {
-                try await sendCommand(command)
+                try await sendCommand(safeCommand)
                 consecutiveCommandFailures = 0
                 hasSentCommand = true
             } catch {
@@ -2123,6 +2240,7 @@ final class FollowNavigationController {
                     "error": error.localizedDescription,
                     "max_failures": "1"
                 ]) { current, _ in current })
+                liveFollowGoal = nil
                 try? await stopRover()
                 state = Self.stateAfterCommandFailure(error)
                 publishSafetyState(.failed(.commandFailed))
@@ -2135,6 +2253,7 @@ final class FollowNavigationController {
             }
             await sleep(.seconds(RoverConfig.commandInterval))
         }
+        liveFollowGoal = nil
         try? await stopRover()
         activePolicy = nil
         return .cancelled
@@ -2322,8 +2441,18 @@ final class FollowNavigationController {
                     return result
                 }
             }
+            let safeCommand: WheelCommand
+            switch guardLayer.evaluate(command: cmd, depthSafety: depthSafetyObservation(cmd)) {
+            case .allow(let limited, _): safeCommand = limited
+            case .stopDepth:
+                try? await rotationStop(origin: "cleanup")
+                finish(.failed(.obstacle))
+                return .failed(.obstacle)
+            }
+            guard !Task.isCancelled, operationGeneration == ownedGeneration,
+                  evidence?.fenced != true, !stopUnconfirmed else { break }
             do {
-                try await sendCommand(cmd)
+                try await sendCommand(safeCommand)
                 if let evidence { trace?.endSend(evidence: evidence, latch: stopUnconfirmed, outcome: "acknowledged") }
                 hasSentCommand = true
             } catch {
@@ -2410,6 +2539,7 @@ final class FollowNavigationController {
         }
         guard safetyState != newState else { return }
         safetyState = newState
+        onSafetyStateChange?(newState)
         for continuation in safetyStateContinuations.values { continuation.yield(newState) }
     }
 

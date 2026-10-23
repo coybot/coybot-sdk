@@ -69,6 +69,9 @@ struct FollowMotionFailureResolution {
         sources.insert(delivery.source.rawValue)
     }
     var diagnosticReason: String {
+        if primaryReason == .noPath, context.purpose == .followReady,
+           let cause = context.failureCause,
+           cause == .readyPathBlocked || cause == .readyMapUnavailable { return cause.rawValue }
         if primaryReason == .stalled, context.purpose == .followReady,
            let cause = context.failureCause, cause.readyDescription != nil { return cause.rawValue }
         if primaryReason == .stalled, context.purpose == .followScan { return "no_yaw_progress" }
@@ -121,7 +124,13 @@ struct FollowMotionFailureResolution {
                 return "\(turn) stopped: calibration pose evidence is incomplete or unreliable. \(stop)"
             }
             return "\(turn) stopped: observed response is too coarse for the remaining angle. \(stop)"
-        case .noPath: return "No navigation path available."
+        case .noPath:
+            if context.purpose == .followReady && context.failureCause == .readyMapUnavailable {
+                return "Ready signal waiting for a map. Let the camera observe the floor and restart following."
+            }
+            return context.purpose == .followReady && context.failureCause == .readyPathBlocked
+                ? "Ready signal blocked by mapped obstacles. Move the rover to clear floor and restart following."
+                : "No navigation path available."
         case .pathRejected: return "Navigation path rejected."
         case .commandFailed: return "Navigation command failed."
         case .cancelled: return "Navigation cancelled."

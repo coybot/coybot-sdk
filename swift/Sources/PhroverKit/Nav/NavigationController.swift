@@ -23,7 +23,9 @@ public enum NavigationSafetyState: Equatable, Sendable {
 public final class NavigationController {
     public enum State: Equatable, Sendable { case idle, planning, driving, arrived, failed(String) }
     public private(set) var state: State = .idle {
-        didSet { publishSafetyState(Self.safetyState(for: state, policyViolation: lastPolicyViolation)) }
+        didSet {
+            if !mirroringFollowState { publishSafetyState(Self.safetyState(for: state, policyViolation: lastPolicyViolation)) }
+        }
     }
     public private(set) var path: [Vec2] = []
     public private(set) var safetyState: NavigationSafetyState = .idle
@@ -35,6 +37,7 @@ public final class NavigationController {
 
     // Follow owns its source-evidence/burst runtime; all admission is serialized by
     // this controller's operation tokens alongside ordinary navigation and scans.
+    private var mirroringFollowState = false
     private var followNavigation: FollowNavigationController
     private var followOperation: OperationToken?
     private var followNeedsConfirmedStop = false
@@ -42,6 +45,7 @@ public final class NavigationController {
 
     private let ar: ARSessionManager
     private let control: RoverControl
+    private var genericStop: () async throws -> Void
     private let planner = AStarPlanner()
     private let pursuit = PursuitController(params: .init(
         wheelBase: RoverConfig.wheelBase,
@@ -103,9 +107,10 @@ public final class NavigationController {
             )
         }
     ) {
-        self.followNavigation = FollowNavigationController(ar: ar, control: control)
+        self.followNavigation = FollowNavigationController(ar: ar, control: control, depthSafetyObservation: depthSafetyObservation)
         self.ar = ar
         self.control = control
+        self.genericStop = { try await control.stop() }
         self.trackingRecoveryTimeout = trackingRecoveryTimeout
         self.scanDepthRecoveryTimeout = scanDepthRecoveryTimeout
         self.guardLayer = guardLayer
@@ -117,8 +122,9 @@ public final class NavigationController {
 
     convenience init(currentPose: @escaping () -> Pose2D?,
          forwardClearance: @escaping () -> Double,
+         depthSafetyObservation: ((WheelCommand) -> DepthSafetyObservation)? = nil,
          plan: @escaping (Vec2, Vec2) -> [Vec2]?,
-         readySignalCostmap: ((Vec2) -> Costmap)? = nil,
+         readySignalCostmap: (@MainActor (Vec2) async -> Costmap?)? = nil,
          lastAckAt: @escaping () async -> Date?,
          sendCommand: @escaping (WheelCommand) async throws -> Void,
          stopRover: @escaping () async throws -> Void,
@@ -136,8 +142,9 @@ public final class NavigationController {
           turnPoseEvidence: ((ARFrameID, ARFrameID) -> [FollowTurnBurstPlanner.Sample]?)? = nil,
          transportUptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.init(ar: ARSessionManager(), control: RoverControl())
+        self.genericStop = stopRover
         self.followNavigation = FollowNavigationController(
-            currentPose: currentPose, forwardClearance: forwardClearance, plan: plan,
+            currentPose: currentPose, forwardClearance: forwardClearance, depthSafetyObservation: depthSafetyObservation, plan: plan,
             readySignalCostmap: readySignalCostmap, lastAckAt: lastAckAt,
             sendCommand: sendCommand, stopRover: stopRover, sleep: sleep, now: now,
             sendCommandReceipt: sendCommandReceipt, stopRoverReceipt: stopRoverReceipt,
@@ -164,21 +171,22 @@ public final class NavigationController {
             self.endAnyRelativeHeadingMeasurementIfCurrent(handoff.token)
             self.followNavigation.onStateChange = { [weak self] state, path in
                 guard let self, self.isCurrentOperation(handoff.token) else { return }
-                self.path = path
-                switch state {
-                case .idle: self.state = .idle
-                case .planning: self.state = .planning
-                case .driving: self.state = .driving
-                case .arrived: self.state = .arrived
-                case .failed(let message): self.state = .failed(message)
-                }
+                self.mirrorFollowState(state, path: path)
+            }
+            self.followNavigation.onSafetyStateChange = { [weak self] state in
+                guard let self, self.isCurrentOperation(handoff.token) else { return }
+                self.mirrorFollowSafetyState(state)
             }
             let result = await self.followNavigation.performFollowMotion(request, context: context)
             if self.isCurrentOperation(handoff.token) {
+                self.mirroringFollowState = true
+                defer { self.mirroringFollowState = false }
                 switch result.result {
-                case .arrived: self.state = .arrived
-                case .cancelled: self.state = .idle
-                case .failed(let failure): self.state = .failed(FollowNavigationController.message(for: failure))
+                case .arrived: self.state = .arrived; self.publishSafetyState(.idle)
+                case .cancelled: self.state = .idle; self.publishSafetyState(.idle)
+                case .failed(let failure):
+                    self.state = .failed(FollowNavigationController.message(for: failure))
+                    self.publishSafetyState(.failed(failure))
                 }
                 self.clearLoopIfCurrent(handoff.token)
             }
@@ -194,6 +202,22 @@ public final class NavigationController {
             await resultTask.value
         } onCancel: { task.cancel(); resultTask.cancel() }
     }
+
+    /// Follow display changes never parse typed failure reasons out of UI text.
+    func mirrorFollowState(_ state: FollowNavigationController.State, path: [Vec2]) {
+        self.path = path
+        mirroringFollowState = true
+        defer { mirroringFollowState = false }
+        switch state {
+        case .idle: self.state = .idle
+        case .planning: self.state = .planning
+        case .driving: self.state = .driving
+        case .arrived: self.state = .arrived
+        case .failed(let message): self.state = .failed(message)
+        }
+    }
+
+    func mirrorFollowSafetyState(_ state: NavigationSafetyState) { publishSafetyState(state) }
 
     public func navigateForFollow(to goal: Vec2, stoppingAtForwardClearance clearance: Double) async -> NavigationResult {
         await performFollowMotion(.following(goal, clearance), context: nil).result
@@ -249,7 +273,6 @@ public final class NavigationController {
     public func stopAndConfirm() async throws {
         let handoff = claimOperation()
         followNeedsConfirmedStop = true
-        state = .idle
         let stop = Task { @MainActor in
             await handoff.predecessor?.value
             // The successor waits for this installed task, so an explicitly
@@ -763,7 +786,7 @@ public final class NavigationController {
     @discardableResult
     private func stopTransportIfCurrent(_ operation: OperationToken) async -> Bool {
         guard isCurrentOperation(operation) else { return false }
-        let stopTask = Task { @MainActor [weak self, control] in
+        let stopTask = Task { @MainActor [weak self] in
             guard self?.isCurrentOperation(operation) == true else { return false }
             if let self, self.followNeedsConfirmedStop {
                 do {
@@ -775,7 +798,7 @@ public final class NavigationController {
                     return false
                 }
             } else {
-                try? await control.stop()
+                try? await self?.genericStop()
             }
             return self?.isCurrentOperation(operation) == true
         }

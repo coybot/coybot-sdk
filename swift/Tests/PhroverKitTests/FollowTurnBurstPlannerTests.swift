@@ -2,6 +2,75 @@ import XCTest
 import PhroverKit
 
 final class FollowTurnBurstPlannerTests: XCTestCase {
+    func testCapturedAlignmentCanRepeatWithinSweptHeadingRangeDespiteSmallReversals() {
+        // iPhone trace, 2026-10-23 17:45:53Z. Total yaw variation exceeds the
+        // corridor, but every sampled heading remains inside a smaller range.
+        let captured: [(yaw: Double, source: Double, collected: Double)] = [
+            (1.1949832373110556, 9203.938061666, 9204.022649458333),
+            (1.1940817401726649, 9203.971396791, 9204.056034416668),
+            (1.190861089928887, 9204.004731958, 9204.088726458334),
+            (1.1902719236301442, 9204.038066916, 9204.125574458334),
+            (1.1925323921063509, 9204.071401875, 9204.161078791667),
+            (1.2148584935181572, 9204.104737125, 9204.191682333334),
+            (1.2444113096701694, 9204.138072125, 9204.223500791668),
+            (1.2814643372919368, 9204.17140725, 9204.259908291668),
+            (1.3214325300794338, 9204.20474225, 9204.292108666667),
+            (1.3304701942019193, 9204.238077375, 9204.322926833334),
+            (1.3243433123842794, 9204.271412291, 9204.354776458335),
+            (1.3276229105685151, 9204.304747541, 9204.388831583334),
+            (1.3216905310702693, 9204.338082541, 9204.424146791667),
+            (1.3239118201860158, 9204.371417625, 9204.457533958333),
+            (1.3269333311310412, 9204.404752541, 9204.492133791668),
+        ]
+        for direction in [-1.0, 1.0] {
+            for offset in [0.0, direction * 1.9] { // Also cross the +/-pi representation seam.
+                func yaw(_ value: Double) -> Double { atan2(sin(direction * value + offset), cos(direction * value + offset)) }
+                let target = yaw(1.422101571912323)
+                let seed = initial(target)
+                let profile = Planner.Profile(purpose: .alignment)
+                let samples = captured.enumerated().map { i, point in
+                    Planner.Sample(yaw: yaw(point.yaw), sequence: UInt64(i + 1), generation: 7,
+                        sourceTimestamp: point.source, collectedUptime: point.collected,
+                        clockDomain: "test_uptime", healthy: true)
+                }
+                let response = Planner.Response(operationID: 1, generation: 7, targetYaw: target,
+                    clockDomain: "test_uptime", requestedBudget: 0.08,
+                    sendEntryUptime: 9204.031909416668, sendResponseUptime: 9204.098584083335,
+                    stopObligationUptime: 9204.135600791667, stopAcknowledgementUptime: 9204.192158666667,
+                    samples: samples,
+                    planningEvaluation: .init(yaw: samples[0].yaw, sequence: 1, generation: 7,
+                        sourceTimestamp: samples[0].sourceTimestamp, collectedUptime: 9204.030813708334,
+                        clockDomain: "test_uptime", healthy: true),
+                    stoppedEvaluation: .init(yaw: samples.last!.yaw, sequence: UInt64(samples.count), generation: 7,
+                        sourceTimestamp: samples.last!.sourceTimestamp, collectedUptime: 9204.501202041667,
+                        clockDomain: "test_uptime", healthy: true))
+                let measured = Planner.recording(response, in: seed, profile: profile)
+                XCTAssertNil(measured.rejection)
+                XCTAssertEqual(measured.sampledAbsoluteTravel ?? -1, 0.1654912438135796, accuracy: 1e-10)
+                XCTAssertEqual(measured.calibration.responseRate, seed.responseRate,
+                    "Preserve the conservative rate model; this fix concerns swept heading geometry")
+                XCTAssertEqual(Planner.plan(.init(actualYaw: yaw(1.422101571912323 - 0.09794924136092731),
+                    profile: profile, calibration: measured.calibration, sendEntryUptime: 9205,
+                    provisionalProbeIssued: true)), .burst(direction: Int(direction), budget: 0.08))
+            }
+        }
+    }
+
+    func testRepeatCannotHideWideOutAndBackExcursionOrWrongDirection() {
+        let seed = initial(0.8)
+        let profile = Planner.Profile(purpose: .alignment)
+        for middle in [0.3, -0.3] {
+            let measured = Planner.recording(response(seed, samples: [sample(0), sample(middle, 2, 100),
+                sample(0.1, 3, 100.4)]), in: seed, profile: profile)
+            XCTAssertNil(measured.rejection)
+            for error in [-0.1, 0.1] {
+                XCTAssertEqual(Planner.plan(.init(actualYaw: seed.targetYaw - error, profile: profile,
+                    calibration: measured.calibration, sendEntryUptime: 101)),
+                    .resolutionFailure(.rotationResolutionInsufficient))
+            }
+        }
+    }
+
     func testInheritedSearchGainReducesNewStepProbeWithoutReusingTargetOrSourceHistory() {
         let seed = Planner.Calibration(operationID: 2, generation: 7, targetYaw: .pi / 18,
             clockDomain: "test_uptime", responseRateFloor: 10)

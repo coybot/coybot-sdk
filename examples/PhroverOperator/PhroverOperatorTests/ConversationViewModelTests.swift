@@ -5,6 +5,59 @@ import RoverNav
 
 @MainActor
 final class ConversationViewModelTests: XCTestCase {
+    func testRuntimeInitializationIsSingleAndCancelledLoadCannotReplaceRuntime() throws {
+        let model = ConversationRuntimeLifetime()
+        let old = try XCTUnwrap(model.beginRuntimeInitialization())
+        XCTAssertFalse(model.runtimeReady)
+        XCTAssertNil(model.beginRuntimeInitialization(), "Only one load may own installation")
+        model.invalidateRuntimeInitialization()
+        let current = try XCTUnwrap(model.beginRuntimeInitialization())
+        XCTAssertFalse(model.completeRuntimeInitialization(old), "Cancelled appearance cannot install")
+        XCTAssertTrue(model.completeRuntimeInitialization(current))
+        XCTAssertTrue(model.runtimeReady)
+        model.invalidateRuntimeInitialization() // Leaving the tab preserves the installed runtime.
+        XCTAssertNil(model.beginRuntimeInitialization(), "Returning to Talk must reuse its runtime")
+    }
+
+    func testSpeechCaptureFromPreviousAppearanceCannotSubmitAfterReturn() throws {
+        let lifetime = ConversationRuntimeLifetime()
+        let capture = lifetime.speechEpoch
+        XCTAssertTrue(lifetime.acceptsSpeechCapture(from: capture))
+        lifetime.invalidateSpeechCapture() // Disappear or background.
+        XCTAssertFalse(lifetime.acceptsSpeechCapture(from: capture))
+        XCTAssertTrue(lifetime.acceptsSpeechCapture(from: lifetime.speechEpoch))
+    }
+
+    func testRecreatedViewGetsFreshRuntimeLifetime() throws {
+        let original = ConversationRuntimeLifetime()
+        XCTAssertTrue(original.completeRuntimeInitialization(try XCTUnwrap(original.beginRuntimeInitialization())))
+        let recreated = ConversationRuntimeLifetime()
+        XCTAssertFalse(recreated.runtimeReady)
+        XCTAssertNotNil(recreated.beginRuntimeInitialization())
+    }
+
+    func testOverlappingFollowFailureKeepsStopControlAndError() async {
+        let entered = expectation(description: "mission stop")
+        var release: CheckedContinuation<Void, Never>?
+        let mission = HeldRouterMission(onStop: {
+            await withCheckedContinuation { release = $0; entered.fulfill() }
+            throw URLError(.timedOut)
+        })
+        let follow = IdleRouterFollow()
+        let router = OperatorCommandRouter(mission: mission, follow: follow)
+        let model = ConversationViewModel(submit: { await router.submit($0) }, stop: { await router.stop() })
+        let first = Task { await model.submitFinalSpeech("follow me") }
+        await fulfillment(of: [entered], timeout: 2)
+        let secondEntered = expectation(description: "duplicate submitted")
+        let second = Task { secondEntered.fulfill(); await model.submitFinalSpeech("follow me") }
+        await fulfillment(of: [secondEntered], timeout: 2)
+        release?.resume()
+        await first.value
+        await second.value
+        XCTAssertEqual(model.errorMessage, "Rover stop could not be confirmed.")
+        XCTAssertTrue(model.showsStopFollowing)
+    }
+
     func testAcknowledgedTalkExitDoesNotRepeatStopOrInhibitOnDisappear() async {
         var stops = 0
         var inhibits = 0
@@ -268,4 +321,20 @@ private final class ConversationMissionPerception: RoverPerception {
 private final class ConversationMissionVoice: RoverVoice {
     func speak(_ text: String) {}
     func ask(_ question: String, timeout: TimeInterval) async -> String? { nil }
+}
+
+@MainActor
+private final class HeldRouterMission: OperatorMission {
+    let onStop: () async throws -> Void
+    init(onStop: @escaping () async throws -> Void) { self.onStop = onStop }
+    func handle(_ text: String) async {}
+    func cancelCurrentMissionAndWait() async throws { try await onStop() }
+}
+
+@MainActor
+private final class IdleRouterFollow: OperatorFollow {
+    var state: FollowMeState { .idle }
+    func start() async -> Bool { true }
+    func stop() async -> Bool { true }
+    func inhibitMotion() {}
 }

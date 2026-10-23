@@ -22,6 +22,9 @@ public enum FollowTurnBurstPlanner {
             public let budget: Double
             public let signedTravel: Double
             public let absoluteTravel: Double
+            /// Width of the unwrapped sampled heading interval, including the
+            /// starting heading. Repeated reversals do not expand this interval.
+            public let headingSpan: Double
         }
         public let operationID: UInt64
         public let generation: UInt64
@@ -293,6 +296,8 @@ public enum FollowTurnBurstPlanner {
         var overhead = calibration.responseOverhead
         var net = 0.0
         var sampledTravel = 0.0
+        var minimumHeading = 0.0
+        var maximumHeading = 0.0
         var postAckTravel = 0.0
         var postAckIntervals = 0
         for (before, after) in zip(response.samples, response.samples.dropFirst()) {
@@ -301,6 +306,8 @@ public enum FollowTurnBurstPlanner {
             let observedRate = abs(delta) / interval
             guard delta.isFinite, observedRate.isFinite else { return reject("nonfinite_response_rate") }
             net += delta
+            minimumHeading = min(minimumHeading, net)
+            maximumHeading = max(maximumHeading, net)
             sampledTravel += abs(delta)
             if hasSettledEndpoint, before.sourceTimestamp! > response.stopAcknowledgementUptime {
                 postAckTravel += abs(delta)
@@ -345,7 +352,8 @@ public enum FollowTurnBurstPlanner {
             stop: max(calibration.maximumStopDuration ?? 0, response.stopAcknowledgementUptime - response.stopObligationUptime),
             travel: travel, ceiling: ceiling, terminal: terminal, measured: hasResponseBracket,
             response: response, observedBurst: hasResponseBracket
-                ? .init(budget: response.requestedBudget, signedTravel: net, absoluteTravel: sampledTravel) : nil), rejection: nil,
+                ? .init(budget: response.requestedBudget, signedTravel: net, absoluteTravel: sampledTravel,
+                        headingSpan: maximumHeading - minimumHeading) : nil), rejection: nil,
             signedResponse: hasResponseBracket ? net : nil,
             sampledAbsoluteTravel: hasResponseBracket ? sampledTravel : nil)
     }
@@ -374,14 +382,15 @@ public enum FollowTurnBurstPlanner {
     }
 
     /// Host overhead is not a physical minimum angle. A previously successful
-    /// small pulse can be repeated if its entire sampled response fits the
-    /// remaining heading corridor. Never enlarge it or override an overshoot cap.
+    /// small pulse can be repeated if its sampled heading span fits the
+    /// remaining heading corridor. Total path length still calibrates rate; it
+    /// must not count repeated visits to a heading as a larger swept interval. Never enlarge it or override an overshoot cap.
     static func repeatableBudget(_ calibration: Calibration, error: Double, profile: Profile) -> Double? {
         guard !calibration.terminalResolutionFailure, calibration.overshootCeiling == nil,
               let observed = calibration.lastObservedBurst,
               observed.signedTravel * error > 0,
               observed.absoluteTravel > 0,
-              observed.absoluteTravel <= abs(error) + profile.tolerance else { return nil }
+              observed.headingSpan <= abs(error) + profile.tolerance else { return nil }
         return observed.budget
     }
 

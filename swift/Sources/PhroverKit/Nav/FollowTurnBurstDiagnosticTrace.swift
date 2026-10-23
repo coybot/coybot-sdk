@@ -102,6 +102,8 @@ final class FollowTurnBurstDiagnosticTrace {
             (reduction.signedResponse == nil ? "unknown_missing_endpoints" : "observed_ar_sampled"))
         fields["response_signed_net_rad"] = Self.number(reduction.signedResponse)
         fields["response_sampled_absolute_travel_rad"] = Self.number(reduction.sampledAbsoluteTravel)
+        fields["response_sampled_heading_span_rad"] = reduction.rejection == nil && reduction.signedResponse != nil
+            ? Self.number(reduction.calibration.lastObservedBurst?.headingSpan) : .null
         fields["previous_requested_budget_s"] = .number(response.requestedBudget)
         func evaluation(_ sample: FollowTurnBurstPlanner.Sample?) -> FollowDiagnosticValue {
             guard let sample else { return .null }

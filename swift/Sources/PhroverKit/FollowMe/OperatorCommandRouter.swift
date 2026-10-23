@@ -60,6 +60,7 @@ public final class OperatorCommandRouter {
     private var missionTask: Task<Void, Never>?
     private var pendingMissionStop: Task<Bool, Never>?
     private var stopTask: Task<OperatorSubmission, Never>?
+    private var followStartTask: Task<OperatorSubmission, Never>?
     private var commandSequence: UInt64 = 0
 
     public init(mission: any OperatorMission, follow: any OperatorFollow,
@@ -88,43 +89,27 @@ public final class OperatorCommandRouter {
             guard owner != .blocked && owner != .stopping else {
                 return .rejected("Rover stop could not be confirmed.")
             }
-            if owner == .follow || owner == .transitioning || follow.state.isActive { return .accepted }
+            if let followStartTask { return await followStartTask.value }
+            if owner == .follow || follow.state.isActive { return .accepted }
             guard owner == .mission || mayStartFollow() else {
                 return .rejected("Stop the other rover activity before following.")
             }
             generation &+= 1
             let token = generation
             owner = .transitioning
-            emitCommand("operator_command.ownership_stop_requested", kind: kind, commandID: commandID, receivedAt: receivedAt, origin: origin)
-            missionTask?.cancel()
-            let stopping = Task { [mission] in
-                do { try await mission.cancelCurrentMissionAndWait(); return true }
-                catch { return false }
+            let task = Task { @MainActor in
+                await self.startFollow(token: token, kind: kind, commandID: commandID,
+                                       receivedAt: receivedAt, origin: origin)
             }
-            pendingMissionStop = stopping
-            let confirmed = await stopping.value
-            guard generation == token else { return .rejected("Follow request cancelled.") }
-            pendingMissionStop = nil
-            guard confirmed else {
-                owner = .blocked
-                emitCommand("operator_command.ownership_stop_failed", kind: kind, commandID: commandID, receivedAt: receivedAt, origin: origin)
-                return .rejected("Rover stop could not be confirmed.")
-            }
-            emitCommand("operator_command.ownership_stop_confirmed", kind: kind, commandID: commandID, receivedAt: receivedAt, origin: origin)
-            emitCommand("operator_command.follow_start_requested", kind: kind, commandID: commandID, receivedAt: receivedAt, origin: origin)
-            let started: Bool
-            if let timed = follow as? any OperatorFollowTimedStart { started = await timed.start(commandReceivedAt: receivedAt) }
-            else { started = await follow.start() }
-            guard generation == token else { return .rejected("Follow request cancelled.") }
-            guard started else {
-                owner = .idle
-                return .rejected("Could not start following.")
-            }
-            owner = .follow
-            return .accepted
+            followStartTask = task
+            let result = await task.value
+            if generation == token { followStartTask = nil }
+            return result
         }
         guard owner == .idle && !follow.state.isActive else {
-            return .rejected("Stop following before sending another request.")
+            return .rejected(owner == .mission
+                ? "I’m still working on the previous command. Stop it before sending another request."
+                : "Stop following before sending another request.")
         }
         generation &+= 1
         let token = generation
@@ -133,6 +118,38 @@ public final class OperatorCommandRouter {
             await mission.handle(text)
             if let self, self.generation == token, self.owner == .mission { self.owner = .idle }
         }
+        return .accepted
+    }
+
+    private func startFollow(token: UInt64, kind: OperatorCommandKind, commandID: UInt64,
+                             receivedAt: TimeInterval, origin: String) async -> OperatorSubmission {
+        guard generation == token else { return .rejected("Follow request cancelled.") }
+        emitCommand("operator_command.ownership_stop_requested", kind: kind, commandID: commandID, receivedAt: receivedAt, origin: origin)
+        missionTask?.cancel()
+        let stopping = Task { [mission] in
+            do { try await mission.cancelCurrentMissionAndWait(); return true }
+            catch { return false }
+        }
+        pendingMissionStop = stopping
+        let confirmed = await stopping.value
+        guard generation == token else { return .rejected("Follow request cancelled.") }
+        pendingMissionStop = nil
+        guard confirmed else {
+            owner = .blocked
+            emitCommand("operator_command.ownership_stop_failed", kind: kind, commandID: commandID, receivedAt: receivedAt, origin: origin)
+            return .rejected("Rover stop could not be confirmed.")
+        }
+        emitCommand("operator_command.ownership_stop_confirmed", kind: kind, commandID: commandID, receivedAt: receivedAt, origin: origin)
+        emitCommand("operator_command.follow_start_requested", kind: kind, commandID: commandID, receivedAt: receivedAt, origin: origin)
+        let started: Bool
+        if let timed = follow as? any OperatorFollowTimedStart { started = await timed.start(commandReceivedAt: receivedAt) }
+        else { started = await follow.start() }
+        guard generation == token else { return .rejected("Follow request cancelled.") }
+        guard started else {
+            owner = .idle
+            return .rejected("Could not start following.")
+        }
+        owner = .follow
         return .accepted
     }
 
@@ -151,7 +168,7 @@ public final class OperatorCommandRouter {
     public func stop() async -> OperatorSubmission {
         if let stopTask { return await stopTask.value }
         generation &+= 1
-        let previous = owner
+        followStartTask = nil
         owner = .stopping
         follow.inhibitMotion()
         missionTask?.cancel()
@@ -159,7 +176,7 @@ public final class OperatorCommandRouter {
         let task = Task { [mission, follow] () -> OperatorSubmission in
             if let pending {
                 guard await pending.value else { return .rejected("Rover stop could not be confirmed.") }
-            } else if previous == .mission || previous == .transitioning || previous == .blocked {
+            } else {
                 do { try await mission.cancelCurrentMissionAndWait() }
                 catch { return .rejected("Rover stop could not be confirmed.") }
             }

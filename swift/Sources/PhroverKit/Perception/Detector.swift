@@ -19,7 +19,7 @@ public final class Detector: @unchecked Sendable {
     private let jobLock = NSLock()
     private let worker: DispatchQueue
     private static func inferenceWorker() -> DispatchQueue {
-        DispatchQueue(label: "us.astral.follow-inference", qos: .userInitiated)
+        DispatchQueue(label: "us.coybot.follow-inference", qos: .userInitiated)
     }
     private var workerRunning = false
     private var pendingJob: InferenceJob?
@@ -131,6 +131,7 @@ public final class Detector: @unchecked Sendable {
             request = nil
             RuntimeFileLog.append("detector_unavailable", fields: [
                 "reason": "model_load_failed",
+                "error_code": String((error as NSError).code),
                 "resource": modelURL.lastPathComponent
             ])
         }

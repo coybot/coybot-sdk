@@ -101,6 +101,35 @@ final class NavigationFollowLiveGoalTests: XCTestCase {
         XCTAssertEqual(log.commands.count, commandsAtStop)
     }
 
+    func testLiveGoalIsRefusedDuringObstacleAndReachedGoalShutdown() async {
+        for targetArrival in [false, true] {
+            let sent = expectation(description: "first command")
+            let stopping = expectation(description: "terminal stop")
+            var releaseTick: CheckedContinuation<Void, Never>?
+            var releaseStop: CheckedContinuation<Void, Never>?
+            var clearance = 5.0
+            var position = Vec2.zero
+            var stops = 0
+            let nav = NavigationController(currentPose: { .init(position: position, yaw: 0) },
+                forwardClearance: { clearance }, plan: { _, goal in [goal] }, lastAckAt: { Date() },
+                sendCommand: { _ in }, stopRover: {
+                    stops += 1
+                    if stops == 2 { await withCheckedContinuation { releaseStop = $0; stopping.fulfill() } }
+                }, sleep: { _ in await withCheckedContinuation { releaseTick = $0; sent.fulfill() } })
+            let goal = targetArrival ? Vec2(1, 0) : Vec2(0, 5)
+            let drive = Task { await nav.performFollowMotion(.following(goal, 1.25), context: self.context()) }
+            await fulfillment(of: [sent], timeout: 2)
+            if targetArrival { position = goal }
+            else { clearance = 0.2 }
+            releaseTick?.resume()
+            await fulfillment(of: [stopping], timeout: 2)
+            XCTAssertFalse(nav.updateFollowGoal(Vec2(3, 3)))
+            releaseStop?.resume()
+            let result = await drive.value
+            XCTAssertEqual(result.result, targetArrival ? .arrived : .failed(.obstacle))
+        }
+    }
+
     func testLiveGoalIsRefusedWhenNothingIsDriving() {
         let nav = controller(Log())
         XCTAssertFalse(nav.updateFollowGoal(Vec2(1, 1)))

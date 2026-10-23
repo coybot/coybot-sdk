@@ -161,23 +161,27 @@ final class RotationCommandTests: XCTestCase {
 
     func testFollowAdmissionDrainsGenericPreflightStopBeforeStarting() async {
         TestURLProtocol.reset()
-        TestURLProtocol.delay = 0.20
+        let stopEntered = expectation(description: "generic preflight stop")
+        TestURLProtocol.holdNextResponse { stopEntered.fulfill() }
         let navigation = makeNavigation(ar: ARSessionManager())
         let rotation = Task { await navigation.rotateAndWait(by: .pi / 6) }
-        await waitForRequestCount(1)
+        await fulfillment(of: [stopEntered], timeout: 2)
         XCTAssertNil(TestURLProtocol.requestRecords.first?.statusCode)
-
-        TestURLProtocol.delay = 0
-        let follow = Task { await navigation.navigateForFollow(to: Vec2(1, 0), stoppingAtForwardClearance: 1.25) }
-        for _ in 0..<50 { await Task.yield() }
-        XCTAssertEqual(TestURLProtocol.requestCount, 1,
-            "Follow admission must wait for the generic controller's suspended preflight stop")
+        let followEntered = expectation(description: "follow submitted")
+        let follow = Task {
+            followEntered.fulfill()
+            return await navigation.navigateForFollow(to: Vec2(1, 0), stoppingAtForwardClearance: 1.25)
+        }
+        await fulfillment(of: [followEntered], timeout: 2)
+        TestURLProtocol.releaseHeldResponse()
 
         let rotationResult = await rotation.value
         let followResult = await follow.value
         XCTAssertEqual(rotationResult, .cancelled)
         XCTAssertEqual(followResult, .failed(.noPose))
         XCTAssertTrue(TestURLProtocol.requestURLs.allSatisfy(Self.isStoppedCommand))
+        XCTAssertTrue(TestURLProtocol.requestRecords.allSatisfy(\.predecessorCompletedAtStart),
+            "Every successor stop must start after its predecessor actually acknowledged")
         XCTAssertGreaterThanOrEqual(TestURLProtocol.requestCount, 2,
             "Follow still requires its own confirmed admission stop")
         XCTAssertEqual(navigation.safetyState, .failed(.noPose))

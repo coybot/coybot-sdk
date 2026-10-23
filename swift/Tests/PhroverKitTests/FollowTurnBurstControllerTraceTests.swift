@@ -80,6 +80,14 @@ final class FollowTurnBurstControllerTraceTests: XCTestCase {
         XCTAssertNil(reduction.rejection)
         XCTAssertEqual(reduction.calibration.completedResponses, 1)
         XCTAssertEqual(reduction.signedResponse ?? -1, 0.03, accuracy: 1e-12)
+        let trace = FollowTurnBurstDiagnosticTrace()
+        trace.reduction(response, reduction)
+        XCTAssertNotEqual(trace.fields["response_sampled_heading_span_rad"], .null)
+        let rejected = FollowTurnBurstPlanner.recording(response, in: reduction.calibration, profile: .init(purpose: .alignment))
+        XCTAssertNotNil(rejected.rejection)
+        trace.reduction(response, rejected)
+        XCTAssertEqual(trace.fields["response_sampled_heading_span_rad"], .null,
+            "A rejected response must not report the preceding burst's retained span")
     }
     func testHealthyIngressCannotEraseUnhealthyControlCollection() throws {
         let start = sample(2, 10.2)

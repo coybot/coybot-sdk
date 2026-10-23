@@ -4,6 +4,184 @@ import RoverNav
 
 @MainActor
 final class NavigationFollowReadySignalTests: XCTestCase {
+    func testMissingReadyMapCannotSendOrUseIndependentPlan() async throws {
+        var commands = 0
+        var planCalls = 0
+        let controller = FollowNavigationController(currentPose: { .init(position: .zero, yaw: 0) },
+            forwardClearance: { 2 }, plan: { _, goal in planCalls += 1; return [goal] },
+            readySignalCostmap: { _ in nil }, lastAckAt: { Date() },
+            sendCommand: { _ in commands += 1 }, stopRover: {}, sleep: { _ in })
+        let result = await NavigationFollowMeMotion(navigation: controller).perform(.ready, context:
+            .init(sessionGeneration: 1, requestToken: 1, purpose: .followReady, phase: "aligning"))
+        XCTAssertEqual(result.result, .failed(.noPath))
+        XCTAssertEqual(result.failure?.context.failureCause, .readyMapUnavailable)
+        XCTAssertEqual(commands, 0)
+        XCTAssertEqual(planCalls, 0)
+    }
+
+    func testPreflightJitterAddsClearanceRatherThanConsumingTheExistingMargin() async throws {
+        var map = Costmap(width: 120, height: 120, resolution: 0.10, origin: Vec2(-6, -6))
+        map.markObstacle(at: Vec2(0.15, 0.15))
+        let capturedMap = map
+        let start = Vec2(0.05, 0.079)
+        XCTAssertTrue(map.isSegmentClear(from: start, to: Vec2(0.17, 0.079), margin: 0.02))
+        var position = start
+        var commands = 0
+        let controller = FollowNavigationController(currentPose: { .init(position: position, yaw: 0) },
+            forwardClearance: { 2 }, plan: { _, goal in [goal] }, readySignalCostmap: { _ in
+                await Task.yield()
+                position = Vec2(0.05, 0.081)
+                return capturedMap
+            }, lastAckAt: { Date() }, sendCommand: { _ in commands += 1 }, stopRover: {}, sleep: { _ in })
+        let result = await NavigationFollowMeMotion(navigation: controller).perform(.ready, context:
+            .init(sessionGeneration: 1, requestToken: 1, purpose: .followReady, phase: "aligning"))
+        XCTAssertEqual(result.result, .failed(.noPath))
+        XCTAssertEqual(result.failure?.turnDiagnosticFields["ready_path_rejection"], .string("corridor_blocked"))
+        XCTAssertEqual(commands, 0)
+    }
+
+    func testSameSessionCoordinateCorrectionCannotUseAnOldReadyMap() async throws {
+        var map = Costmap(width: 120, height: 120, resolution: 0.10, origin: Vec2(-6, -6))
+        map.markObstacle(at: Vec2(0, 0.20))
+        map.inflate(radius: 0.25)
+        let capturedMap = map
+        var position = Vec2.zero
+        var time = 100.0
+        var sequence: UInt64 = 1
+        var commands = 0
+        let controller = FollowNavigationController(currentPose: { .init(position: position, yaw: 0) },
+            forwardClearance: { 2 }, plan: { _, goal in [goal] }, readySignalCostmap: { _ in
+                await Task.yield()
+                // AR world correction shifts both the live pose and live mesh, but
+                // the returned value map still contains pre-correction geometry.
+                position = Vec2(1, 0); time = 100.2; sequence = 2
+                return capturedMap
+            }, lastAckAt: { Date(timeIntervalSince1970: time) },
+            sendCommand: { _ in commands += 1 }, stopRover: {}, sleep: { duration in
+                time += max(0.001, Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18)
+                sequence += 1; position = Vec2(1.10, 0)
+            }, now: { Date(timeIntervalSince1970: time) }, poseSample: {
+                .init(pose: .init(position: position, yaw: 0), frameID: .init(generation: 1, sequence: sequence),
+                    sourceTimestamp: time, trackingQuality: .normal)
+            }, sourceNow: { time })
+        let result = await NavigationFollowMeMotion(navigation: controller).perform(.ready, context:
+            .init(sessionGeneration: 1, requestToken: 1, purpose: .followReady, phase: "aligning"))
+        XCTAssertEqual(result.result, .failed(.stalled))
+        XCTAssertEqual(result.failure?.context.failureCause, .readyPreSendPoseShift)
+        XCTAssertEqual(commands, 0)
+    }
+
+    func testStopDuringReadyMapBuildCannotSendAfterPlanningResumes() async throws {
+        let entered = expectation(description: "map build suspended")
+        let gate = AsyncStream.makeStream(of: Void.self)
+        let map = Costmap(width: 120, height: 120, resolution: 0.10, origin: Vec2(-6, -6))
+        var commands = 0
+        let controller = FollowNavigationController(currentPose: { .init(position: .zero, yaw: 0) },
+            forwardClearance: { 2 }, plan: { _, goal in [goal] },
+            readySignalCostmap: { _ in
+                entered.fulfill()
+                for await _ in gate.stream { break }
+                return map
+            }, lastAckAt: { Date() }, sendCommand: { _ in commands += 1 }, stopRover: {}, sleep: { _ in })
+        let ready = Task { await controller.navigateForFollowReadySignal() }
+        await fulfillment(of: [entered], timeout: 2)
+        XCTAssertEqual(commands, 0)
+        try await controller.stopAndConfirm()
+        gate.continuation.yield(())
+        gate.continuation.finish()
+        let result = await ready.value
+        XCTAssertEqual(result, .cancelled)
+        XCTAssertEqual(commands, 0)
+    }
+
+    func testReadyMapBuildRevalidatesSessionTrackingFreshnessAndKeepsCapturedOrigin() async {
+        let map = Costmap(width: 120, height: 120, resolution: 0.10, origin: Vec2(-6, -6))
+        for fault in ["none", "session", "tracking", "stale", "map_stale"] {
+            var time = 100.0
+            var position = Vec2.zero
+            var planned = false
+            var commands = 0
+            var sequence: UInt64 = 1
+            let controller = FollowNavigationController(currentPose: { .init(position: position, yaw: 0) },
+                forwardClearance: { 2 }, plan: { _, goal in [goal] },
+                readySignalCostmap: { _ in
+                    await Task.yield()
+                    planned = true; time = fault == "map_stale" ? 100.501 : 100.2
+                    position = Vec2(0.005, 0)
+                    sequence = 2
+                    return map
+                }, lastAckAt: { Date(timeIntervalSince1970: time) },
+                sendCommand: { _ in commands += 1 }, stopRover: {},
+                sleep: { duration in
+                    time += max(0.001, Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18)
+                    position = Vec2(0.105, 0)
+                    sequence += 1
+                }, now: { Date(timeIntervalSince1970: time) }, poseSample: {
+                    .init(pose: .init(position: position, yaw: 0),
+                        frameID: .init(generation: planned && fault == "session" ? 2 : 1, sequence: sequence),
+                        sourceTimestamp: planned && fault == "stale" ? time - 0.6 : time,
+                        trackingQuality: planned && fault == "tracking" ? .limited : .normal)
+                }, sourceNow: { time })
+            let result = await controller.navigateForFollowReadySignal()
+            let expected: NavigationResult = fault == "none" ? .arrived :
+                (fault == "map_stale" ? .failed(.stalled) : .failed(.trackingLost))
+            XCTAssertEqual(result, expected, fault)
+            XCTAssertEqual(commands, fault == "none" ? 1 : 0, fault)
+        }
+    }
+
+    func testReadyPathRejectionDistinguishesBlockedStartGoalAndSweptClearance() async throws {
+        for rejection in ["start_blocked", "goal_blocked", "corridor_blocked"] {
+            var map = Costmap(width: 120, height: 120, resolution: 0.10, origin: Vec2(-6, -6))
+            let start = Vec2(0.05, 0.05)
+            if rejection == "start_blocked" { map.markObstacle(at: start) }
+            if rejection == "goal_blocked" { map.markObstacle(at: Vec2(0.15, 0.05)) }
+            if rejection == "corridor_blocked" {
+                let cell = map.worldToCell(start)
+                map.setCost(cell.cx, cell.cy, 10)
+            }
+            let capturedMap = map
+            var commands = 0
+            let controller = FollowNavigationController(currentPose: { .init(position: start, yaw: 0) },
+                forwardClearance: { 2 }, plan: { _, goal in [goal] }, readySignalCostmap: { _ in capturedMap },
+                lastAckAt: { Date() }, sendCommand: { _ in commands += 1 }, stopRover: {}, sleep: { _ in })
+            let result = await NavigationFollowMeMotion(navigation: controller).perform(.ready, context:
+                .init(sessionGeneration: 1, requestToken: 1, purpose: .followReady, phase: "aligning"))
+            let failure = try XCTUnwrap(result.failure)
+            XCTAssertEqual(result.result, .failed(.noPath))
+            XCTAssertEqual(failure.context.failureCause, .readyPathBlocked)
+            XCTAssertEqual(failure.turnDiagnosticFields["ready_path_rejection"], .string(rejection))
+            XCTAssertEqual(FollowMotionFailureResolution(failure).diagnosticReason, "ready_path_blocked")
+            XCTAssertTrue(FollowMotionFailureResolution(failure).message.contains("mapped obstacles"))
+            XCTAssertEqual(commands, 0)
+        }
+    }
+
+    func testReadySignalUsesOneAuthoritativeCostmapInsteadOfAnIndependentPlan() async {
+        let map = Costmap(width: 120, height: 120, resolution: 0.10, origin: Vec2(-6, -6))
+        var position = Vec2.zero
+        var time = 100.0
+        var planCalls = 0
+        var mapCalls = 0
+        var commands = 0
+        let controller = FollowNavigationController(
+            currentPose: { .init(position: position, yaw: 0) }, forwardClearance: { 2 },
+            plan: { _, _ in planCalls += 1; return nil },
+            readySignalCostmap: { _ in mapCalls += 1; return map },
+            lastAckAt: { Date(timeIntervalSince1970: time) },
+            sendCommand: { _ in commands += 1 }, stopRover: {},
+            sleep: { duration in
+                time += max(0.001, Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18)
+                position = Vec2(0.10, 0)
+            }, now: { Date(timeIntervalSince1970: time) }, sourceNow: { time })
+
+        let result = await controller.navigateForFollowReadySignal()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertEqual(planCalls, 0, "Ready planning and swept clearance must share the same map")
+        XCTAssertEqual(mapCalls, 1)
+        XCTAssertEqual(commands, 1)
+    }
+
     func testNearEightCentimetersStopsPulsingAndConfirmsFreshArrivalAfterMovementCutoff() async throws {
         try await exerciseFinalReadyConfirmation(fault: nil)
     }
@@ -480,14 +658,15 @@ final class NavigationFollowReadySignalTests: XCTestCase {
             if scenario == 0 { map.markObstacle(at: start) }
             if scenario == 1 { map.markObstacle(at: Vec2(0.05, 0.25)); map.inflate(radius: 0.25) }
             if scenario == 2 { map.markObstacle(at: Vec2(0.15, 0.05)) }
+            let capturedMap = map
             // Coybot's planner may reject an occupied start outright. Either
             // way, the ready signal must reject the exact unsafe segment.
             var commands = 0
             let ack = Date()
             let controller = FollowNavigationController(
                 currentPose: { Pose2D(position: start, yaw: yaw) }, forwardClearance: { 2 },
-                plan: { AStarPlanner().plan(from: $0, to: $1, in: map) },
-                readySignalCostmap: { _ in map }, lastAckAt: { ack },
+                plan: { AStarPlanner().plan(from: $0, to: $1, in: capturedMap) },
+                readySignalCostmap: { _ in capturedMap }, lastAckAt: { ack },
                 sendCommand: { _ in commands += 1 }, stopRover: {}, sleep: { _ in })
             let result = await controller.navigateForFollowReadySignal()
             XCTAssertEqual(result, .failed(.noPath), "scenario=\(scenario)")

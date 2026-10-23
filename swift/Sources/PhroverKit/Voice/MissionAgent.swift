@@ -64,7 +64,7 @@ public protocol RoverMotion: AnyObject {
 }
 
 extension RoverMotion {
-    public func stopAndConfirm() async throws { cancel() }
+    public func stopAndConfirm() async throws { await stopAndWait() }
     public func navigate(to goal: Vec2, stoppingAtForwardClearance clearance: Double) {
         navigate(to: goal)
     }
@@ -160,6 +160,7 @@ public final class ARPerceptionSource: RoverPerception {
     private let ar: ARSessionManager
     private let detector: Detector?
     private let colorAnalyzer = LocalObjectColorAnalyzer()
+    private let detectionNow: () -> TimeInterval
     private var detectionFrame: ARFrameSnapshot?
     private var detections: [Detector.Detection] = []
 
@@ -171,8 +172,8 @@ public final class ARPerceptionSource: RoverPerception {
         }
         guard let evaluation = await detector.evaluateForMissionAsync(snapshot),
               !Task.isCancelled, evaluation.snapshot.id.generation == ar.sessionGeneration else {
-            detectionFrame = nil
-            detections = []
+            // A skipped/superseded inference says nothing about the previous receipt.
+            // Its original capture time continues to bound freshness.
             return
         }
         detectionFrame = evaluation.snapshot
@@ -180,15 +181,25 @@ public final class ARPerceptionSource: RoverPerception {
     }
 
     private var freshDetectionFrame: ARFrameSnapshot? {
-        guard let frame = detectionFrame, frame.id.generation == ar.sessionGeneration,
-              ar.trackingQuality == .normal, frame.trackingQuality == .normal else { return nil }
-        let age = ProcessInfo.processInfo.systemUptime - frame.timestamp
+        guard let frame = detectionFrame, frame.id.generation == ar.sessionGeneration else { return nil }
+        let age = detectionNow() - frame.timestamp
         return age.isFinite && age >= 0 && age <= 0.5 ? frame : nil
     }
 
-    public init(ar: ARSessionManager, detector: Detector?) {
+    private var trustedDetectionFrame: ARFrameSnapshot? {
+        guard let frame = freshDetectionFrame, ar.trackingQuality == .normal,
+              frame.trackingQuality == .normal else { return nil }
+        return frame
+    }
+
+    public convenience init(ar: ARSessionManager, detector: Detector?) {
+        self.init(ar: ar, detector: detector, detectionNow: { ProcessInfo.processInfo.systemUptime })
+    }
+
+    init(ar: ARSessionManager, detector: Detector?, detectionNow: @escaping () -> TimeInterval) {
         self.ar = ar
         self.detector = detector
+        self.detectionNow = detectionNow
     }
 
     public var pose: Pose2D? { ar.pose }
@@ -215,16 +226,17 @@ public final class ARPerceptionSource: RoverPerception {
     }
 
     public func unproject(normalizedPoint: CGPoint) -> Vec2? {
-        ar.unproject(normalizedPoint: normalizedPoint)
+        guard ar.trackingQuality == .normal else { return nil }
+        return ar.unproject(normalizedPoint: normalizedPoint)
     }
 
     public func unprojectDetectedObject(normalizedPoint: CGPoint) -> Vec2? {
-        guard let frame = freshDetectionFrame else { return nil }
+        guard let frame = trustedDetectionFrame else { return nil }
         return ARSessionManager.unproject(normalizedPoint: normalizedPoint, in: frame)
     }
 
     public func groundPoint(of object: PerceivedObject) -> Vec2? {
-        guard let frame = freshDetectionFrame else { return nil }
+        guard let frame = trustedDetectionFrame else { return nil }
         guard let box = object.normalizedBoundingBox else {
             return ARSessionManager.unproject(normalizedPoint: object.normalizedPoint, in: frame)
         }
@@ -232,7 +244,7 @@ public final class ARPerceptionSource: RoverPerception {
     }
 
     public func unproject(object: PerceivedObject) -> Vec2? {
-        guard let frame = freshDetectionFrame else { return nil }
+        guard let frame = trustedDetectionFrame else { return nil }
         guard let box = object.normalizedBoundingBox else {
             return ARSessionManager.unproject(normalizedPoint: object.normalizedPoint, in: frame)
         }
@@ -1710,8 +1722,13 @@ public final class MissionAgent {
                 outcome = "claimRoom(\(roomId)) → broadcast"
 
             case .stop:
+                let stopGeneration = missionGeneration + 1
                 do {
                     try await cancelCurrentMissionAndWait()
+                    if missionGeneration == stopGeneration, !Task.isCancelled {
+                        publishMissionTerminal({ .succeeded(id: $0, command: $1,
+                            message: "Command completed.") }, missionID: missionID)
+                    }
                 } catch {
                     publishMissionTerminal({ .failed(id: $0, command: $1,
                         message: "Rover stop could not be confirmed.") }, missionID: missionID)
@@ -4269,6 +4286,8 @@ public final class MissionAgent {
             voice.speak("I can't follow anything right now.")
             return "follow → unavailable"
         }
+        await perception.refreshDetections()
+        guard isCurrentMission(missionID), !Task.isCancelled else { return nil }
         guard let resolved = followSpec(for: target) else {
             voice.speak("I couldn't tell who to follow.")
             return "follow → couldn't resolve target"

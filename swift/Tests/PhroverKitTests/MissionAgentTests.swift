@@ -129,20 +129,90 @@ final class MissionAgentTests: XCTestCase {
         XCTAssertTrue(brain.seenContexts.isEmpty)
     }
 
+    private final class LegacyWaitingMotion: RoverMotion {
+        var state: NavigationController.State = .driving
+        var waits = 0
+        func navigate(to goal: Vec2) {}
+        func rotate(by angle: Double) async {}
+        func cancel() { state = .idle }
+        func stopAndWait() async { waits += 1; cancel() }
+    }
+
+    func testLegacyConfirmedStopInvokesAwaitableStop() async throws {
+        let motion = LegacyWaitingMotion()
+        try await motion.stopAndConfirm()
+        XCTAssertEqual(motion.waits, 1)
+    }
+
+    func testExternalCancellationDuringBrainStopRemainsCancelled() async {
+        let motion = FakeMotion()
+        motion.suspendConfirmedStop = true
+        let brain = FakeBrain(script: [.stop])
+        var statuses: [MissionCommandStatus] = []
+        let agent = MissionAgent(motion: motion, perception: FakePerception(), voice: FakeVoice(),
+            commandStatusDidChange: { statuses.append($0) }) { brain }
+        let mission = Task { await agent.handle("never mind") }
+        await motion.waitUntilStopRequested()
+        mission.cancel()
+        motion.finishConfirmedStop()
+        await mission.value
+        guard case .cancelled = statuses.last else { return XCTFail("External cancellation must remain cancelled") }
+    }
+
     func testBrainStopDecisionAwaitsMotorStopAcknowledgement() async {
         let motion = FakeMotion()
         motion.suspendConfirmedStop = true
         let brain = FakeBrain(script: [.stop])
-        let agent = MissionAgent(motion: motion, perception: FakePerception(), voice: FakeVoice()) { brain }
+        var statuses: [MissionCommandStatus] = []
+        let agent = MissionAgent(motion: motion, perception: FakePerception(), voice: FakeVoice(),
+            commandStatusDidChange: { statuses.append($0) }) { brain }
         var completed = false
         let mission = Task { await agent.handle("never mind"); completed = true }
         await motion.waitUntilStopRequested()
-        for _ in 0..<20 { await Task.yield() }
         XCTAssertFalse(completed)
         XCTAssertEqual(agent.phase, .acting)
         motion.finishConfirmedStop()
         await mission.value
         XCTAssertEqual(agent.phase, .idle)
+        guard case .succeeded = statuses.last else { return XCTFail("Confirmed brain stop must complete successfully") }
+    }
+
+    func testCancellationDuringPostBrainRefreshCannotStartFollow() async throws {
+        let perception = FakePerception()
+        let refreshEntered = expectation(description: "post brain refresh")
+        var refreshes = 0
+        var release: CheckedContinuation<Void, Never>?
+        perception.onRefresh = {
+            refreshes += 1
+            if refreshes == 2 { await withCheckedContinuation { release = $0; refreshEntered.fulfill() } }
+            perception.objects = [.init(label: "person", confidence: 0.95, normalizedPoint: .init(x: 0.5, y: 0.5))]
+        }
+        let brain = FakeBrain(script: [.follow(.imagePoint(.init(x: 0.5, y: 0.5))), .done])
+        let follower = FakeFollower()
+        let agent = MissionAgent(motion: FakeMotion(), perception: perception, voice: FakeVoice(), follower: follower) { brain }
+        let mission = Task { await agent.handle("track the selected subject") }
+        await fulfillment(of: [refreshEntered], timeout: 2)
+        try await agent.cancelCurrentMissionAndWait()
+        release?.resume()
+        await mission.value
+        XCTAssertTrue(follower.followCalls.isEmpty)
+    }
+
+    func testBrainFollowRefreshesDetectionsAfterDecisionLatency() async {
+        for target: NavigationTarget in [.imagePoint(CGPoint(x: 0.5, y: 0.5)), .worldPoint(Vec2(1, 2)), .visualQuery("person")] {
+            let perception = FakePerception()
+            let person = PerceivedObject(label: "person", confidence: 0.95,
+                normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+            perception.onRefresh = { perception.objects = [person] }
+            let brain = FakeBrain(script: [.follow(target), .done])
+            brain.onNext = { perception.objects = [] } // The brain outlives the cached receipt.
+            let follower = FakeFollower()
+            let agent = MissionAgent(motion: FakeMotion(), perception: perception, voice: FakeVoice(),
+                follower: follower) { brain }
+            await agent.handle("track the selected subject")
+            XCTAssertEqual(follower.followCalls.map(\.query), ["person"])
+            XCTAssertEqual(follower.seeds.compactMap { $0 }, [Vec2(1, 2)])
+        }
     }
 
     func testPlainFollowRequestsAreRecognisedWithoutABrain() {
@@ -4147,6 +4217,7 @@ private final class FakeFollower: RoverFollowing {
     private(set) var followingSpec: TargetSpec?
     var followState: FollowController.State = .idle
     private(set) var followCalls: [TargetSpec] = []
+    private(set) var seeds: [Vec2?] = []
     private(set) var stopCallCount = 0
     /// Shared with the fake motion so a test can assert what happened first.
     var onEvent: ((String) -> Void)?
@@ -4156,6 +4227,7 @@ private final class FakeFollower: RoverFollowing {
 
     func follow(_ spec: TargetSpec, seed: Vec2?) {
         followCalls.append(spec)
+        seeds.append(seed)
         followingSpec = spec
         followState = .following
         onEvent?("follow")
@@ -4179,6 +4251,7 @@ private enum FakeBrainError: Error, Equatable {
 
 @MainActor
 private final class FakeBrain: RoverBrain {
+    var onNext: (() -> Void)?
     private var script: [RoverDecision]
     private(set) var seenContexts: [MissionContext] = []
 
@@ -4186,6 +4259,7 @@ private final class FakeBrain: RoverBrain {
 
     func nextAction(_ context: MissionContext) async throws -> BrainOutput {
         seenContexts.append(context)
+        onNext?()
         return BrainOutput(decision: script.isEmpty ? .done : script.removeFirst())
     }
 }
@@ -4500,6 +4574,8 @@ private final class FakePerception: RoverPerception {
     private(set) var unprojectFrameSequences: [UInt64?] = []
     private(set) var frontierFrameSequences: [UInt64?] = []
     var onDetectObjects: (() -> Void)?
+    var onRefresh: (() async -> Void)?
+    func refreshDetections() async { await onRefresh?() }
 
     var latestObservation: PoseObservation? {
         guard !observations.isEmpty else { return nil }

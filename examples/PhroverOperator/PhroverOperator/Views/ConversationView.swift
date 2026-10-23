@@ -43,6 +43,8 @@ struct ConversationView: View {
     @State private var agent: MissionAgent?
     @State private var lastCommand = ConversationView.makeInitialLastCommandState()
     @State private var authorized = false
+    @State private var isVisible = false
+    @State private var runtimeLifetime = ConversationRuntimeLifetime()
     @State private var navigationDebug = NavigationDebugSummary()
     @State private var brainAvailability = ConversationView.makeInitialBrainAvailability()
     @State private var perception: ARPerceptionSource?
@@ -156,9 +158,30 @@ struct ConversationView: View {
         }
         .padding(.horizontal)
         .padding(.top, 20)
+        .onAppear { isVisible = true }
         .task {
             guard !scripted else { return }
+            if runtimeLifetime.runtimeReady {
+                detector?.setInferenceEnabled(scenePhase == .active)
+                if !authorized {
+                    let granted = await speechIn.requestAuthorization()
+                    if !Task.isCancelled { authorized = granted }
+                }
+                return
+            }
+            guard let initialization = runtimeLifetime.beginRuntimeInitialization() else { return }
+            // A recreated auth view can retain the model's old router. Confirm its
+            // stop before replacing the closures with a new view-owned runtime.
+            guard await model.leaveTalk(), !Task.isCancelled else {
+                runtimeLifetime.abandonRuntimeInitialization(initialization)
+                return
+            }
             let detector = await Detector()
+            guard !Task.isCancelled, runtimeLifetime.completeRuntimeInitialization(initialization) else {
+                runtimeLifetime.abandonRuntimeInitialization(initialization)
+                detector.setInferenceEnabled(false)
+                return
+            }
             detector.setInferenceEnabled(scenePhase == .active)
             let perception = ARPerceptionSource(ar: ar, detector: detector)
             self.detector = detector
@@ -213,15 +236,22 @@ struct ConversationView: View {
                             submitFinalized: { text, receivedAt in
                                 await router.submit(text, finalizedTextReceivedAt: receivedAt)
                             }, monotonic: { followClock.now })
-            authorized = await speechIn.requestAuthorization()
+            let granted = await speechIn.requestAuthorization()
+            if !Task.isCancelled { authorized = granted }
         }
         .onDisappear {
+            isVisible = false
+            runtimeLifetime.invalidateRuntimeInitialization()
+            runtimeLifetime.invalidateSpeechCapture()
+            speechIn.stop()
             model.prepareToLeave()
             Task { _ = await model.leaveTalk() }
         }
         .onChange(of: scenePhase) { _, phase in
             detector?.setInferenceEnabled(phase == .active)
             if phase != .active {
+                runtimeLifetime.invalidateSpeechCapture()
+                speechIn.stop()
                 model.prepareToLeave()
                 Task { _ = await model.leaveTalk() }
             }
@@ -309,13 +339,17 @@ struct ConversationView: View {
     }
 
     private func startListening() {
-        guard authorized, agent != nil, speechIn.state != .listening else { return }
+        guard isVisible, scenePhase == .active, runtimeLifetime.runtimeReady,
+              authorized, agent != nil, speechIn.state != .listening else { return }
+        let captureEpoch = runtimeLifetime.speechEpoch
         do {
             try speechIn.start(onEvent: { event in
                 lastCommand.reduce(event)
             }) { captureID, utterance in
                 lastCommand.finalizeCapture(captureID)
                 Task { @MainActor in
+                    guard isVisible, scenePhase == .active, runtimeLifetime.runtimeReady,
+                          runtimeLifetime.acceptsSpeechCapture(from: captureEpoch) else { return }
                     await model.submitFinalSpeech(utterance)
                 }
             }

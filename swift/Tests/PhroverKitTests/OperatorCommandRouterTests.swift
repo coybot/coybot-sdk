@@ -3,6 +3,44 @@ import XCTest
 
 @MainActor
 final class OperatorCommandRouterTests: XCTestCase {
+    func testBusyMissionRejectionDescribesTheRunningMission() async {
+        let mission = RecordingOperatorMission()
+        let router = OperatorCommandRouter(mission: mission, follow: RecordingOperatorFollow())
+        _ = await router.submit("first request")
+        let result = await router.submit("second request")
+        XCTAssertEqual(result, .rejected("I’m still working on the previous command. Stop it before sending another request."))
+    }
+
+    func testIdleRouterStopStillConfirmsSharedMissionMotion() async {
+        let mission = RecordingOperatorMission()
+        mission.stopFails = true
+        let follow = RecordingOperatorFollow()
+        let router = OperatorCommandRouter(mission: mission, follow: follow)
+        let result = await router.submit("stop")
+        XCTAssertEqual(mission.events, ["stop"])
+        XCTAssertEqual(result, .rejected("Rover stop could not be confirmed."))
+        let next = await router.submit("go to kitchen")
+        XCTAssertNotEqual(next, .accepted)
+    }
+
+    func testOverlappingFollowRequestsShareFailedAdmission() async {
+        let mission = RecordingOperatorMission()
+        mission.suspendStop = true
+        mission.stopFails = true
+        let router = OperatorCommandRouter(mission: mission, follow: RecordingOperatorFollow())
+        let first = Task { await router.submit("follow me") }
+        await mission.waitForStop()
+        let secondEntered = expectation(description: "second follow submitted")
+        let second = Task { secondEntered.fulfill(); return await router.submit("follow me") }
+        await fulfillment(of: [secondEntered], timeout: 1)
+        mission.releaseStop()
+        let firstResult = await first.value
+        let secondResult = await second.value
+        XCTAssertEqual(firstResult, .rejected("Rover stop could not be confirmed."))
+        XCTAssertEqual(secondResult, firstResult)
+        XCTAssertEqual(mission.events, ["stop"])
+    }
+
     func testNormalizedLocalStopFencesFollowAndBlocksNewMissionUntilConfirmed() async {
         let mission = RecordingOperatorMission()
         let follow = RecordingOperatorFollow()
@@ -15,14 +53,14 @@ final class OperatorCommandRouterTests: XCTestCase {
         XCTAssertFalse(follow.state.isActive, "Fence locally before awaiting motor acknowledgement")
         let pending = await router.submit("go to the kitchen")
         XCTAssertNotEqual(pending, .accepted)
-        XCTAssertEqual(mission.events, ["stop"], "Stop must never call the brain/mission.handle")
+        XCTAssertEqual(mission.events, ["stop", "stop"], "Both follow admission and operator stop confirm shared motion without calling the brain")
         follow.releaseStop()
         let confirmed = await stopping.value
         XCTAssertEqual(confirmed, .accepted)
         let next = await router.submit("go to the kitchen")
         XCTAssertEqual(next, .accepted)
         for _ in 0..<20 { await Task.yield() }
-        XCTAssertEqual(mission.events, ["stop", "handle:go to the kitchen"])
+        XCTAssertEqual(mission.events, ["stop", "stop", "handle:go to the kitchen"])
     }
 
     func testFollowPhraseCancelsMissionBeforeStartingFollow() async {
@@ -167,6 +205,7 @@ final class OperatorCommandRouterTests: XCTestCase {
 private final class RecordingOperatorMission: OperatorMission {
     var events: [String] = []
     var suspendStop = false
+    var stopFails = false
     private var stopWaiter: CheckedContinuation<Void, Never>?
     private var requestedWaiter: CheckedContinuation<Void, Never>?
     private var stopRequested = false
@@ -178,6 +217,7 @@ private final class RecordingOperatorMission: OperatorMission {
         requestedWaiter?.resume()
         requestedWaiter = nil
         if suspendStop { await withCheckedContinuation { stopWaiter = $0 } }
+        if stopFails { throw NSError(domain: "stop", code: 1) }
     }
     func waitForStop() async {
         if stopRequested { return }

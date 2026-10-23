@@ -7,6 +7,47 @@ import ImageIO
 
 @MainActor
 final class ARFollowMePerceptionSourceTests: XCTestCase {
+    func testMissionReceiptSurvivesSkippedInferenceAndLimitedTrackingWithoutSpatialGrounding() async throws {
+        var image: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 20, 20, kCVPixelFormatType_32BGRA, nil, &image)
+        let buffer = try XCTUnwrap(image)
+        let ar = ARSessionManager()
+        let detector = Detector(supportedLabels: ["chair"], detectionHandler: { _ in
+            [.init(label: "chair", confidence: 0.9, boundingBox: CGRect(x: 0.2, y: 0.2, width: 0.4, height: 0.4))]
+        })
+        var uptime = 10.0
+        let source = ARPerceptionSource(ar: ar, detector: detector, detectionNow: { uptime })
+        ar.ingestForTesting(image: buffer, timestamp: uptime,
+            cameraTransform: matrix_identity_float4x4, intrinsics: matrix_identity_float3x3,
+            imageResolution: CGSize(width: 20, height: 20), depthMap: nil, trackingQuality: .normal)
+        await source.refreshDetections()
+        XCTAssertEqual(source.detectObjects().map(\.label), ["chair"])
+        let consumer = detector.beginFollowConsumer()
+        uptime = 10.4
+        await source.refreshDetections() // Preview-only request deliberately skipped.
+        XCTAssertEqual(source.detectObjects().map(\.label), ["chair"])
+        ar.ingestForTesting(image: buffer, timestamp: uptime,
+            cameraTransform: matrix_identity_float4x4, intrinsics: matrix_identity_float3x3,
+            imageResolution: CGSize(width: 20, height: 20), depthMap: nil, trackingQuality: .limited)
+        XCTAssertEqual(source.detectObjects().map(\.label), ["chair"])
+        XCTAssertNil(source.unprojectDetectedObject(normalizedPoint: CGPoint(x: 0.5, y: 0.5)))
+        XCTAssertNil(source.unproject(normalizedPoint: CGPoint(x: 0.5, y: 0.5)))
+        detector.endFollowConsumer(consumer)
+        await source.refreshDetections()
+        XCTAssertEqual(source.detectObjects().map(\.label), ["chair"])
+        if let object = source.detectObjects().first {
+            XCTAssertNil(source.groundPoint(of: object))
+            XCTAssertNil(source.unproject(object: object))
+        }
+        let secondConsumer = detector.beginFollowConsumer()
+        uptime = 10.8
+        await source.refreshDetections()
+        XCTAssertEqual(source.detectObjects().map(\.label), ["chair"])
+        uptime = 11.0
+        XCTAssertTrue(source.detectObjects().isEmpty, "Skipped refresh must not renew the receipt timestamp")
+        detector.endFollowConsumer(secondConsumer)
+    }
+
     func testLiveFollowRequiresMatchingBodyDespitePerfectRawPersonScore() async throws {
         for scenario in ["none", "matched", "failed", "unavailable"] {
             try await checkLiveBodyVerification(scenario)

@@ -24,6 +24,9 @@ enum FollowMotionFailureCause: String, Sendable {
     case readyOverallTimeout = "ready_overall_timeout"
     case readyPreSendPoseShift = "ready_pre_send_pose_shift"
     case readyInvalidGeometry = "ready_invalid_geometry"
+    case readyPathBlocked = "ready_path_blocked"
+    case readyMapUnavailable = "ready_map_unavailable"
+    case readyMapStale = "ready_map_stale"
 
     var readyDescription: String? {
         switch self {
@@ -35,6 +38,7 @@ enum FollowMotionFailureCause: String, Sendable {
         case .readyOverallTimeout: return "the five-second movement limit expired"
         case .readyPreSendPoseShift: return "pose changed before the first motor command"
         case .readyInvalidGeometry: return "invalid measured pose geometry"
+        case .readyMapStale: return "obstacle-map preparation exceeded the freshness limit"
         default: return nil
         }
     }

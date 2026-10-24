@@ -161,6 +161,8 @@ public final class FollowController {
         var hasSentCommand = false
 
         while !Task.isCancelled {
+            await perception.refreshDetections()
+            guard !Task.isCancelled else { return }
             let now = Date()
             if now.timeIntervalSince(startedAt) > maxDuration {
                 await end("I've been following for a while — stopping there.", reason: "time_budget")
@@ -185,6 +187,7 @@ public final class FollowController {
                 continue
             case .lost:
                 if await search(from: pose) { continue }
+                guard !Task.isCancelled else { return }
                 await end("I lost you — say follow me again.", reason: "target_lost")
                 return
             case .idle:
@@ -282,6 +285,8 @@ public final class FollowController {
             try? await Task.sleep(for: .seconds(RoverConfig.scanTurnPulseDuration))
             try? await drive.stop()
             try? await Task.sleep(for: .seconds(RoverConfig.scanTurnSettleDuration))
+            await perception.refreshDetections()
+            guard !Task.isCancelled else { return false }
             tracker.update(observations: observations())
             if tracker.state == .tracking {
                 track = tracker.track

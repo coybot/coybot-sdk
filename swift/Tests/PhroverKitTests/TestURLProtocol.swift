@@ -4,16 +4,30 @@ final class TestURLProtocol: URLProtocol, @unchecked Sendable {
     struct RecordedRequest: Sendable {
         let url: URL
         let statusCode: Int?
+        let predecessorCompletedAtStart: Bool
     }
 
     private struct MutableRequest {
         let url: URL
         var statusCode: Int?
+        let predecessorCompletedAtStart: Bool
     }
 
     private static let requestLock = NSLock()
     nonisolated(unsafe) private static var configuredDelay: TimeInterval = 0
     nonisolated(unsafe) private static var recordedRequests: [MutableRequest] = []
+
+    nonisolated(unsafe) private static var holdNext = false
+    nonisolated(unsafe) private static var heldResponse: (@Sendable () -> Void)?
+    nonisolated(unsafe) private static var requestStarted: (@Sendable () -> Void)?
+
+    static func holdNextResponse(onStart: @escaping @Sendable () -> Void) {
+        withRequestLock { holdNext = true; requestStarted = onStart }
+    }
+    static func releaseHeldResponse() {
+        let response = withRequestLock { let response = heldResponse; heldResponse = nil; return response }
+        response?()
+    }
 
     static var delay: TimeInterval {
         get { withRequestLock { configuredDelay } }
@@ -31,7 +45,7 @@ final class TestURLProtocol: URLProtocol, @unchecked Sendable {
     static var requestRecords: [RecordedRequest] {
         withRequestLock {
             recordedRequests.map {
-                RecordedRequest(url: $0.url, statusCode: $0.statusCode)
+                RecordedRequest(url: $0.url, statusCode: $0.statusCode, predecessorCompletedAtStart: $0.predecessorCompletedAtStart)
             }
         }
     }
@@ -40,6 +54,9 @@ final class TestURLProtocol: URLProtocol, @unchecked Sendable {
         withRequestLock {
             configuredDelay = 0
             recordedRequests = []
+            holdNext = false
+            heldResponse = nil
+            requestStarted = nil
         }
     }
 
@@ -49,7 +66,7 @@ final class TestURLProtocol: URLProtocol, @unchecked Sendable {
     override func startLoading() {
         let request = request
         let (requestIndex, delay) = Self.recordStart(url: request.url!)
-        DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
+        let response: @Sendable () -> Void = { [weak self] in
             guard let self,
                   let response = HTTPURLResponse(
                     url: request.url!,
@@ -62,6 +79,16 @@ final class TestURLProtocol: URLProtocol, @unchecked Sendable {
             self.client?.urlProtocol(self, didLoad: Data())
             self.client?.urlProtocolDidFinishLoading(self)
         }
+        let onStart: (@Sendable () -> Void)? = Self.withRequestLock {
+            guard Self.holdNext else { return nil }
+            Self.holdNext = false
+            Self.heldResponse = response
+            let callback = Self.requestStarted
+            Self.requestStarted = nil
+            return callback
+        }
+        if let onStart { onStart() }
+        else { DispatchQueue.global().asyncAfter(deadline: .now() + delay, execute: response) }
     }
 
     override func stopLoading() {}
@@ -69,7 +96,8 @@ final class TestURLProtocol: URLProtocol, @unchecked Sendable {
     private static func recordStart(url: URL) -> (index: Int, delay: TimeInterval) {
         withRequestLock {
             let index = recordedRequests.count
-            recordedRequests.append(MutableRequest(url: url, statusCode: nil))
+            recordedRequests.append(MutableRequest(url: url, statusCode: nil,
+                predecessorCompletedAtStart: recordedRequests.allSatisfy { $0.statusCode != nil }))
             return (index, configuredDelay)
         }
     }

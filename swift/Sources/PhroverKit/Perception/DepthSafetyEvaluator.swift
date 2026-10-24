@@ -5,8 +5,8 @@ import simd
 
 enum DepthSafetyEvaluator {
     private static let cellResolution = 0.04
-    private static let maximumRawDepthAge: TimeInterval = 0.25
-    private static let baseStoppingMargin = 0.25
+    static let maximumRawDepthAge: TimeInterval = 0.25
+    private static let minimumStoppingDistance = 0.30
     private static let assumedLatency: TimeInterval = 0.25
     private static let assumedDeceleration = 0.80
     private static let cautionLeadDistance = 0.35
@@ -220,9 +220,17 @@ enum DepthSafetyEvaluator {
 
     static func evaluate(_ snapshot: DepthSafetySnapshot,
                          command: WheelCommand,
-                         now: TimeInterval) -> DepthSafetyObservation {
+                         now: TimeInterval,
+                         operatorClearedRotation: Bool = false) -> DepthSafetyObservation {
         let motion = DepthSafetyMotionClass.classify(command)
         let age = max(0, now - snapshot.timestamp)
+        guard now.isFinite, snapshot.timestamp.isFinite, now >= snapshot.timestamp,
+              snapshot.cellResolution.isFinite, snapshot.cellResolution > 0 else {
+            return .unavailable(.malformedDepth, sampleAge: age, motionClass: motion)
+        }
+        guard snapshot.geometry.validation == .valid else {
+            return .unavailable(.invalidCollisionGeometry, sampleAge: age, motionClass: motion)
+        }
         if let reason = snapshot.failureReason {
             return .unavailable(reason, sampleAge: age, motionClass: motion)
         }
@@ -236,13 +244,25 @@ enum DepthSafetyEvaluator {
             return .unavailable(.blindSweptVolume, sampleAge: age, motionClass: motion)
         }
 
+        let confirmedRotation = operatorClearedRotation && motion == .rotating &&
+            command.left.isFinite && command.right.isFinite && command.left == -command.right
         let speed = max(abs(command.left), abs(command.right))
-        let stoppingDistance = baseStoppingMargin
-            + speed * (age + assumedLatency)
+        let latencyAndBrakingDistance = speed * (age + assumedLatency)
             + speed * speed / (2 * assumedDeceleration)
+        // Thirty centimeters is the total minimum, not an additive buffer.
+        // Faster motion still requires the full latency and braking distance.
+        let stoppingDistance = max(confirmedRotation ? FollowSearchClearancePolicy.retainedClearance : minimumStoppingDistance, latencyAndBrakingDistance)
         let cautionDistance = stoppingDistance + cautionLeadDistance
         var contactTravel: [DepthSafetyCell: Double] = [:]
         for occupiedCell in snapshot.cells {
+            if confirmedRotation {
+                let lateral = (Double(occupiedCell.lateralIndex) + 0.5) * snapshot.cellResolution
+                let forward = (Double(occupiedCell.forwardIndex) + 0.5) * snapshot.cellResolution
+                let gap = max(0, hypot(lateral, forward) - FollowSearchClearancePolicy.sweptRadius(
+                    geometry: snapshot.geometry, cellResolution: snapshot.cellResolution))
+                if gap <= cautionDistance { contactTravel[occupiedCell] = gap }
+                continue
+            }
             let point = center(of: occupiedCell)
             if let travel = firstContactTravel(
                 lateral: point.x,
@@ -264,8 +284,8 @@ enum DepthSafetyEvaluator {
         if let nearestCluster {
             let clearance = nearestContact(in: nearestCluster, contactTravel: contactTravel)
             let state: DepthSafetyState = clearance <= stoppingDistance ? .stop : .caution
-            if state == .stop {
-                return hazardObservation(
+            if state == .stop || confirmedRotation {
+                var observation = hazardObservation(
                     state: state,
                     clearance: clearance,
                     supportCount: nearestCluster.count,
@@ -273,6 +293,8 @@ enum DepthSafetyEvaluator {
                     stoppingDistance: stoppingDistance,
                     motion: motion
                 )
+                if confirmedRotation { observation.coverageProvenance = "operator_confirmed_rotation" }
+                return observation
             }
             guard sweptVolumeCoverage(
                 snapshot: snapshot,
@@ -290,6 +312,14 @@ enum DepthSafetyEvaluator {
                 stoppingDistance: stoppingDistance,
                 motion: motion
             )
+        }
+
+        // Raw depth validity and all observed collision clusters were checked
+        // above. The assertion supplements only unobserved pure-rotation sectors.
+        if confirmedRotation {
+            var observation = clearObservation(age: age, motion: motion, stoppingDistance: stoppingDistance)
+            observation.coverageProvenance = "operator_confirmed_rotation"
+            return observation
         }
 
         guard sweptVolumeCoverage(

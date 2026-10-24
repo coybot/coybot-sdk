@@ -276,7 +276,7 @@ final class HybridBrainTests: XCTestCase {
             result: .failure(RoverBrainError.onDeviceUnavailable(.modelNotReady))
         )
         let brain = HybridBrain(cloud: nil, onDevice: onDevice, isOnline: { true })
-        let logBefore = runtimeLog()
+        let logBefore = await runtimeLog()
 
         do {
             _ = try await brain.nextAction(MissionContext())
@@ -285,7 +285,7 @@ final class HybridBrainTests: XCTestCase {
             XCTAssertEqual(error as? RoverBrainError, .onDeviceUnavailable(.modelNotReady))
         }
 
-        let selectionLog = String(runtimeLog().dropFirst(logBefore.count))
+        let selectionLog = String((await runtimeLog()).dropFirst(logBefore.count))
         XCTAssertEqual(onDevice.callCount, 1)
         XCTAssertEqual(order.names, ["on_device"])
         XCTAssertTrue(selectionLog.contains("mission_brain_selected brain=on_device"))
@@ -341,7 +341,8 @@ final class HybridBrainTests: XCTestCase {
         XCTAssertEqual(motion.navigateCalls, [Vec2(1, 0)])
     }
 
-    private func runtimeLog() -> String {
+    private func runtimeLog() async -> String {
+        await RuntimeFileLog.flush()
         guard let url = RuntimeFileLog.logFileURL else { return "" }
         return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
     }

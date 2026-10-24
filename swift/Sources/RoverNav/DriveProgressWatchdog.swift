@@ -5,6 +5,21 @@ public struct DriveProgressWatchdog: Sendable {
     public let timeout: TimeInterval
     public let minimumProgress: Double
 
+    public struct DiagnosticSnapshot: Sendable {
+        public let bestDistance: Double?
+        public let lastProgressAt: Date?
+        public let progress: Double?
+        public let elapsed: TimeInterval?
+        public let interval: TimeInterval
+        public let requiredProgress: Double
+    }
+
+    public func diagnosticSnapshot(distanceToGoal: Double, now: Date) -> DiagnosticSnapshot {
+        .init(bestDistance: bestDistance, lastProgressAt: lastProgressAt,
+            progress: bestDistance.map { $0 - distanceToGoal }, elapsed: lastProgressAt.map { now.timeIntervalSince($0) },
+            interval: timeout, requiredProgress: minimumProgress)
+    }
+
     private var bestDistance: Double?
     private var lastProgressAt: Date?
 

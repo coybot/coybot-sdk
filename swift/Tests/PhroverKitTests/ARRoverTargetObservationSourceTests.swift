@@ -6,6 +6,44 @@ import XCTest
 
 @MainActor
 final class ARRoverTargetObservationSourceTests: XCTestCase {
+    func testProductionInferenceDoesNotBlockMainActorStopWork() async throws {
+        let entered = expectation(description: "native inference entered")
+        let gate = NativeInferenceGate()
+        let detector = Detector(supportedLabels: ["chair"], detectionHandler: { _ in
+            entered.fulfill()
+            gate.wait()
+            return []
+        })
+        let ar = ARSessionManager()
+        let source = ARRoverTargetObservationSource(sessionManager: ar, clock: RuntimeSilentSearchClock(),
+            detector: detector, canonicalLabel: "chair", sharedFrame: try XCTUnwrap(
+                SharedMissionFrame(localOrigin: .zero, localNorthHeading: 0, sessionGeneration: ar.sessionGeneration)))
+        let snapshot = makeSnapshot()
+        let observation = Task { await source.observeNextFrame(until: RuntimeSilentSearchClock().monotonicNow + 10_000_000_000) }
+        let publisher = Task { @MainActor in
+            while !Task.isCancelled, !gate.entered {
+                ar.ingestForTesting(image: snapshot.image, timestamp: ProcessInfo.processInfo.systemUptime,
+                    cameraTransform: snapshot.cameraTransform, intrinsics: snapshot.cameraIntrinsics,
+                    imageResolution: snapshot.imageResolution, depthMap: snapshot.depthMap, trackingQuality: .normal)
+                await Task.yield()
+            }
+        }
+        defer {
+            publisher.cancel()
+            observation.cancel()
+            gate.release()
+        }
+        await fulfillment(of: [entered], timeout: 3)
+        // This actor turn models a stop request while native Vision is held.
+        XCTAssertFalse(gate.timedOut, "MainActor must remain responsive while inference owns the Vision lock")
+        publisher.cancel()
+        observation.cancel()
+        gate.release()
+        await publisher.value
+        let result = await observation.value
+        XCTAssertEqual(result, .pending)
+    }
+
     func testGroundsAllDetectionsFromSameFrameAndBestUngroundedBoxDoesNotFallThrough() throws {
         let snapshot = makeSnapshot()
         let sink = TargetAdapterSink()
@@ -117,4 +155,19 @@ private final class TargetAdapterSink: TargetTrackerEventSink {
     func record(_ event: TargetTrackerEvent) {
         if case let .rejected(_, reason) = event { rejections.append(reason) }
     }
+}
+
+private final class NativeInferenceGate: @unchecked Sendable {
+    private let semaphore = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var timeout = false
+    private var requested = false
+    var entered: Bool { lock.withLock { requested } }
+    var timedOut: Bool { lock.withLock { timeout } }
+    func wait() {
+        lock.withLock { requested = true }
+        // Failure watchdog only: successful execution is released by the actor turn.
+        if semaphore.wait(timeout: .now() + 2) == .timedOut { lock.withLock { timeout = true } }
+    }
+    func release() { semaphore.signal() }
 }

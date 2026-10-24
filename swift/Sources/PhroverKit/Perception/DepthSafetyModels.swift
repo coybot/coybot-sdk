@@ -82,7 +82,7 @@ enum DepthSafetyInvalidReason: String, Equatable, Sendable {
     case invalidCollisionHeightBand = "invalid_collision_height_band"
 }
 
-enum DepthSafetyUnavailableReason: String, Equatable, Sendable {
+public enum DepthSafetyUnavailableReason: String, Equatable, Sendable {
     case missingRawDepth = "missing_raw_depth"
     case staleRawDepth = "stale_raw_depth"
     case invalidCalibration = "invalid_calibration"
@@ -132,6 +132,7 @@ struct DepthSafetyObservation: Equatable, Sendable {
     let requiredStoppingDistance: Double
     let motionClass: DepthSafetyMotionClass
     let speedLimit: Double?
+    var coverageProvenance: String = "depth"
 
     static func unavailable(_ reason: DepthSafetyUnavailableReason,
                             sampleAge: TimeInterval,

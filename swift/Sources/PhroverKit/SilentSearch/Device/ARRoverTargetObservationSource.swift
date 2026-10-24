@@ -9,6 +9,8 @@ public final class ARRoverTargetObservationSource: SilentSearchTargetObserving {
     private let clock: any SilentSearchClock
     private let sharedFrame: SharedMissionFrame
     private let detector: DetectorFunction
+    private var evaluateAsync: ((ARFrameSnapshot) async -> Detector.FollowEvaluation?)?
+    private var currentGeneration: (() -> UInt64)?
     private let tracker: SilentSearchTargetTracker
 
     public init(sessionManager: ARSessionManager, clock: any SilentSearchClock,
@@ -19,6 +21,8 @@ public final class ARRoverTargetObservationSource: SilentSearchTargetObserving {
         self.clock = clock
         self.sharedFrame = sharedFrame
         self.detector = { detector.detect($0) }
+        self.evaluateAsync = { await detector.evaluateForMissionAsync($0) }
+        self.currentGeneration = { sessionManager.sessionGeneration }
         tracker = SilentSearchTargetTracker(canonicalLabel: canonicalLabel, frame: sharedFrame,
                                 eventSink: eventSink, events: events)
     }
@@ -47,7 +51,11 @@ public final class ARRoverTargetObservationSource: SilentSearchTargetObserving {
 
     func frameObservation(in snapshot: ARFrameSnapshot) -> TargetFrameObservation? {
         guard snapshot.id.generation == sharedFrame.sessionGeneration else { return nil }
-        let result = detector(snapshot)
+        return frameObservation(in: snapshot, result: detector(snapshot))
+    }
+
+    private func frameObservation(in snapshot: ARFrameSnapshot, result: Detector.FrameDetections) -> TargetFrameObservation? {
+        guard snapshot.id.generation == sharedFrame.sessionGeneration else { return nil }
         guard result.frameID == snapshot.id,
               result.monotonicTimestamp == snapshot.timestamp else { return nil }
         let detections = result.detections.map { detection in
@@ -102,8 +110,22 @@ public final class ARRoverTargetObservationSource: SilentSearchTargetObserving {
             }
         }
         for await snapshot in stream {
-            guard let snapshot else { return .pending }
-            return process(snapshot)
+            guard let snapshot, !Task.isCancelled else { return .pending }
+            guard let evaluateAsync else { return process(snapshot) }
+            // Native Vision remains serialized on its worker; waiting never blocks
+            // MainActor, so cancellation and motor-stop work can still execute.
+            guard let evaluation = await evaluateAsync(snapshot), !Task.isCancelled,
+                  clock.monotonicNow < deadline,
+                  evaluation.snapshot.id.generation == currentGeneration?(),
+                  evaluation.snapshot.trackingQuality == .normal,
+                  evaluation.receipt.status == .executed else { return .pending }
+            let age = ProcessInfo.processInfo.systemUptime - evaluation.snapshot.timestamp
+            guard age.isFinite, age >= 0, age <= 0.5,
+                  let observation = frameObservation(in: evaluation.snapshot, result: evaluation.receipt.frame) else { return .pending }
+            switch tracker.process(observation) {
+            case .collecting: return .pending
+            case .confirmed(let confirmation): return .confirmed(confirmation)
+            }
         }
         return .pending
     }

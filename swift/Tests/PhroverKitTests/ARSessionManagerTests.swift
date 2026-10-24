@@ -3,10 +3,227 @@ import CoreVideo
 import XCTest
 import simd
 import RoverNav
+import Observation
 @testable import PhroverKit
 
 @MainActor
 final class ARSessionManagerTests: XCTestCase {
+    func testClearanceRevocationSurvivesOverwrittenIngressBeforeConsumptionAndDuringPause() throws {
+        for consumedBeforeIngress in [false, true] {
+            for invalidTracking in [false, true] {
+                let ar = ARSessionManager()
+                ar.resetTracking(generation: 1, runSession: false)
+                let image = makeImage()
+                let now = ProcessInfo.processInfo.systemUptime - 0.01
+                func publish(_ offset: Float, _ quality: ARTrackingQuality, _ sequence: Double) {
+                    var transform = matrix_identity_float4x4
+                    transform.columns.3.x = offset
+                    ar.ingestForTesting(image: image, timestamp: now + sequence * 0.001,
+                        cameraTransform: transform, intrinsics: matrix_identity_float3x3,
+                        imageResolution: CGSize(width: 2, height: 2), depthMap: nil, trackingQuality: quality)
+                }
+                publish(0, .normal, 0)
+                let confirmation = try XCTUnwrap(ar.confirmInitialFollowSearchClearance())
+                let earlyGrant = consumedBeforeIngress ? confirmation.consume(session: 1) : nil
+                // No consumer may drain between the bad capture and the healthy
+                // origin replacement. AR producer evidence must retain the veto.
+                publish(invalidTracking ? 0 : 0.21, invalidTracking ? .limited : .normal, 1)
+                publish(0, .normal, 2)
+                let grant = try XCTUnwrap(earlyGrant ?? confirmation.consume(session: 1))
+                XCTAssertTrue(grant.revoked, "Ingress history lost: consumed=\(consumedBeforeIngress), tracking=\(invalidTracking)")
+                XCTAssertFalse(grant.validate(sample: ar.latestSnapshot.map(NavigationPoseSample.init(snapshot:)),
+                    session: 1, now: ProcessInfo.processInfo.systemUptime), "Returning to origin cannot restore clearance")
+            }
+        }
+    }
+
+    func testTwentyCentimeterFloatIngressRetainsGrantUntilBeyondBoundary() throws {
+        let ar = ARSessionManager()
+        ar.resetTracking(generation: 1, runSession: false)
+        let image = makeImage()
+        let now = ProcessInfo.processInfo.systemUptime - 0.01
+        func publish(_ offset: Float, _ step: Double) {
+            var transform = matrix_identity_float4x4
+            transform.columns.3.x = offset
+            ar.ingestForTesting(image: image, timestamp: now + step * 0.001,
+                cameraTransform: transform, intrinsics: matrix_identity_float3x3,
+                imageResolution: CGSize(width: 2, height: 2), depthMap: nil, trackingQuality: .normal)
+        }
+        publish(0, 0)
+        let confirmation = try XCTUnwrap(ar.confirmInitialFollowSearchClearance())
+        let grant = try XCTUnwrap(confirmation.consume(session: 1))
+        publish(0.20, 1)
+        XCTAssertFalse(grant.revoked)
+        publish(0.20001, 2)
+        XCTAssertTrue(grant.revoked)
+        publish(0, 3)
+        XCTAssertEqual(grant.revocationCause, .searchClearanceSpaceExceeded)
+    }
+
+    func testClearanceRevokesSynchronouslyOnProducerLifecycleBeforeConsumption() throws {
+        for lifecycle in 0..<3 {
+            let ar = ARSessionManager()
+            ar.resetTracking(generation: 1, runSession: false)
+            ar.ingestForTesting(image: makeImage(), timestamp: ProcessInfo.processInfo.systemUptime,
+                cameraTransform: matrix_identity_float4x4, intrinsics: matrix_identity_float3x3,
+                imageResolution: CGSize(width: 2, height: 2), depthMap: nil, trackingQuality: .normal)
+            let confirmation = try XCTUnwrap(ar.confirmInitialFollowSearchClearance())
+            switch lifecycle {
+            case 0: ar.pause()
+            case 1: ar.resetTracking(generation: 2, runSession: false)
+            default: ar.interruptionBeganForTesting()
+            }
+            XCTAssertTrue(try XCTUnwrap(confirmation.consume(session: 1)).revoked)
+            XCTAssertNil(ar.confirmInitialFollowSearchClearance(), "Suspended producer cannot mint another assertion from cached pose")
+        }
+    }
+
+    func testProducerClearanceRegistryDoesNotRetainDiscardedConfirmation() throws {
+        let ar = ARSessionManager()
+        ar.resetTracking(generation: 1, runSession: false)
+        ar.ingestForTesting(image: makeImage(), timestamp: ProcessInfo.processInfo.systemUptime,
+            cameraTransform: matrix_identity_float4x4, intrinsics: matrix_identity_float3x3,
+            imageResolution: CGSize(width: 2, height: 2), depthMap: nil, trackingQuality: .normal)
+        var confirmation = try XCTUnwrap(ar.confirmInitialFollowSearchClearance()) as FollowSearchClearanceConfirmation?
+        weak let grant = confirmation?.consume(session: 1)
+        XCTAssertNotNil(grant)
+        confirmation = nil
+        XCTAssertNil(grant, "AR must not retain discarded or completed grants")
+    }
+
+    func testDepthPublicationAllowsReentrantUnsubscribeAndReleasesObserver() {
+        let ar = ARSessionManager()
+        var callbacks = 0
+        var owner: NSObject? = NSObject()
+        weak let retained = owner
+        var remove: (() -> Void)?
+        remove = ar.observeDepthSafety { [owner] _ in
+            _ = owner
+            callbacks += 1
+            remove?()
+        }
+        owner = nil
+        XCTAssertNotNil(retained)
+        ar.pause() // The real producer invalidation publishes nil synchronously.
+        XCTAssertEqual(callbacks, 1)
+        XCTAssertNil(retained)
+        ar.pause()
+        XCTAssertEqual(callbacks, 1)
+        remove = nil
+    }
+
+    func testRetiredMeshAnchorsAreRemovedEvenWhenTrackingIsLimited() throws {
+        let ar = ARSessionManager()
+        ar.resetTracking(generation: 1, runSession: false)
+        for sequence in 1...3 {
+            XCTAssertTrue(ar.ingest(.init(pose: Pose2D(position: .zero, yaw: 0),
+                frameSequence: UInt64(sequence), timestamp: Double(sequence),
+                trackingQuality: .normal, sessionGeneration: 1)))
+        }
+        let retired = try meshIdentity()
+        let retained = try meshIdentity()
+        ar.session(ar.session, didAdd: [retired, retained])
+        XCTAssertEqual(ar.meshAnchors.count, 2)
+        ar.sessionWasInterrupted(ar.session)
+        (ar as ARSessionDelegate).session?(ar.session, didRemove: [retired])
+        XCTAssertEqual(ar.meshAnchors.map(\.identifier), [retained.identifier])
+        (ar as ARSessionDelegate).session?(ar.session, didRemove: [retained])
+        XCTAssertTrue(ar.meshAnchors.isEmpty)
+    }
+
+    func testBackgroundDepthResultsCannotSurviveResetOrInterruption() async throws {
+        for reset in [true, false] {
+            let oldStarted = expectation(description: "old projection started")
+            let newStarted = expectation(description: "new projection started")
+            let published = expectation(description: "new projection published")
+            let oldGate = DispatchSemaphore(value: 0)
+            let newGate = DispatchSemaphore(value: 0)
+            defer { oldGate.signal(); newGate.signal() }
+            let ar = ARSessionManager(relativeHeadingTelemetry: { _, _ in }, depthProjection: { input in
+                if input.timestamp == 12 {
+                    oldStarted.fulfill()
+                    _ = oldGate.wait(timeout: .now() + 3)
+                } else {
+                    newStarted.fulfill()
+                    _ = newGate.wait(timeout: .now() + 3)
+                }
+                return DepthSafetyProcessor.project(input)
+            })
+            ar.resetTracking(generation: 1, runSession: false)
+            let map = makeDepth(2)
+            ar.enqueueDepthSafety(rawDepthMap: map, intrinsics: matrix_identity_float3x3,
+                cameraTransform: matrix_identity_float4x4, timestamp: 12)
+            await fulfillment(of: [oldStarted], timeout: 2)
+
+            if reset {
+                ar.resetTracking(generation: 2, runSession: false)
+            } else {
+                ar.sessionWasInterrupted(ar.session)
+                ar.sessionInterruptionEnded(ar.session)
+            }
+            ar.enqueueDepthSafety(rawDepthMap: map, intrinsics: matrix_identity_float3x3,
+                cameraTransform: matrix_identity_float4x4, timestamp: 13)
+            oldGate.signal()
+            await fulfillment(of: [newStarted], timeout: 2)
+            XCTAssertNil(ar.latestDepthSafetySnapshot, "Old projection must not repopulate a resumed session")
+            XCTAssertEqual(ar.depthSnapshotVersion, 0)
+
+            withObservationTracking { _ = ar.depthSnapshotVersion } onChange: { published.fulfill() }
+            newGate.signal()
+            await fulfillment(of: [published], timeout: 2)
+            XCTAssertEqual(ar.latestDepthSafetySnapshot?.timestamp, 13)
+            XCTAssertEqual(ar.depthSnapshotVersion, 1)
+        }
+    }
+
+    func testSnapshotPreservesDepthConfidenceOrientationAndIngressEvidence() throws {
+        var image: CVPixelBuffer?
+        var confidence: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 8, 6, kCVPixelFormatType_32BGRA, nil, &image)
+        CVPixelBufferCreate(kCFAllocatorDefault, 8, 6, kCVPixelFormatType_OneComponent8, nil, &confidence)
+        let ar = ARSessionManager()
+        ar.resetTracking(generation: 4, runSession: false)
+        let uptime = ProcessInfo.processInfo.systemUptime
+        ar.ingestForTesting(image: try XCTUnwrap(image), timestamp: uptime,
+            cameraTransform: matrix_identity_float4x4, intrinsics: matrix_identity_float3x3,
+            imageResolution: CGSize(width: 8, height: 6), depthMap: nil, trackingQuality: .normal,
+            depthConfidenceMap: confidence, depthSource: .sceneDepth, imageOrientation: .left)
+        let snapshot = try XCTUnwrap(ar.latestSnapshot)
+        XCTAssertTrue(snapshot.depthConfidenceMap === confidence)
+        XCTAssertEqual(snapshot.depthSource, .sceneDepth)
+        XCTAssertEqual(snapshot.imageOrientation, .left)
+        XCTAssertEqual(ar.sourceHighWater?.frameID, snapshot.id)
+        XCTAssertEqual(ar.sourceHighWater?.sourceTimestamp, uptime)
+        XCTAssertEqual(ar.turnPoseEvidence(from: snapshot.id, through: snapshot.id)?.count, 1)
+        ar.interruptionBeganForTesting()
+        XCTAssertNil(ar.turnPoseEvidence(from: snapshot.id, through: snapshot.id))
+        ar.resetTracking(generation: 5, runSession: false)
+        XCTAssertNil(ar.sourceHighWater)
+    }
+
+    func testSnapshotGroundingRetainsNonLidarFloorAndPersonFallback() throws {
+        var image: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 20, 20, kCVPixelFormatType_32BGRA, nil, &image)
+        var transform = matrix_identity_float4x4
+        transform.columns.3.y = 1
+        let frame = ARFrameSnapshot(id: .init(generation: 1, sequence: 1), timestamp: 1,
+            image: try XCTUnwrap(image), cameraTransform: transform,
+            cameraIntrinsics: simd_float3x3(columns: (SIMD3(10, 0, 0), SIMD3(0, 10, 0), SIMD3(10, 10, 1))),
+            imageResolution: CGSize(width: 20, height: 20), depthMap: nil,
+            pose: .init(position: .zero, yaw: 0), trackingQuality: .normal,
+            imageOrientation: .up, floorHeight: 0)
+        let box = CGRect(x: 0.3, y: 0.1, width: 0.4, height: 0.6)
+        let floor = try XCTUnwrap(ARSessionManager.groundPoint(boundingBox: box, label: "chair", in: frame))
+        XCTAssertEqual(floor.x, 0, accuracy: 1e-5)
+        XCTAssertEqual(floor.y, -1.25, accuracy: 1e-5)
+        let withoutFloor = ARFrameSnapshot(id: frame.id, timestamp: frame.timestamp, image: frame.image,
+            cameraTransform: frame.cameraTransform, cameraIntrinsics: frame.cameraIntrinsics,
+            imageResolution: frame.imageResolution, depthMap: nil, pose: frame.pose, trackingQuality: .normal,
+            imageOrientation: frame.imageOrientation)
+        XCTAssertNotNil(ARSessionManager.groundPoint(boundingBox: box, label: "person", in: withoutFloor))
+        XCTAssertNil(ARSessionManager.groundPoint(boundingBox: box, label: "chair", in: withoutFloor))
+    }
+
     func testPlainObservationsAreMonotonicWithinExplicitGeneration() {
         let ar = ARSessionManager()
         ar.resetTracking(generation: 4, runSession: false)
@@ -436,4 +653,15 @@ final class ARSessionManagerTests: XCTestCase {
         value.columns.3 = SIMD4<Float>(x, 0, z, 1)
         return value
     }
+}
+
+// Decode an identity-only mesh anchor through ARKit's public NSSecureCoding
+// interface. These lifecycle tests never inspect the absent geometry.
+private func meshIdentity() throws -> ARMeshAnchor {
+    let data = try NSKeyedArchiver.archivedData(withRootObject: ARAnchor(transform: matrix_identity_float4x4),
+        requiringSecureCoding: true)
+    let decoder = try NSKeyedUnarchiver(forReadingFrom: data)
+    decoder.setClass(ARMeshAnchor.self, forClassName: "ARAnchor")
+    defer { decoder.finishDecoding() }
+    return try XCTUnwrap(decoder.decodeObject(of: ARMeshAnchor.self, forKey: NSKeyedArchiveRootObjectKey))
 }

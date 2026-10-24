@@ -60,6 +60,17 @@ final class NavigationSilentSearchMotionTests: XCTestCase {
         }
     }
 
+    func testResolutionFailureRemainsSpecificThroughNavigationAndRotation() async {
+        let motion = NavigationSilentSearchMotion(frame: identityFrame,
+            currentPose: { Pose2D(position: .zero, yaw: 0) }, currentPath: { [] },
+            navigateAndWait: { _, _ in .failed(.rotationResolutionInsufficient) },
+            rotateAndWait: { _ in .failed(.rotationResolutionInsufficient) }, cancelAndWait: {})
+        let navigation = await motion.navigate(to: MissionPoint(x: 0, y: 0)!, policy: .unrestrictedConvergence)
+        let rotation = await motion.rotate(to: 1, tolerance: 0.05)
+        XCTAssertEqual(navigation, .failed(.rotationResolutionInsufficient))
+        XCTAssertEqual(rotation, .failed(.rotationResolutionInsufficient))
+    }
+
     func testFinalRotationUsesLocalHeadingAndVerifiesBothTolerances() async {
         let frame = SharedMissionFrame(
             localOrigin: .zero, localNorthHeading: .pi / 2, sessionGeneration: 1

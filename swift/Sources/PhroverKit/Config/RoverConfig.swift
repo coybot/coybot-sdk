@@ -13,8 +13,11 @@ public enum RoverConfig {
 
     /// WAVE ROVER JSON command "T" opcodes we use (see Waveshare sub-controller command set).
     public enum Opcode {
-        public static let speedControl = 1     // {"T":1,"L":<m/s>,"R":<m/s>}
-        public static let emergencyStop = 0    // {"T":0} — stop all motors
+        public static let speedControl = 1     // L/R open-loop wheel commands; both zero stops the chassis
+        /// Retained for source compatibility only; stock WAVE ROVER does not
+        /// implement T:0 as a chassis stop.
+        @available(*, deprecated, message: "Use RoverControl.stop(); WAVE ROVER requires T:1 with L:0 and R:0")
+        public static let emergencyStop = 0
         public static let feedbackFlowOn = 131 // continuous chassis+IMU feedback
         public static let imuQuery = 126       // one-shot IMU read
     }
@@ -40,6 +43,14 @@ public enum RoverConfig {
     /// The autonomous rotate loop may compute a smaller speed from yaw error, but values
     /// below this can make interpreted voice turns appear to do nothing.
     public static let minimumRotateWheelSpeed = 0.25
+    /// Open-loop wheel output for the short follow readiness translation.
+    static let readySignalWheelMagnitude = 0.25
+    static let readySignalPulseBudget: TimeInterval = 0.040
+    static let readySignalStoppedObservation: TimeInterval = 0.100
+    /// Host-time allowance to drain a readiness pulse and confirm its stop.
+    static let readySignalStopReserve: TimeInterval = 0.100
+    /// Read-only confirmation after the five-second movement cutoff.
+    static let readySignalFinalConfirmation: TimeInterval = 0.300
     public static let relativeHeadingUpdateInterval: TimeInterval = 1.0 / 60.0
     public static let relativeHeadingMaximumIntegrationGap: TimeInterval = 0.10
     public static let relativeHeadingMaximumSampleAge: TimeInterval = 0.15
@@ -49,6 +60,10 @@ public enum RoverConfig {
     public static let scanTurnPulseDuration: TimeInterval = 0.02
     public static let scanTurnSettleDuration: TimeInterval = 0.75
     public static let scanTurnYawTolerance = 7.0 * Double.pi / 180.0
+    /// Follow-only tuning; legacy and Silent Search scan timing remains independent.
+    static let followScanRotationProfile = FollowScanRotationProfile(
+        pulseWait: 0.200, settleWait: 0.300, wheelCap: minimumRotateWheelSpeed, yawGain: 0.30,
+        angularTolerance: scanTurnYawTolerance)
     public static let scanMinimumProgressYaw = 2.0 * Double.pi / 180.0
     public static let scanFramePollInterval: TimeInterval = 0.05
     public static let scanFrameFreshnessTimeout: TimeInterval = 1.5

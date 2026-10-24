@@ -60,9 +60,11 @@ public protocol RoverMotion: AnyObject {
     func recoverPlanningContext() async -> PlanningRecoveryOutcome
     func stopAndWait() async
     func cancel()
+    func stopAndConfirm() async throws
 }
 
 extension RoverMotion {
+    public func stopAndConfirm() async throws { await stopAndWait() }
     public func navigate(to goal: Vec2, stoppingAtForwardClearance clearance: Double) {
         navigate(to: goal)
     }
@@ -101,6 +103,9 @@ public protocol RoverPerception: AnyObject {
     /// `nil` keeps non-camera and test implementations backward compatible.
     var frameSequence: UInt64? { get }
     func detectObjects() -> [PerceivedObject]
+    func refreshDetections() async
+    /// Project a point produced by the latest local detection receipt.
+    func unprojectDetectedObject(normalizedPoint: CGPoint) -> Vec2?
     func unproject(normalizedPoint: CGPoint) -> Vec2?
     func unproject(object: PerceivedObject) -> Vec2?
     func capturedFrameJPEG() -> Data?
@@ -120,6 +125,12 @@ public protocol RoverPerception: AnyObject {
 extension RoverPerception {
     public var latestObservation: PoseObservation? { nil }
     public var frameSequence: UInt64? { nil }
+
+    public func refreshDetections() async {}
+
+    public func unprojectDetectedObject(normalizedPoint: CGPoint) -> Vec2? {
+        unproject(normalizedPoint: normalizedPoint)
+    }
 
     public func unproject(object: PerceivedObject) -> Vec2? {
         unproject(normalizedPoint: object.normalizedPoint)
@@ -149,10 +160,46 @@ public final class ARPerceptionSource: RoverPerception {
     private let ar: ARSessionManager
     private let detector: Detector?
     private let colorAnalyzer = LocalObjectColorAnalyzer()
+    private let detectionNow: () -> TimeInterval
+    private var detectionFrame: ARFrameSnapshot?
+    private var detections: [Detector.Detection] = []
 
-    public init(ar: ARSessionManager, detector: Detector?) {
+    public func refreshDetections() async {
+        guard let detector, let snapshot = ar.latestSnapshot else {
+            detectionFrame = nil
+            detections = []
+            return
+        }
+        guard let evaluation = await detector.evaluateForMissionAsync(snapshot),
+              !Task.isCancelled, evaluation.snapshot.id.generation == ar.sessionGeneration else {
+            // A skipped/superseded inference says nothing about the previous receipt.
+            // Its original capture time continues to bound freshness.
+            return
+        }
+        detectionFrame = evaluation.snapshot
+        detections = evaluation.receipt.frame.detections
+    }
+
+    private var freshDetectionFrame: ARFrameSnapshot? {
+        guard let frame = detectionFrame, frame.id.generation == ar.sessionGeneration else { return nil }
+        let age = detectionNow() - frame.timestamp
+        return age.isFinite && age >= 0 && age <= 0.5 ? frame : nil
+    }
+
+    private var trustedDetectionFrame: ARFrameSnapshot? {
+        guard let frame = freshDetectionFrame, ar.trackingQuality == .normal,
+              frame.trackingQuality == .normal else { return nil }
+        return frame
+    }
+
+    public convenience init(ar: ARSessionManager, detector: Detector?) {
+        self.init(ar: ar, detector: detector, detectionNow: { ProcessInfo.processInfo.systemUptime })
+    }
+
+    init(ar: ARSessionManager, detector: Detector?, detectionNow: @escaping () -> TimeInterval) {
         self.ar = ar
         self.detector = detector
+        self.detectionNow = detectionNow
     }
 
     public var pose: Pose2D? { ar.pose }
@@ -160,8 +207,8 @@ public final class ARPerceptionSource: RoverPerception {
     public var frameSequence: UInt64? { ar.frameSequence }
 
     public func detectObjects() -> [PerceivedObject] {
-        guard let detector, let buffer = ar.latestPixelBuffer else { return [] }
-        return detector.detect(buffer, orientation: ar.imageOrientation).map { detection in
+        guard let frame = freshDetectionFrame else { return [] }
+        return detections.map { detection in
             PerceivedObject(
                 label: detection.label,
                 confidence: detection.confidence,
@@ -171,41 +218,49 @@ public final class ARPerceptionSource: RoverPerception {
                 ),
                 normalizedBoundingBox: detection.boundingBox,
                 colorEvidence: colorAnalyzer.analyze(
-                    pixelBuffer: buffer,
-                    normalizedBoundingBox: rawBufferBox(detection.boundingBox)
+                    pixelBuffer: frame.image,
+                    normalizedBoundingBox: rawBufferBox(detection.boundingBox, in: frame)
                 )
             )
         }
     }
 
     public func unproject(normalizedPoint: CGPoint) -> Vec2? {
-        ar.unproject(normalizedPoint: normalizedPoint)
+        guard ar.trackingQuality == .normal else { return nil }
+        return ar.unproject(normalizedPoint: normalizedPoint)
+    }
+
+    public func unprojectDetectedObject(normalizedPoint: CGPoint) -> Vec2? {
+        guard let frame = trustedDetectionFrame else { return nil }
+        return ARSessionManager.unproject(normalizedPoint: normalizedPoint, in: frame)
     }
 
     public func groundPoint(of object: PerceivedObject) -> Vec2? {
-        guard let box = object.normalizedBoundingBox else { return unproject(normalizedPoint: object.normalizedPoint) }
-        return ar.groundPoint(boundingBox: box, label: object.label)
+        guard let frame = trustedDetectionFrame else { return nil }
+        guard let box = object.normalizedBoundingBox else {
+            return ARSessionManager.unproject(normalizedPoint: object.normalizedPoint, in: frame)
+        }
+        return ARSessionManager.groundPoint(boundingBox: box, label: object.label, in: frame)
     }
 
     public func unproject(object: PerceivedObject) -> Vec2? {
-        guard let boundingBox = object.normalizedBoundingBox else {
-            return unproject(normalizedPoint: object.normalizedPoint)
+        guard let frame = trustedDetectionFrame else { return nil }
+        guard let box = object.normalizedBoundingBox else {
+            return ARSessionManager.unproject(normalizedPoint: object.normalizedPoint, in: frame)
         }
-        return ar.unproject(
-            normalizedBoundingBox: boundingBox,
-            fallbackPoint: object.normalizedPoint
-        )
+        return ARSessionManager.unproject(normalizedBoundingBox: box,
+                                         fallbackPoint: object.normalizedPoint, in: frame)
     }
 
     /// Detector boxes are in the upright frame (the buffer rotated by
     /// `ar.imageOrientation`); `LocalObjectColorAnalyzer` reads the raw buffer, so map the
     /// box back into raw-buffer Vision coordinates (bottom-left origin) first.
-    private func rawBufferBox(_ box: CGRect) -> CGRect {
+    private func rawBufferBox(_ box: CGRect, in frame: ARFrameSnapshot) -> CGRect {
         let unit = CGSize(width: 1, height: 1)
         let a = ARSessionManager.sensorPixel(forVisionNormalizedPoint: CGPoint(x: box.minX, y: box.minY),
-                                             imageSize: unit, orientation: ar.imageOrientation)
+                                             imageSize: unit, orientation: frame.imageOrientation)
         let b = ARSessionManager.sensorPixel(forVisionNormalizedPoint: CGPoint(x: box.maxX, y: box.maxY),
-                                             imageSize: unit, orientation: ar.imageOrientation)
+                                             imageSize: unit, orientation: frame.imageOrientation)
         // sensorPixel is top-left origin; flip back to Vision's bottom-left origin.
         return CGRect(x: min(a.x, b.x), y: 1 - max(a.y, b.y),
                       width: abs(a.x - b.x), height: abs(a.y - b.y))
@@ -413,6 +468,7 @@ public final class MissionAgent {
     private var lastAnswerWasInconclusive = false
     private var nextCandidateNumber = 1
     private var isHandlingMission = false
+    private var stopUnconfirmed = false
     private var missionGeneration = 0
     private var nextCommandID: MissionCommandID = 0
     private var commandByMissionID: [Int: (id: MissionCommandID, text: String)] = [:]
@@ -516,19 +572,25 @@ public final class MissionAgent {
         RuntimeFileLog.append("voice_command_received", fields: ["utterance": trimmedUtterance])
         if isEmergencyStopUtterance(trimmedUtterance) {
             commandStatusDidChange?(.working(id: commandID, command: trimmedUtterance))
-            missionGeneration += 1
-            isHandlingMission = false
-            phase = .acting
-            follower?.stopFollowing()
-            await motion.stopAndWait()
-            roomTopology?.abandonTransition()
-            publishRoomTransitionState(.idle)
-            phase = .idle
+            do {
+                try await cancelCurrentMissionAndWait()
+            } catch {
+                RuntimeFileLog.append("voice_command_stop_failed", fields: ["error": error.localizedDescription])
+                publishTerminal(.failed(id: commandID, command: trimmedUtterance,
+                                        message: "Rover stop could not be confirmed."))
+                return
+            }
             RuntimeFileLog.append("voice_command_stop", fields: ["utterance": trimmedUtterance])
             publishTerminal(.cancelled(id: commandID, command: trimmedUtterance))
             return
         }
 
+        guard !stopUnconfirmed else {
+            voice.speak("Rover stop could not be confirmed.")
+            publishTerminal(.failed(id: commandID, command: trimmedUtterance,
+                                    message: "Rover stop could not be confirmed."))
+            return
+        }
         guard !isHandlingMission else {
             voice.speak("I'm still working on the previous command. Say stop if you want me to cancel it.")
             RuntimeFileLog.append("voice_command_busy", fields: ["utterance": trimmedUtterance])
@@ -649,7 +711,7 @@ public final class MissionAgent {
                 { .succeeded(id: $0, command: $1, message: "Entered another room.") },
                 missionID: missionID
             )
-            phase = .idle
+            setPhase(.idle, missionID: missionID)
         case .exhausted(let reason):
             let fields = roomTraversalExhaustionFields
             roomTraversalExhaustionFields = [:]
@@ -672,7 +734,7 @@ public final class MissionAgent {
                 )
             }
         case .cancelled:
-            phase = .idle
+            setPhase(.idle, missionID: missionID)
         }
     }
 
@@ -743,6 +805,10 @@ public final class MissionAgent {
                     candidates: candidates
                 )
             }
+            guard !missionCancellationDetected(missionID) else {
+                cancelActiveMotion(missionID: missionID, reason: "cancelled_after_doorway_evidence")
+                return .cancelled
+            }
             let ranked = roomTopology.rankedCandidates(
                 assessments: assessments,
                 visualBoosts: visualBoosts,
@@ -803,10 +869,10 @@ public final class MissionAgent {
                 ]) { _, new in new })
                 guard remainingScanSteps > 0 else { break }
                 remainingScanSteps -= 1
-                phase = .acting
+                setPhase(.acting, missionID: missionID)
                 let frameBeforeTurn = perception.frameSequence
                 switch await rotateForScanRespectingCancellation(
-                    by: .pi / 6,
+                    missionID: missionID, by: .pi / 6,
                     expectedSessionGeneration: sessionGeneration
                 ) {
                 case .completed:
@@ -921,7 +987,7 @@ public final class MissionAgent {
                 "goal_y": String(format: "%.2f", selected.assessment.beyondPlaneGoal.y),
             ]) { _, new in new })
             publishRoomTransitionState(.approaching(id: selected.candidate.id))
-            phase = .acting
+            setPhase(.acting, missionID: missionID)
             motion.navigate(to: selected.assessment.beyondPlaneGoal)
             var lastFrameSequence: UInt64?
             var trackingRecoveryDeadline: Date?
@@ -961,8 +1027,10 @@ public final class MissionAgent {
                         publishRoomTransitionState(.confirmingCrossing(id: selected.candidate.id))
                         await motion.stopAndWait()
                         guard isCurrentMission(missionID), !Task.isCancelled else {
-                            roomTopology.abandonTransition()
-                            publishRoomTransitionState(.idle)
+                            if isCurrentMission(missionID) {
+                                roomTopology.abandonTransition()
+                                publishRoomTransitionState(.idle)
+                            }
                             return .cancelled
                         }
                         if let roomID = roomTopology.confirmTransition(),
@@ -1050,13 +1118,16 @@ public final class MissionAgent {
         }
 
         if !isCurrentMission(missionID) || Task.isCancelled {
-            motion.cancel()
-            roomTopology.abandonTransition()
-            publishRoomTransitionState(.idle)
-            phase = .idle
+            if isCurrentMission(missionID) {
+                motion.cancel()
+                roomTopology.abandonTransition()
+                publishRoomTransitionState(.idle)
+                setPhase(.idle, missionID: missionID)
+            }
             return .cancelled
         }
         await motion.stopAndWait()
+        guard isCurrentMission(missionID), !Task.isCancelled else { return .cancelled }
         roomTopology.abandonTransition()
         roomTraversalExhaustionFields = [
             "candidate_attempts": String(candidateAttempts),
@@ -1086,6 +1157,7 @@ public final class MissionAgent {
         sessionGeneration: UInt64? = nil,
         fields: [String: String] = [:]
     ) {
+        guard isCurrentMission(missionID) else { return }
         publishRoomTransitionFailure(
             reason,
             missionID: missionID,
@@ -1096,7 +1168,7 @@ public final class MissionAgent {
             { .failed(id: $0, command: $1, message: message) },
             missionID: missionID
         )
-        phase = .idle
+        setPhase(.idle, missionID: missionID)
     }
 
     private func finishRoomTransitionExhausted(
@@ -1104,6 +1176,7 @@ public final class MissionAgent {
         sessionGeneration: UInt64? = nil,
         fields: [String: String] = [:]
     ) {
+        guard isCurrentMission(missionID) else { return }
         publishRoomTransitionState(.exhausted)
         roomTransitionTelemetry("room_transition_exhausted", fields.merging([
             "mission_id": String(missionID),
@@ -1114,10 +1187,33 @@ public final class MissionAgent {
             { .failed(id: $0, command: $1, message: "I couldn’t find a safe route into another room.") },
             missionID: missionID
         )
-        phase = .idle
+        setPhase(.idle, missionID: missionID)
+    }
+
+    public func cancelCurrentMissionAndWait() async throws {
+        missionGeneration += 1
+        let generation = missionGeneration
+        isHandlingMission = false
+        phase = .acting
+        stopUnconfirmed = true
+        follower?.stopFollowing()
+        try await motion.stopAndConfirm()
+        if missionGeneration == generation {
+            stopUnconfirmed = false
+            roomTopology?.abandonTransition()
+            publishRoomTransitionState(.idle)
+            phase = .idle
+        }
     }
 
     // MARK: - Loop
+
+    /// Async work may outlive acknowledged cancellation and a subsequent mission.
+    /// Fence phase mutation and its UI callback at the source, including idle updates.
+    private func setPhase(_ value: Phase, missionID: Int) {
+        guard missionID == missionGeneration else { return }
+        phase = value
+    }
 
     private func runLoop(firstUtterance: String?, missionID: Int) async {
         var nextUtterance = firstUtterance
@@ -1144,7 +1240,7 @@ public final class MissionAgent {
 
         for tick in 0..<maxTicksPerUtterance {
             guard !missionCancellationDetected(missionID) else {
-                phase = .idle
+                setPhase(.idle, missionID: missionID)
                 RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
                 return
             }
@@ -1154,7 +1250,7 @@ public final class MissionAgent {
             let directFollow = tick == 0 ? firstUtterance.flatMap(Self.directFollowQuery) : nil
             let brain = currentBrain()
             if brain == nil, directFollow == nil || follower == nil, !isFollowing {
-                if followEndedWithNothingElseToDo { phase = .idle; return }
+                if followEndedWithNothingElseToDo { setPhase(.idle, missionID: missionID); return }
                 RuntimeFileLog.append("mission_failed", fields: [
                     "mission": "\(missionID)",
                     "reason": "missing_brain"
@@ -1181,7 +1277,9 @@ public final class MissionAgent {
                 break
             }
 
-            phase = .thinking
+            setPhase(.thinking, missionID: missionID)
+            await perception.refreshDetections()
+            guard isCurrentMission(missionID), !Task.isCancelled else { return }
             let rememberedCountBefore = memory.rememberedObjects.count
             updateWorldModel()
             let newObjects = memory.rememberedObjects.count - rememberedCountBefore
@@ -1218,7 +1316,7 @@ public final class MissionAgent {
                             "mission": "\(missionID)",
                             "error": error.localizedDescription
                         ])
-                        if followEndedWithNothingElseToDo { phase = .idle; return }
+                        if followEndedWithNothingElseToDo { setPhase(.idle, missionID: missionID); return }
                         if !hasUsableBrainOutput {
                             await attemptOfflineObjectFallback(
                                 utterance: missionUtterance,
@@ -1245,7 +1343,7 @@ public final class MissionAgent {
                         output = keep
                     } else {
                         guard isCurrentMission(missionID) else {
-                            phase = .idle
+                            setPhase(.idle, missionID: missionID)
                             RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
                             return
                         }
@@ -1253,7 +1351,7 @@ public final class MissionAgent {
                             "mission": "\(missionID)",
                             "timeout": String(format: "%.2f", brainDecisionTimeout)
                         ])
-                        if followEndedWithNothingElseToDo { phase = .idle; return }
+                        if followEndedWithNothingElseToDo { setPhase(.idle, missionID: missionID); return }
                         if !hasUsableBrainOutput {
                             await attemptOfflineObjectFallback(
                                 utterance: missionUtterance,
@@ -1280,7 +1378,7 @@ public final class MissionAgent {
                         output = keep
                     } else {
                         guard isCurrentMission(missionID) else {
-                            phase = .idle
+                            setPhase(.idle, missionID: missionID)
                             RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
                             return
                         }
@@ -1289,7 +1387,7 @@ public final class MissionAgent {
                             "mission": "\(missionID)",
                             "error": error.localizedDescription
                         ])
-                        if followEndedWithNothingElseToDo { phase = .idle; return }
+                        if followEndedWithNothingElseToDo { setPhase(.idle, missionID: missionID); return }
                         if !hasUsableBrainOutput {
                             await attemptOfflineObjectFallback(
                                 utterance: missionUtterance,
@@ -1336,7 +1434,7 @@ public final class MissionAgent {
                 "decision": decisionDescription(output.decision)
             ])
 
-            phase = .acting
+            setPhase(.acting, missionID: missionID)
             let decision = output.decision
             let poseBefore = perception.pose?.position
             var outcome = ""
@@ -1354,7 +1452,7 @@ public final class MissionAgent {
                     case .found(let scannedGoal):
                         visualTargetScanSteps = 0
                         if navigate(to: scannedGoal, for: effectiveTarget) {
-                            await waitForMotionToSettle()
+                            await waitForMotionToSettle(missionID: missionID)
                         } else {
                             switch await approachVisualTarget(
                                 effectiveTarget,
@@ -1368,14 +1466,14 @@ public final class MissionAgent {
                                 failTargetNavigationMission(missionID: missionID, reason: reason)
                                 return
                             case .cancelled:
-                                phase = .idle
+                                setPhase(.idle, missionID: missionID)
                                 RuntimeFileLog.append("mission_cancelled", fields: [
                                     "mission": "\(missionID)",
                                     "reason": "cancelled_during_target_approach"
                                 ])
                                 return
                             case .sessionGenerationChanged:
-                                phase = .idle
+                                setPhase(.idle, missionID: missionID)
                                 RuntimeFileLog.append("mission_cancelled", fields: [
                                     "mission": "\(missionID)",
                                     "reason": "session_generation_changed"
@@ -1384,7 +1482,7 @@ public final class MissionAgent {
                             }
                         }
                         guard isCurrentMission(missionID) else {
-                            phase = .idle
+                            setPhase(.idle, missionID: missionID)
                             RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
                             return
                         }
@@ -1412,7 +1510,7 @@ public final class MissionAgent {
                                       poseBefore: poseBefore,
                                       newObjects: newObjects,
                                       outcome: outcome) {
-                            phase = .idle
+                            setPhase(.idle, missionID: missionID)
                             return
                         }
                         continue
@@ -1420,11 +1518,11 @@ public final class MissionAgent {
                         failScanRotationMission(missionID: missionID, reason: reason)
                         return
                     case .cancelled:
-                        phase = .idle
+                        setPhase(.idle, missionID: missionID)
                         RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
                         return
                     case .sessionGenerationChanged:
-                        phase = .idle
+                        setPhase(.idle, missionID: missionID)
                         RuntimeFileLog.append("mission_cancelled", fields: [
                             "mission": "\(missionID)",
                             "reason": "session_generation_changed"
@@ -1443,7 +1541,7 @@ public final class MissionAgent {
                             ])
                             visualTargetScanSteps = 0
                             motion.navigate(to: candidate.worldPoint)
-                            await waitForMotionToSettle()
+                            await waitForMotionToSettle(missionID: missionID)
                             let reachedCandidate = motion.state == .arrived
                             if await recoverOrStopMissionIfMotionFailed(
                                 missionID: missionID,
@@ -1467,21 +1565,21 @@ public final class MissionAgent {
                                           poseBefore: poseBefore,
                                           newObjects: newObjects,
                                           outcome: outcome) {
-                                phase = .idle
+                                setPhase(.idle, missionID: missionID)
                                 return
                             }
                             continue
                         }
                     }
                     guard isCurrentMission(missionID) else {
-                        phase = .idle
+                        setPhase(.idle, missionID: missionID)
                         RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
                         return
                     }
                     voice.speak("I couldn't quite figure out where that is.")
                     if recordTick(decision: decision, poseBefore: poseBefore, newObjects: newObjects,
                                    outcome: "navigate → couldn't resolve target") {
-                        phase = .idle
+                        setPhase(.idle, missionID: missionID)
                         return
                     }
                     continue
@@ -1492,7 +1590,7 @@ public final class MissionAgent {
                         missionID: missionID,
                         expectedSessionGeneration: roomTopology?.snapshot.sessionGeneration
                     ) else {
-                        phase = .idle
+                        setPhase(.idle, missionID: missionID)
                         return
                     }
                 } else {
@@ -1508,14 +1606,14 @@ public final class MissionAgent {
                         failTargetNavigationMission(missionID: missionID, reason: reason)
                         return
                     case .cancelled:
-                        phase = .idle
+                        setPhase(.idle, missionID: missionID)
                         RuntimeFileLog.append("mission_cancelled", fields: [
                             "mission": "\(missionID)",
                             "reason": "cancelled_during_target_approach"
                         ])
                         return
                     case .sessionGenerationChanged:
-                        phase = .idle
+                        setPhase(.idle, missionID: missionID)
                         RuntimeFileLog.append("mission_cancelled", fields: [
                             "mission": "\(missionID)",
                             "reason": "session_generation_changed"
@@ -1550,7 +1648,7 @@ public final class MissionAgent {
                     voice.speak("I'm not sure which opening that is anymore.")
                     if recordTick(decision: decision, poseBefore: poseBefore, newObjects: newObjects,
                                    outcome: "explore(\(candidateId)) → unknown opening id") {
-                        phase = .idle
+                        setPhase(.idle, missionID: missionID)
                         return
                     }
                     continue
@@ -1578,7 +1676,7 @@ public final class MissionAgent {
                     candidate = requestedCandidate
                 }
                 motion.navigate(to: candidate.worldPoint)
-                await waitForMotionToSettle()
+                await waitForMotionToSettle(missionID: missionID)
                 if await recoverOrStopMissionIfMotionFailed(missionID: missionID,
                                                             recoverFromBlockedHeading: true,
                                                             blockedCandidateId: candidate.id) { return }
@@ -1595,7 +1693,7 @@ public final class MissionAgent {
                     : "pose changed")
 
             case .ask(let question):
-                phase = .waitingForAnswer
+                setPhase(.waitingForAnswer, missionID: missionID)
                 if let reply = await voice.ask(question, timeout: askTimeout) {
                     lastAnswerWasInconclusive = false
                     if let pose = perception.pose { memory.record(utterance: reply, at: pose) }
@@ -1609,7 +1707,7 @@ public final class MissionAgent {
             case .follow(let target):
                 guard let followOutcome = await startOrContinueFollowing(target,
                                                                          missionID: missionID) else {
-                    phase = .idle
+                    setPhase(.idle, missionID: missionID)
                     RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
                     return
                 }
@@ -1624,19 +1722,27 @@ public final class MissionAgent {
                 outcome = "claimRoom(\(roomId)) → broadcast"
 
             case .stop:
-                motion.cancel()
-                follower?.stopFollowing()
-                phase = .idle
+                let stopGeneration = missionGeneration + 1
+                do {
+                    try await cancelCurrentMissionAndWait()
+                    if missionGeneration == stopGeneration, !Task.isCancelled {
+                        publishMissionTerminal({ .succeeded(id: $0, command: $1,
+                            message: "Command completed.") }, missionID: missionID)
+                    }
+                } catch {
+                    publishMissionTerminal({ .failed(id: $0, command: $1,
+                        message: "Rover stop could not be confirmed.") }, missionID: missionID)
+                }
                 return
 
             case .done:
-                phase = .idle
+                setPhase(.idle, missionID: missionID)
                 RuntimeFileLog.append("mission_done", fields: ["mission": "\(missionID)"])
                 return
             }
 
             if recordTick(decision: decision, poseBefore: poseBefore, newObjects: newObjects, outcome: outcome) {
-                phase = .idle
+                setPhase(.idle, missionID: missionID)
                 return
             }
         }
@@ -1645,7 +1751,7 @@ public final class MissionAgent {
             voice.speak("I've used up the time I had for this and want to check in rather than keep going. "
                 + wrapUpFindings())
         }
-        phase = .idle
+        setPhase(.idle, missionID: missionID)
         RuntimeFileLog.append("mission_finished", fields: ["mission": "\(missionID)"])
     }
 
@@ -1656,7 +1762,7 @@ public final class MissionAgent {
         failureMessage: String
     ) async {
         guard isCurrentMission(missionID), !Task.isCancelled else {
-            phase = .idle
+            setPhase(.idle, missionID: missionID)
             RuntimeFileLog.append("mission_offline_fallback_cancelled", fields: [
                 "mission": "\(missionID)",
                 "reason": "mission_cancelled_before_start"
@@ -1691,6 +1797,8 @@ public final class MissionAgent {
             "brain_failure": brainFailureReason,
             "reason": brainFailureReason,
         ])
+        await perception.refreshDetections()
+        guard !missionCancellationDetected(missionID) else { return }
         await runOfflineObjectMission(
             intent,
             missionID: missionID,
@@ -1905,7 +2013,7 @@ public final class MissionAgent {
             return
         }
 
-        phase = .acting
+        setPhase(.acting, missionID: missionID)
         switch await approachVisualTarget(
             target,
             initialGoal: goal,
@@ -2153,7 +2261,7 @@ public final class MissionAgent {
             ])
         }
 
-        phase = .idle
+        setPhase(.idle, missionID: missionID)
         guard !missionCancellationDetected(missionID) else {
             cancelActiveMotion(missionID: missionID, reason: "cancelled_before_success")
             RuntimeFileLog.append("mission_offline_fallback_cancelled", fields: [
@@ -2296,6 +2404,8 @@ public final class MissionAgent {
                         await motion.stopAndWait()
                         return .sessionGenerationChanged
                     }
+                    await perception.refreshDetections()
+                    guard !missionCancellationDetected(missionID) else { return .cancelled }
                     guard let refreshedGoal = resolve(target, missionID: missionID) else {
                         return .failed("I couldn't reacquire the target before refreshing the map.")
                     }
@@ -2364,7 +2474,7 @@ public final class MissionAgent {
                 "path_distance": String(format: "%.2f", selected.assessment.pathDistance)
             ])
 
-            phase = .acting
+            setPhase(.acting, missionID: missionID)
             let frameBeforeStaging = perception.frameSequence
             motion.navigate(to: selected.candidate.worldPoint)
             guard await waitForMotionToSettle(
@@ -2409,6 +2519,8 @@ public final class MissionAgent {
                 return .sessionGenerationChanged
             }
 
+            await perception.refreshDetections()
+            guard !missionCancellationDetected(missionID) else { return .cancelled }
             var reacquiredGoal = resolve(target, missionID: missionID)
             if reacquiredGoal == nil {
                 var scanSteps = 0
@@ -2450,9 +2562,10 @@ public final class MissionAgent {
         message: String,
         reason: String
     ) {
+        guard isCurrentMission(missionID) else { return }
         motion.cancel()
         voice.speak(message.replacingOccurrences(of: "I’m", with: "I'm"))
-        phase = .idle
+        setPhase(.idle, missionID: missionID)
         publishMissionTerminal(
             { .failed(id: $0, command: $1, message: message) },
             missionID: missionID
@@ -2490,8 +2603,9 @@ public final class MissionAgent {
     }
 
     private func cancelActiveMotion(missionID: Int, reason: String) {
+        guard isCurrentMission(missionID) else { return }
         motion.cancel()
-        phase = .idle
+        setPhase(.idle, missionID: missionID)
         RuntimeFileLog.append("mission_cancelled", fields: [
             "mission": "\(missionID)",
             "reason": reason
@@ -2957,7 +3071,7 @@ public final class MissionAgent {
             ])
             let frameBeforeTurn = perception.frameSequence
             let firstRotation = await rotateForScanRespectingCancellation(
-                by: angle,
+                missionID: missionID, by: angle,
                 expectedSessionGeneration: expectedSessionGeneration
             )
             switch firstRotation {
@@ -2974,7 +3088,7 @@ public final class MissionAgent {
                     "reason": firstReason,
                 ])
                 switch await rotateForScanRespectingCancellation(
-                    by: retryAngle,
+                    missionID: missionID, by: retryAngle,
                     expectedSessionGeneration: expectedSessionGeneration
                 ) {
                 case .completed:
@@ -3101,6 +3215,9 @@ public final class MissionAgent {
             guard !sessionGenerationChanged(from: expectedSessionGeneration) else {
                 return .sessionGenerationChanged
             }
+            await perception.refreshDetections()
+            guard !missionCancellationDetected(missionID) else { return .cancelled }
+            guard !sessionGenerationChanged(from: expectedSessionGeneration) else { return .sessionGenerationChanged }
             guard hasUsablePerceptionFrame(
                 newerThan: frameBaseline,
                 expectedSessionGeneration: expectedSessionGeneration,
@@ -3123,6 +3240,9 @@ public final class MissionAgent {
             guard !sessionGenerationChanged(from: expectedSessionGeneration) else {
                 return .sessionGenerationChanged
             }
+            await perception.refreshDetections()
+            guard !missionCancellationDetected(missionID) else { return .cancelled }
+            guard !sessionGenerationChanged(from: expectedSessionGeneration) else { return .sessionGenerationChanged }
             guard hasUsablePerceptionFrame(
                 newerThan: frameBaseline,
                 expectedSessionGeneration: expectedSessionGeneration,
@@ -3457,7 +3577,7 @@ public final class MissionAgent {
         guard !Self.hasFollowUpIntent(missionUtterance), !Self.hasFollowUpIntent(plan ?? "") else {
             return false
         }
-        phase = .idle
+        setPhase(.idle, missionID: missionID)
         RuntimeFileLog.append("mission_target_navigation_done", fields: [
             "mission": "\(missionID)",
             "target": targetDescription(target)
@@ -3495,7 +3615,7 @@ public final class MissionAgent {
             return true
         }
 
-        phase = .idle
+        setPhase(.idle, missionID: missionID)
         plan = "Primary target reached; returned to mission start."
         RuntimeFileLog.append("mission_return_completed", fields: [
             "mission": "\(missionID)",
@@ -3557,7 +3677,7 @@ public final class MissionAgent {
                 "angle_deg": String(format: "%.0f", angle * 180 / .pi)
             ])
             switch await rotateForScanRespectingCancellation(
-                by: angle,
+                missionID: missionID, by: angle,
                 expectedSessionGeneration: expectedSessionGeneration
             ) {
             case .completed:
@@ -3591,26 +3711,18 @@ public final class MissionAgent {
     }
 
     private func rotateForScanRespectingCancellation(
+        missionID: Int,
         by angle: Double,
         expectedSessionGeneration: UInt64? = nil
     ) async -> ScanRotationOutcome {
+        guard !missionCancellationDetected(missionID) else {
+            cancelActiveMotion(missionID: missionID, reason: "cancelled_before_scan_rotation")
+            return .cancelled
+        }
         guard !sessionGenerationChanged(from: expectedSessionGeneration) else {
             motion.cancel()
             return .sessionGenerationChanged
         }
-        guard expectedSessionGeneration != nil else {
-            await withTaskCancellationHandler {
-                await motion.rotateForScan(by: angle)
-            } onCancel: {
-                Task { @MainActor [weak self] in
-                    self?.motion.cancel()
-                }
-            }
-            if Task.isCancelled { return .cancelled }
-            if case .failed(let reason) = motion.state { return .failed(reason) }
-            return .completed
-        }
-
         let race = ScanRotationRace()
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
@@ -3618,6 +3730,7 @@ public final class MissionAgent {
                     motion: motion,
                     topology: roomTopology,
                     expectedSessionGeneration: expectedSessionGeneration,
+                    ownsMotion: { [weak self] in self?.isCurrentMission(missionID) ?? false },
                     angle: angle,
                     continuation: continuation
                 )
@@ -3711,9 +3824,10 @@ public final class MissionAgent {
     }
 
     private func failReturnMission(missionID: Int, reason: String) {
+        guard isCurrentMission(missionID) else { return }
         motion.cancel()
         voice.speak(reason)
-        phase = .idle
+        setPhase(.idle, missionID: missionID)
         RuntimeFileLog.append("mission_motion_failed", fields: [
             "mission": "\(missionID)",
             "reason": reason
@@ -3725,13 +3839,14 @@ public final class MissionAgent {
     }
 
     private func failScanRotationMission(missionID: Int, reason: String) {
+        guard isCurrentMission(missionID) else { return }
         motion.cancel()
         voice.speak(reason)
         publishMissionTerminal(
             { .failed(id: $0, command: $1, message: reason) },
             missionID: missionID
         )
-        phase = .idle
+        setPhase(.idle, missionID: missionID)
         RuntimeFileLog.append("mission_target_scan_rotation_failed", fields: [
             "mission": "\(missionID)",
             "reason": reason,
@@ -3739,13 +3854,14 @@ public final class MissionAgent {
     }
 
     private func failTargetNavigationMission(missionID: Int, reason: String) {
+        guard isCurrentMission(missionID) else { return }
         motion.cancel()
         voice.speak(reason)
         publishMissionTerminal(
             { .failed(id: $0, command: $1, message: reason) },
             missionID: missionID
         )
-        phase = .idle
+        setPhase(.idle, missionID: missionID)
         RuntimeFileLog.append("mission_target_navigation_failed", fields: [
             "mission": "\(missionID)",
             "reason": reason,
@@ -3781,9 +3897,9 @@ public final class MissionAgent {
                 "goal_y": String(format: "%.2f", freshGoal.y)
             ])
             navigate(to: freshGoal, for: target)
-            await waitForMotionToSettle()
+            await waitForMotionToSettle(missionID: missionID)
             guard isCurrentMission(missionID) else {
-                phase = .idle
+                setPhase(.idle, missionID: missionID)
                 RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
                 return true
             }
@@ -3798,7 +3914,7 @@ public final class MissionAgent {
         case .notFound:
             motion.cancel()
             voice.speak("I couldn't find the target after looking around.")
-            phase = .idle
+            setPhase(.idle, missionID: missionID)
             RuntimeFileLog.append("mission_target_recovery_exhausted", fields: [
                 "mission": "\(missionID)",
                 "target": query
@@ -3810,12 +3926,12 @@ public final class MissionAgent {
             return true
 
         case .cancelled:
-            phase = .idle
+            setPhase(.idle, missionID: missionID)
             RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
             return true
 
         case .sessionGenerationChanged:
-            phase = .idle
+            setPhase(.idle, missionID: missionID)
             RuntimeFileLog.append("mission_cancelled", fields: [
                 "mission": "\(missionID)",
                 "reason": "session_generation_changed"
@@ -3857,6 +3973,7 @@ public final class MissionAgent {
             "state": motion.state.description
         ])
         while motion.state.isMotionActive {
+            if let missionID, !isCurrentMission(missionID) { return false }
             if sessionGenerationChanged(from: expectedSessionGeneration) {
                 await motion.stopAndWait()
                 return false
@@ -3883,6 +4000,7 @@ public final class MissionAgent {
                 return false
             }
         }
+        if let missionID, !isCurrentMission(missionID) { return false }
         if sessionGenerationChanged(from: expectedSessionGeneration) {
             await motion.stopAndWait()
             return false
@@ -3919,7 +4037,7 @@ public final class MissionAgent {
             }
             guard case .failed(let recoveryReason) = motion.state else { return false }
             voice.speak(recoveryReason)
-            phase = .idle
+            setPhase(.idle, missionID: missionID)
             RuntimeFileLog.append("mission_motion_failed", fields: [
                 "mission": "\(missionID)",
                 "reason": recoveryReason
@@ -3927,7 +4045,7 @@ public final class MissionAgent {
             return true
         }
         voice.speak(reason)
-        phase = .idle
+        setPhase(.idle, missionID: missionID)
         RuntimeFileLog.append("mission_motion_failed", fields: [
             "mission": "\(missionID)",
             "reason": reason
@@ -3972,6 +4090,7 @@ public final class MissionAgent {
                     motion: motion,
                     topology: roomTopology,
                     expectedSessionGeneration: expectedSessionGeneration,
+                    ownsMotion: { [weak self] in self?.isCurrentMission(missionID) ?? false },
                     missionIsCancelled: { [weak self] in
                         self?.missionCancellationDetected(missionID) ?? true
                     },
@@ -4167,6 +4286,8 @@ public final class MissionAgent {
             voice.speak("I can't follow anything right now.")
             return "follow → unavailable"
         }
+        await perception.refreshDetections()
+        guard isCurrentMission(missionID), !Task.isCancelled else { return nil }
         guard let resolved = followSpec(for: target) else {
             voice.speak("I couldn't tell who to follow.")
             return "follow → couldn't resolve target"
@@ -4299,20 +4420,28 @@ private final class BlockedHeadingRecoveryRace {
     private var continuation: CheckedContinuation<BlockedHeadingRecoveryRaceOutcome, Never>?
     private var tasks: [Task<Void, Never>] = []
     private weak var motion: RoverMotion?
+    private var ownsMotion: () -> Bool = { false }
 
     func start(
         motion: RoverMotion,
         topology: (any RoomTopologyManaging)?,
         expectedSessionGeneration: UInt64?,
+        ownsMotion: @escaping () -> Bool,
         missionIsCancelled: @escaping @MainActor () -> Bool,
         angle: Double,
         timeout: TimeInterval,
         continuation: CheckedContinuation<BlockedHeadingRecoveryRaceOutcome, Never>
     ) {
+        guard !Task.isCancelled, ownsMotion() else {
+            continuation.resume(returning: .cancelled)
+            return
+        }
         self.motion = motion
+        self.ownsMotion = ownsMotion
         self.continuation = continuation
         tasks = [
             Task { @MainActor in
+                guard ownsMotion() else { self.finish(.cancelled); return }
                 await motion.rotateForScan(by: angle)
                 self.finish(Task.isCancelled ? .cancelled : .completed)
             },
@@ -4322,19 +4451,19 @@ private final class BlockedHeadingRecoveryRace {
                 } catch {
                     return
                 }
-                motion.cancel()
+                if ownsMotion() { motion.cancel() }
                 self.finish(.timedOut)
             },
             Task { @MainActor in
                 while !Task.isCancelled {
                     if missionIsCancelled() {
-                        motion.cancel()
+                        if ownsMotion() { motion.cancel() }
                         self.finish(.cancelled)
                         return
                     }
                     if let expectedSessionGeneration,
                        topology?.snapshot.sessionGeneration != expectedSessionGeneration {
-                        motion.cancel()
+                        if ownsMotion() { motion.cancel() }
                         self.finish(.sessionGenerationChanged)
                         return
                     }
@@ -4349,7 +4478,8 @@ private final class BlockedHeadingRecoveryRace {
     }
 
     func cancel() {
-        motion?.cancel()
+        guard continuation != nil else { return }
+        if ownsMotion() { motion?.cancel() }
         finish(.cancelled)
     }
 
@@ -4368,18 +4498,26 @@ private final class ScanRotationRace {
     private var continuation: CheckedContinuation<ScanRotationOutcome, Never>?
     private var tasks: [Task<Void, Never>] = []
     private weak var motion: RoverMotion?
+    private var ownsMotion: () -> Bool = { false }
 
     func start(
         motion: RoverMotion,
         topology: (any RoomTopologyManaging)?,
         expectedSessionGeneration: UInt64?,
+        ownsMotion: @escaping () -> Bool,
         angle: Double,
         continuation: CheckedContinuation<ScanRotationOutcome, Never>
     ) {
+        guard !Task.isCancelled, ownsMotion() else {
+            continuation.resume(returning: .cancelled)
+            return
+        }
         self.motion = motion
+        self.ownsMotion = ownsMotion
         self.continuation = continuation
         tasks = [
             Task { @MainActor in
+                guard ownsMotion() else { self.finish(.cancelled); return }
                 await motion.rotateForScan(by: angle)
                 if Task.isCancelled {
                     self.finish(.cancelled)
@@ -4391,9 +4529,10 @@ private final class ScanRotationRace {
             },
             Task { @MainActor in
                 while !Task.isCancelled {
+                    guard ownsMotion() else { self.finish(.cancelled); return }
                     if let expectedSessionGeneration,
                        topology?.snapshot.sessionGeneration != expectedSessionGeneration {
-                        motion.cancel()
+                        if ownsMotion() { motion.cancel() }
                         self.finish(.sessionGenerationChanged)
                         return
                     }
@@ -4408,7 +4547,8 @@ private final class ScanRotationRace {
     }
 
     func cancel() {
-        motion?.cancel()
+        guard continuation != nil else { return }
+        if ownsMotion() { motion?.cancel() }
         finish(.cancelled)
     }
 

@@ -1,6 +1,9 @@
 import Foundation
 
 public enum RuntimeFileLog {
+    private static let writer = RuntimeLogWriter { count in
+        write("runtime_log_dropped", fields: ["count": String(count), "reason": "bounded_writer_overflow"], now: Date())
+    }
     public static let fileName = "phrover-runtime.log"
 
     public static var logFileURL: URL? {
@@ -9,6 +12,17 @@ public enum RuntimeFileLog {
     }
 
     public static func append(_ event: String, fields: [String: String] = [:], now: Date = Date()) {
+        writer.submit { write(event, fields: fields, now: now) }
+    }
+
+    public static func flush() async { await writer.flush() }
+
+    static func appendDeferred(_ event: String, now: Date,
+                               fields: @escaping @Sendable () -> [String: String]?) {
+        writer.submit { if let captured = fields() { write(event, fields: captured, now: now) } }
+    }
+
+    private static func write(_ event: String, fields: [String: String], now: Date) {
         guard let url = logFileURL else { return }
         let line = format(event, fields: fields, now: now)
         do {

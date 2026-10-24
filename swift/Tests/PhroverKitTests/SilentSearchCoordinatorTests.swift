@@ -1155,8 +1155,18 @@ final class SilentSearchCoordinatorTests: XCTestCase {
     func testManualClockResumesOnlyReachedDeadlinesAndSafetyStreamIsMulticast() async throws {
         let harness = SilentSearchTestHarness()
         var resumed: [String] = []
-        let first = Task { try await harness.clock.sleep(until: 10); resumed.append("first") }
-        let second = Task { try await harness.clock.sleep(until: 20); resumed.append("second") }
+        let firstResumed = expectation(description: "first clock deadline resumed")
+        let secondResumed = expectation(description: "second clock deadline resumed")
+        let first = Task {
+            try await harness.clock.sleep(until: 10)
+            resumed.append("first")
+            firstResumed.fulfill()
+        }
+        let second = Task {
+            try await harness.clock.sleep(until: 20)
+            resumed.append("second")
+            secondResumed.fulfill()
+        }
         let cancelled = Task {
             do {
                 try await harness.clock.sleep(until: 30)
@@ -1167,24 +1177,33 @@ final class SilentSearchCoordinatorTests: XCTestCase {
                 return false
             }
         }
+        defer { first.cancel(); second.cancel(); cancelled.cancel() }
         await eventually { Set(harness.clock.pendingDeadlines) == [10, 20, 30] }
         cancelled.cancel()
         let cancellationObserved = await cancelled.value
         XCTAssertTrue(cancellationObserved)
 
         harness.clock.advance(nanoseconds: 10)
-        await taskTurn()
+        await fulfillment(of: [firstResumed], timeout: 2)
         XCTAssertEqual(resumed, ["first"])
+        guard resumed.contains("first") else { return }
 
+        let subscribersReady = expectation(description: "both safety subscribers registered")
+        subscribersReady.expectedFulfillmentCount = 2
         let leftTask = Task {
             var iterator = harness.safety.events().makeAsyncIterator()
+            subscribersReady.fulfill()
             return await iterator.next()
         }
         let rightTask = Task {
             var iterator = harness.safety.events().makeAsyncIterator()
+            subscribersReady.fulfill()
             return await iterator.next()
         }
-        await taskTurn()
+        defer { leftTask.cancel(); rightTask.cancel() }
+        await fulfillment(of: [subscribersReady], timeout: 2)
+        XCTAssertEqual(harness.safety.consumerCount, 2)
+        guard harness.safety.consumerCount == 2 else { return }
         harness.safety.send(.operatorStop)
         let left = await leftTask.value
         let right = await rightTask.value
@@ -1192,6 +1211,8 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         XCTAssertEqual(right, .operatorStop)
 
         harness.clock.advance(nanoseconds: 10)
+        await fulfillment(of: [secondResumed], timeout: 2)
+        guard resumed.contains("second") else { return }
         _ = try await (first.value, second.value)
     }
 

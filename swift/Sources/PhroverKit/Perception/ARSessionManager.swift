@@ -20,6 +20,10 @@ public enum ARTrackingQuality: Equatable, Sendable {
     case normal
 }
 
+public enum ARDepthSource: String, Sendable {
+    case smoothedSceneDepth, sceneDepth
+}
+
 /// One coherent AR frame: image, camera, depth and pose captured together, so consumers
 /// that run asynchronously (Silent Search) never pair one frame's detections with another
 /// frame's camera or depth.
@@ -31,16 +35,23 @@ public struct ARFrameSnapshot: @unchecked Sendable {
     public let cameraIntrinsics: simd_float3x3
     public let imageResolution: CGSize
     public let depthMap: CVPixelBuffer?
+    public let depthConfidenceMap: CVPixelBuffer?
+    public let depthSource: ARDepthSource?
     public let pose: Pose2D
     public let trackingQuality: ARTrackingQuality
     /// Which way up `image` is (see `ARSessionManager.imageOrientation`).
     public let imageOrientation: CGImagePropertyOrientation
+    /// Floor estimate captured with this image for coherent non-LiDAR grounding.
+    public let floorHeight: Float?
 
     public init(id: ARFrameID, timestamp: TimeInterval, image: CVPixelBuffer,
                 cameraTransform: simd_float4x4, cameraIntrinsics: simd_float3x3,
                 imageResolution: CGSize, depthMap: CVPixelBuffer?, pose: Pose2D,
                 trackingQuality: ARTrackingQuality,
-                imageOrientation: CGImagePropertyOrientation = .right) {
+                depthConfidenceMap: CVPixelBuffer? = nil,
+                depthSource: ARDepthSource? = nil,
+                imageOrientation: CGImagePropertyOrientation = .right,
+                floorHeight: Float? = nil) {
         self.id = id
         self.timestamp = timestamp
         self.image = image
@@ -48,9 +59,12 @@ public struct ARFrameSnapshot: @unchecked Sendable {
         self.cameraIntrinsics = cameraIntrinsics
         self.imageResolution = imageResolution
         self.depthMap = depthMap
+        self.depthConfidenceMap = depthConfidenceMap
+        self.depthSource = depthSource
         self.pose = pose
         self.trackingQuality = trackingQuality
         self.imageOrientation = imageOrientation
+        self.floorHeight = floorHeight
     }
 }
 
@@ -84,13 +98,43 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     public private(set) var pose: Pose2D?
     public private(set) var meshAnchors: [ARMeshAnchor] = []
     /// Nearest obstacle distance (m) in a forward cone from the latest depth frame.
-    private(set) var latestDepthSafetySnapshot: DepthSafetySnapshot?
+    private(set) var latestDepthSafetySnapshot: DepthSafetySnapshot? {
+        didSet {
+            // Publication is synchronous with assignment, independent of pose
+            // delivery. Snapshot callbacks tolerate unsubscribe/revoke reentrancy.
+            let published = latestDepthSafetySnapshot
+            for observer in Array(depthSafetyObservers.values) { observer(published) }
+        }
+    }
+    @ObservationIgnored private var depthSafetyObservers: [UUID: (DepthSafetySnapshot?) -> Void] = [:]
+    private struct WeakSearchClearance { weak var value: FollowSearchClearanceGrant? }
+    @ObservationIgnored private var followSearchClearances: [WeakSearchClearance] = []
+
+    func registerFollowSearchClearance(_ grant: FollowSearchClearanceGrant) {
+        followSearchClearances.removeAll { $0.value == nil || $0.value?.revoked == true }
+        followSearchClearances.append(.init(value: grant))
+    }
+
+    private func revokeFollowSearchClearances() {
+        let grants = followSearchClearances.compactMap(\.value)
+        followSearchClearances.removeAll()
+        for grant in grants { grant.revoke(cause: .searchClearanceSourceInvalid, detail: "producer_invalidated") }
+    }
+
+    @ObservationIgnored private let depthProjection: @Sendable (DepthSafetyProcessor.Input) -> DepthSafetySnapshot
+    @ObservationIgnored private lazy var depthProcessor = DepthSafetyProcessor(evaluate: depthProjection) { [weak self] snapshot in
+        guard let self, self.acceptsObservations else { return }
+        self.latestDepthSafetySnapshot = snapshot
+        self.depthSnapshotVersion &+= 1
+    }
     public private(set) var depthSnapshotVersion: UInt64 = 0
     public var depthSnapshotTimestamp: TimeInterval? { latestDepthSafetySnapshot?.timestamp }
     public private(set) var trackingState: ARCamera.TrackingState = .notAvailable
     public private(set) var trackingQuality: ARTrackingQuality = .unavailable
     /// Latest coherent frame, `nil` until the first accepted frame after a reset.
     public private(set) var latestSnapshot: ARFrameSnapshot?
+    private(set) var sourceHighWater: FollowTurnSourceHighWater?
+    private var turnEvidence = FollowTurnPoseEvidenceArchive()
     private var snapshotContinuations: [UUID: AsyncStream<ARFrameSnapshot>.Continuation] = [:]
     private var lifecycleContinuations: [UUID: AsyncStream<ARSessionLifecycleEvent>.Continuation] = [:]
     private var hasResetTracking = false
@@ -107,6 +151,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     public var observationHandler: ((PoseObservation) -> Void)?
     public var onReset: ((UInt64) -> Void)?
     private var acceptsObservations = false
+    var acceptsFollowSearchClearance: Bool { acceptsObservations }
     private var lastObservationTimestamp: TimeInterval?
     nonisolated private let relativeHeadingStore = RelativeHeadingTrackerStore()
     private var loggedRelativeHeadingReliability: RelativeHeadingReliability = .unreliable(.notStarted)
@@ -169,6 +214,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     private var lastRejectedMeshLogAt = Date.distantPast
 
     public override init() {
+        depthProjection = DepthSafetyProcessor.project
         relativeHeadingTelemetry = { event, fields in
             RuntimeFileLog.append(event, fields: fields)
         }
@@ -176,7 +222,9 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         session.delegate = self
     }
 
-    init(relativeHeadingTelemetry: @escaping RoomTopologyTelemetrySink) {
+    init(relativeHeadingTelemetry: @escaping RoomTopologyTelemetrySink,
+         depthProjection: @escaping @Sendable (DepthSafetyProcessor.Input) -> DepthSafetySnapshot = DepthSafetyProcessor.project) {
+        self.depthProjection = depthProjection
         self.relativeHeadingTelemetry = relativeHeadingTelemetry
         super.init()
         session.delegate = self
@@ -284,6 +332,8 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     }
 
     func resetTracking(generation: UInt64, runSession: Bool) {
+        revokeFollowSearchClearances()
+        depthProcessor.invalidate()
         hasResetTracking = true
         acceptsObservations = false
         sessionGeneration = generation
@@ -300,6 +350,8 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         latestCamera = nil
         latestDepthMap = nil
         latestSnapshot = nil
+        sourceHighWater = nil
+        turnEvidence.clear()
         trackingQuality = .unavailable
         forwardClearance = .infinity
         onReset?(generation)
@@ -338,6 +390,10 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     }
 
     public func pause() {
+        acceptsObservations = false
+        revokeFollowSearchClearances()
+        depthProcessor.invalidate()
+        latestDepthSafetySnapshot = nil
         session.pause()
         motionManager.stopDeviceMotionUpdates()
     }
@@ -352,6 +408,11 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
                 Task { @MainActor in self?.snapshotContinuations.removeValue(forKey: id) }
             }
         }
+    }
+
+    /// Keep compact pose ingress evidence even when image consumers skip frames.
+    func turnPoseEvidence(from first: ARFrameID, through last: ARFrameID) -> [FollowTurnBurstPlanner.Sample]? {
+        turnEvidence.evidence(from: first, through: last)
     }
 
     /// Session resets, interruptions and failures, unbuffered-loss-free per subscriber.
@@ -372,15 +433,21 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     private func publishSnapshot(image: CVPixelBuffer, timestamp: TimeInterval,
                                  cameraTransform: simd_float4x4, intrinsics: simd_float3x3,
                                  imageResolution: CGSize, depthMap: CVPixelBuffer?,
-                                 trackingQuality: ARTrackingQuality) {
+                                 trackingQuality: ARTrackingQuality,
+                                 depthConfidenceMap: CVPixelBuffer? = nil,
+                                 depthSource: ARDepthSource? = nil) {
         guard let pose else { return }
         let snapshot = ARFrameSnapshot(
             id: ARFrameID(generation: sessionGeneration, sequence: frameSequence), timestamp: timestamp,
             image: image, cameraTransform: cameraTransform, cameraIntrinsics: intrinsics,
             imageResolution: imageResolution, depthMap: depthMap, pose: pose,
-            trackingQuality: trackingQuality, imageOrientation: imageOrientation
+            trackingQuality: trackingQuality, depthConfidenceMap: depthConfidenceMap,
+            depthSource: depthSource, imageOrientation: imageOrientation, floorHeight: floorHeight
         )
         latestSnapshot = snapshot
+        turnEvidence.record(.init(snapshot: snapshot), at: ProcessInfo.processInfo.systemUptime)
+        sourceHighWater = .init(frameID: snapshot.id, sourceTimestamp: timestamp.isFinite
+            ? max(sourceHighWater?.sourceTimestamp ?? timestamp, timestamp) : sourceHighWater?.sourceTimestamp)
         self.trackingQuality = trackingQuality
         for continuation in snapshotContinuations.values { continuation.yield(snapshot) }
     }
@@ -404,6 +471,21 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         depthSnapshotVersion &+= 1
     }
 
+    func enqueueDepthSafety(rawDepthMap: CVPixelBuffer,
+                            intrinsics: simd_float3x3,
+                            intrinsicsImageSize: CGSize? = nil,
+                            cameraTransform: simd_float4x4,
+                            timestamp: TimeInterval) {
+        depthProcessor.submit(.init(rawDepthMap: rawDepthMap, intrinsics: intrinsics,
+            imageResolution: intrinsicsImageSize, cameraTransform: cameraTransform, timestamp: timestamp))
+    }
+
+    func observeDepthSafety(_ observer: @escaping (DepthSafetySnapshot?) -> Void) -> () -> Void {
+        let id = UUID()
+        depthSafetyObservers[id] = observer
+        return { [weak self] in self?.depthSafetyObservers.removeValue(forKey: id) }
+    }
+
     func depthSafetyObservation(
         for command: WheelCommand,
         at timestamp: TimeInterval = ProcessInfo.processInfo.systemUptime
@@ -418,7 +500,8 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         return DepthSafetyEvaluator.evaluate(
             latestDepthSafetySnapshot,
             command: command,
-            now: timestamp
+            now: timestamp,
+            operatorClearedRotation: FollowSearchRotationScope.authorized
         )
     }
 
@@ -441,7 +524,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
             RuntimeFileLog.append("image_orientation", fields: ["exif": "\(orientation.rawValue)"])
         }
         if let rawDepth = frame.sceneDepth {
-            ingestDepthSafety(
+            enqueueDepthSafety(
                 rawDepthMap: rawDepth.depthMap,
                 intrinsics: frame.camera.intrinsics,
                 intrinsicsImageSize: frame.camera.imageResolution,
@@ -449,9 +532,11 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
                 timestamp: frame.timestamp
             )
         } else {
+            depthProcessor.invalidate()
             latestDepthSafetySnapshot = nil
         }
-        if let depth = frame.smoothedSceneDepth ?? frame.sceneDepth {
+        let depth = frame.smoothedSceneDepth ?? frame.sceneDepth
+        if let depth {
             forwardClearance = Self.forwardClearance(from: depth)
             latestDepthMap = depth.depthMap
         } else {
@@ -461,7 +546,10 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         publishSnapshot(image: frame.capturedImage, timestamp: frame.timestamp,
                         cameraTransform: frame.camera.transform, intrinsics: frame.camera.intrinsics,
                         imageResolution: frame.camera.imageResolution, depthMap: latestDepthMap,
-                        trackingQuality: Self.arTrackingQuality(trackingQuality))
+                        trackingQuality: Self.arTrackingQuality(trackingQuality),
+                        depthConfidenceMap: depth?.confidenceMap,
+                        depthSource: frame.smoothedSceneDepth != nil ? .smoothedSceneDepth
+                            : (depth != nil ? .sceneDepth : nil))
     }
 
     @discardableResult
@@ -472,6 +560,9 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
               lastObservationTimestamp.map({ observation.timestamp > $0 }) ?? true else {
             return false
         }
+        let observedAt = ProcessInfo.processInfo.systemUptime
+        for grant in followSearchClearances.compactMap(\.value) { grant.observeIngress(observation, now: observedAt) }
+        followSearchClearances.removeAll { $0.value == nil || $0.value?.revoked == true }
         latestObservation = observation
         lastObservationTimestamp = observation.timestamp
         pose = observation.pose
@@ -482,6 +573,9 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     }
 
     private func suspendObservations() {
+        revokeFollowSearchClearances()
+        depthProcessor.invalidate()
+        turnEvidence.clear()
         acceptsObservations = false
         planningReadinessTracker.suspend()
         pose = nil
@@ -529,7 +623,10 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     func ingestForTesting(image: CVPixelBuffer, timestamp: TimeInterval,
                           cameraTransform: simd_float4x4, intrinsics: simd_float3x3,
                           imageResolution: CGSize, depthMap: CVPixelBuffer?,
-                          trackingQuality: ARTrackingQuality) {
+                          trackingQuality: ARTrackingQuality,
+                          depthConfidenceMap: CVPixelBuffer? = nil,
+                          depthSource: ARDepthSource? = nil,
+                          imageOrientation: CGImagePropertyOrientation? = nil) {
         // Silent Search's fixtures feed a never-started manager at generation 0; outside
         // tests, observations are only accepted after `start()`/`resetTracking`.
         if !hasResetTracking { acceptsObservations = true }
@@ -546,11 +643,13 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
             sessionGeneration: sessionGeneration
         )) else { return }
         latestPixelBuffer = image
+        if let imageOrientation { self.imageOrientation = imageOrientation }
         latestDepthMap = depthMap
         forwardClearance = depthMap.map(Self.forwardClearance(fromDepthMap:)) ?? .infinity
         publishSnapshot(image: image, timestamp: timestamp, cameraTransform: cameraTransform,
                         intrinsics: intrinsics, imageResolution: imageResolution, depthMap: depthMap,
-                        trackingQuality: trackingQuality)
+                        trackingQuality: trackingQuality, depthConfidenceMap: depthConfidenceMap,
+                        depthSource: depthSource)
     }
 
     func interruptionBeganForTesting() { sessionWasInterrupted(session) }
@@ -575,6 +674,21 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     public func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
         collectMesh(anchors)
         collectFloor(anchors)
+    }
+
+    public func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
+        let retired = Set(anchors.map(\.identifier))
+        let previousCount = meshAnchors.count
+        meshAnchors.removeAll { retired.contains($0.identifier) }
+        if meshAnchors.count != previousCount {
+            // Removal is valid even during tracking loss. It is not a new trusted
+            // geometry observation and must not satisfy a recovery refresh gate.
+            RuntimeFileLog.append("nav_mesh_removed", fields: [
+                "removed_count": String(previousCount - meshAnchors.count),
+                "remaining_count": String(meshAnchors.count),
+                "session_generation": String(sessionGeneration)
+            ])
+        }
     }
 
     private func collectFloor(_ anchors: [ARAnchor]) {
@@ -646,15 +760,42 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
                               cameraTransform: snapshot.cameraTransform, depth: depth)
     }
 
-    public func unproject(normalizedPoint: CGPoint) -> Vec2? {
-        guard let camera = latestCamera, let depthMap = latestDepthMap else { return nil }
-        let imageSize = camera.imageResolution // raw (landscape) sensor pixel space, matches `intrinsics`
-        guard let depth = Self.sampleDepth(depthMap, atVisionNormalizedPoint: normalizedPoint,
-                                           imageSize: imageSize, orientation: imageOrientation) else {
-            return nil
+    nonisolated public static func unproject(normalizedBoundingBox: CGRect, fallbackPoint: CGPoint,
+                                           in snapshot: ARFrameSnapshot) -> Vec2? {
+        guard let depthMap = snapshot.depthMap else { return nil }
+        guard let sample = sampleObjectDepth(depthMap, inVisionNormalizedBoundingBox: normalizedBoundingBox,
+            imageSize: snapshot.imageResolution, orientation: snapshot.imageOrientation) else {
+            return unproject(normalizedPoint: fallbackPoint, in: snapshot)
         }
-        return Self.unprojectPoint(normalizedPoint, imageSize: imageSize, orientation: imageOrientation,
-                                   intrinsics: camera.intrinsics, cameraTransform: camera.transform, depth: depth)
+        return unprojectPoint(sample.point, imageSize: snapshot.imageResolution,
+            orientation: snapshot.imageOrientation, intrinsics: snapshot.cameraIntrinsics,
+            cameraTransform: snapshot.cameraTransform, depth: sample.depth)
+    }
+
+    public static func groundPoint(boundingBox box: CGRect, label: String,
+                                   in snapshot: ARFrameSnapshot) -> Vec2? {
+        if snapshot.depthMap != nil {
+            return unproject(normalizedBoundingBox: box, fallbackPoint: CGPoint(x: box.midX, y: box.midY), in: snapshot)
+        }
+        if let floorHeight = snapshot.floorHeight {
+            let ray = cameraRay(through: CGPoint(x: box.midX, y: box.minY), imageSize: snapshot.imageResolution,
+                orientation: snapshot.imageOrientation, intrinsics: snapshot.cameraIntrinsics,
+                cameraTransform: snapshot.cameraTransform)
+            if let hit = floorIntersection(origin: ray.origin, direction: ray.direction, floorY: floorHeight) {
+                return Vec2(Double(hit.x), Double(hit.z))
+            }
+        }
+        guard MissionAgent.visualQueryMatchScore(query: "person", label: label) > 0,
+              let depth = depthFromApparentHeight(box, imageSize: snapshot.imageResolution,
+                orientation: snapshot.imageOrientation, intrinsics: snapshot.cameraIntrinsics) else { return nil }
+        return unprojectPoint(CGPoint(x: box.midX, y: box.midY), imageSize: snapshot.imageResolution,
+            orientation: snapshot.imageOrientation, intrinsics: snapshot.cameraIntrinsics,
+            cameraTransform: snapshot.cameraTransform, depth: Float(depth))
+    }
+
+    public func unproject(normalizedPoint: CGPoint) -> Vec2? {
+        guard let snapshot = latestSnapshot else { return nil }
+        return Self.unproject(normalizedPoint: normalizedPoint, in: snapshot)
     }
 
     /// Where a detected object stands on the nav plane. With LiDAR, the nearest supported

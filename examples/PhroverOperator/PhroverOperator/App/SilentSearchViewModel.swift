@@ -755,7 +755,7 @@ final class LiveSilentSearchSafetyMonitor: SilentSearchSafetyMonitoring {
                     guard case let .failed(failure) = state else { continue }
                     switch failure {
                     case .commsLost, .commandFailed: yield(.transportFailed)
-                    case .obstacle, .tipping, .stalled: yield(.reactiveSafetyFailed)
+                    case .obstacle, .depthUnavailable, .tipping, .stalled: yield(.reactiveSafetyFailed)
                     case .noPose, .noPath, .pathRejected, .trackingLost, .cancelled, .rotationResolutionInsufficient: break
                     }
                 }

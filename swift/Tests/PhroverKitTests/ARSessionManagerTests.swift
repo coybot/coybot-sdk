@@ -8,6 +8,110 @@ import Observation
 
 @MainActor
 final class ARSessionManagerTests: XCTestCase {
+    func testClearanceRevocationSurvivesOverwrittenIngressBeforeConsumptionAndDuringPause() throws {
+        for consumedBeforeIngress in [false, true] {
+            for invalidTracking in [false, true] {
+                let ar = ARSessionManager()
+                ar.resetTracking(generation: 1, runSession: false)
+                let image = makeImage()
+                let now = ProcessInfo.processInfo.systemUptime - 0.01
+                func publish(_ offset: Float, _ quality: ARTrackingQuality, _ sequence: Double) {
+                    var transform = matrix_identity_float4x4
+                    transform.columns.3.x = offset
+                    ar.ingestForTesting(image: image, timestamp: now + sequence * 0.001,
+                        cameraTransform: transform, intrinsics: matrix_identity_float3x3,
+                        imageResolution: CGSize(width: 2, height: 2), depthMap: nil, trackingQuality: quality)
+                }
+                publish(0, .normal, 0)
+                let confirmation = try XCTUnwrap(ar.confirmInitialFollowSearchClearance())
+                let earlyGrant = consumedBeforeIngress ? confirmation.consume(session: 1) : nil
+                // No consumer may drain between the bad capture and the healthy
+                // origin replacement. AR producer evidence must retain the veto.
+                publish(invalidTracking ? 0 : 0.21, invalidTracking ? .limited : .normal, 1)
+                publish(0, .normal, 2)
+                let grant = try XCTUnwrap(earlyGrant ?? confirmation.consume(session: 1))
+                XCTAssertTrue(grant.revoked, "Ingress history lost: consumed=\(consumedBeforeIngress), tracking=\(invalidTracking)")
+                XCTAssertFalse(grant.validate(sample: ar.latestSnapshot.map(NavigationPoseSample.init(snapshot:)),
+                    session: 1, now: ProcessInfo.processInfo.systemUptime), "Returning to origin cannot restore clearance")
+            }
+        }
+    }
+
+    func testTwentyCentimeterFloatIngressRetainsGrantUntilBeyondBoundary() throws {
+        let ar = ARSessionManager()
+        ar.resetTracking(generation: 1, runSession: false)
+        let image = makeImage()
+        let now = ProcessInfo.processInfo.systemUptime - 0.01
+        func publish(_ offset: Float, _ step: Double) {
+            var transform = matrix_identity_float4x4
+            transform.columns.3.x = offset
+            ar.ingestForTesting(image: image, timestamp: now + step * 0.001,
+                cameraTransform: transform, intrinsics: matrix_identity_float3x3,
+                imageResolution: CGSize(width: 2, height: 2), depthMap: nil, trackingQuality: .normal)
+        }
+        publish(0, 0)
+        let confirmation = try XCTUnwrap(ar.confirmInitialFollowSearchClearance())
+        let grant = try XCTUnwrap(confirmation.consume(session: 1))
+        publish(0.20, 1)
+        XCTAssertFalse(grant.revoked)
+        publish(0.20001, 2)
+        XCTAssertTrue(grant.revoked)
+        publish(0, 3)
+        XCTAssertEqual(grant.revocationCause, .searchClearanceSpaceExceeded)
+    }
+
+    func testClearanceRevokesSynchronouslyOnProducerLifecycleBeforeConsumption() throws {
+        for lifecycle in 0..<3 {
+            let ar = ARSessionManager()
+            ar.resetTracking(generation: 1, runSession: false)
+            ar.ingestForTesting(image: makeImage(), timestamp: ProcessInfo.processInfo.systemUptime,
+                cameraTransform: matrix_identity_float4x4, intrinsics: matrix_identity_float3x3,
+                imageResolution: CGSize(width: 2, height: 2), depthMap: nil, trackingQuality: .normal)
+            let confirmation = try XCTUnwrap(ar.confirmInitialFollowSearchClearance())
+            switch lifecycle {
+            case 0: ar.pause()
+            case 1: ar.resetTracking(generation: 2, runSession: false)
+            default: ar.interruptionBeganForTesting()
+            }
+            XCTAssertTrue(try XCTUnwrap(confirmation.consume(session: 1)).revoked)
+            XCTAssertNil(ar.confirmInitialFollowSearchClearance(), "Suspended producer cannot mint another assertion from cached pose")
+        }
+    }
+
+    func testProducerClearanceRegistryDoesNotRetainDiscardedConfirmation() throws {
+        let ar = ARSessionManager()
+        ar.resetTracking(generation: 1, runSession: false)
+        ar.ingestForTesting(image: makeImage(), timestamp: ProcessInfo.processInfo.systemUptime,
+            cameraTransform: matrix_identity_float4x4, intrinsics: matrix_identity_float3x3,
+            imageResolution: CGSize(width: 2, height: 2), depthMap: nil, trackingQuality: .normal)
+        var confirmation = try XCTUnwrap(ar.confirmInitialFollowSearchClearance()) as FollowSearchClearanceConfirmation?
+        weak let grant = confirmation?.consume(session: 1)
+        XCTAssertNotNil(grant)
+        confirmation = nil
+        XCTAssertNil(grant, "AR must not retain discarded or completed grants")
+    }
+
+    func testDepthPublicationAllowsReentrantUnsubscribeAndReleasesObserver() {
+        let ar = ARSessionManager()
+        var callbacks = 0
+        var owner: NSObject? = NSObject()
+        weak let retained = owner
+        var remove: (() -> Void)?
+        remove = ar.observeDepthSafety { [owner] _ in
+            _ = owner
+            callbacks += 1
+            remove?()
+        }
+        owner = nil
+        XCTAssertNotNil(retained)
+        ar.pause() // The real producer invalidation publishes nil synchronously.
+        XCTAssertEqual(callbacks, 1)
+        XCTAssertNil(retained)
+        ar.pause()
+        XCTAssertEqual(callbacks, 1)
+        remove = nil
+    }
+
     func testRetiredMeshAnchorsAreRemovedEvenWhenTrackingIsLimited() throws {
         let ar = ARSessionManager()
         ar.resetTracking(generation: 1, runSession: false)

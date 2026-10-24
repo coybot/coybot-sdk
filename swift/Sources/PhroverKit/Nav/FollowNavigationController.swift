@@ -45,7 +45,8 @@ final class FollowNavigationController {
     private var pendingFollowTurnBurstDrain: FollowTurnBurstDrain?
     var followTurnBurstPendingStatus: FollowTurnBurstPendingStatus? { pendingFollowTurnBurst?.status }
     private let depthSafetyObservation: (WheelCommand) -> DepthSafetyObservation
-    private struct DepthSafetyStop: Error {}
+    private let observeDepthSafety: ((@escaping (DepthSafetySnapshot?) -> Void) -> (() -> Void))?
+    private struct DepthSafetyStop: Error { let failure: NavigationFailure }
     private let currentForwardClearance: () -> Double
     private let makePlan: (Vec2, Vec2) -> [Vec2]?
     private let readySignalCostmap: (@MainActor (Vec2) async -> Costmap?)?
@@ -78,6 +79,8 @@ final class FollowNavigationController {
     private var replanCounter = 0
     private var activePolicy: (any PathAdmissibilityPolicy)?
     private var safetyStateContinuations: [UUID: AsyncStream<NavigationSafetyState>.Continuation] = [:]
+    private var depthRecoverySession: UInt64 = 0
+    private var depthRecoveryAttempts = 0
     private var nextFollowOperationID: UInt64 = 0
     private var activeFollowEvidence: FollowMotionOperationEvidence?
     private var terminalFollowEvidence: FollowMotionOperationEvidence?
@@ -100,6 +103,12 @@ final class FollowNavigationController {
     }
 
     func performFollowMotion(_ request: FollowMotionRequest, context: FollowMotionRequestContext?) async -> FollowMotionResult {
+        // Session identity is monotonic. Operation/reacquisition churn cannot
+        // replenish the finite recovery allowance, nor can an old session.
+        if let session = context?.sessionGeneration, session > depthRecoverySession {
+            depthRecoverySession = session
+            depthRecoveryAttempts = 0
+        }
         nextFollowOperationID &+= 1 // Controller-owned identity reserved before the first suspension.
         let captured = FollowMotionOperationContext(request: context, controllerOperationID: nextFollowOperationID,
             purpose: request.purpose, profile: (request.purpose == .followScan || request.purpose == .followAlignment)
@@ -156,7 +165,7 @@ final class FollowNavigationController {
                 }
                 let terminal = evidence.result(result) // Freeze before clearing ownership or returning.
                 evidence.scanTrace?.emit("operation_complete", evidence: evidence, latch: stopUnconfirmed,
-                    outcome: result == .arrived ? "completed" : (result == .cancelled ? "cancelled" : "failed"))
+                    outcome: result == .arrived ? "completed" : (result == .reobservationRequired ? "reobservation_required" : (result == .cancelled ? "cancelled" : "failed")))
                 if activeFollowEvidence === evidence {
                     activeFollowEvidence = nil
                     terminalFollowEvidence = evidence
@@ -241,6 +250,7 @@ final class FollowNavigationController {
         }
         currentForwardClearance = { ar.forwardClearance }
         self.depthSafetyObservation = depthSafetyObservation ?? { ar.depthSafetyObservation(for: $0) }
+        self.observeDepthSafety = { ar.observeDepthSafety($0) }
         makePlan = { start, goal in
             let costmap = CostmapBuilder.build(from: ar.meshAnchors, center: start)
             return planner.plan(from: start, to: goal, in: costmap)
@@ -261,6 +271,7 @@ final class FollowNavigationController {
     init(currentPose: @escaping () -> Pose2D?,
          forwardClearance: @escaping () -> Double,
          depthSafetyObservation: ((WheelCommand) -> DepthSafetyObservation)? = nil,
+         observeDepthSafety: ((@escaping (DepthSafetySnapshot?) -> Void) -> (() -> Void))? = nil,
          plan: @escaping (Vec2, Vec2) -> [Vec2]?,
          readySignalCostmap: (@MainActor (Vec2) async -> Costmap?)? = nil,
          lastAckAt: @escaping () async -> Date?,
@@ -288,6 +299,7 @@ final class FollowNavigationController {
         self.sourceHealth = sourceHealth
         self.turnPoseEvidence = turnPoseEvidence
         self.currentForwardClearance = forwardClearance
+        self.observeDepthSafety = observeDepthSafety
         // Legacy fixtures supply scalar clearance; production always uses AR depth provenance.
         self.depthSafetyObservation = depthSafetyObservation ?? { command in
             .init(state: .clear, clearance: forwardClearance(), supportCount: 0, sampleAge: 0,
@@ -681,7 +693,7 @@ final class FollowNavigationController {
                     sendValidUntil: validUntil)
                 guard operationGeneration == ownedGeneration, !Task.isCancelled,
                       FollowMotionTaskScope.evidence?.fenced != true, !stopUnconfirmed, recoveryAuthorized else { return .cancelled }
-                if pulse.send.result.failure is DepthSafetyStop { return .failed(.obstacle) }
+                if let denial = pulse.send.result.failure as? DepthSafetyStop { return .failed(denial.failure) }
                 if pulse.send.result.failure != nil { return .failed(.commandFailed) }
                 let pulseReturnUptime = sourceNow()
                 let pulseReturnedElapsed = now().timeIntervalSince(started)
@@ -924,6 +936,7 @@ final class FollowNavigationController {
                 }
             }
             defer { self.followTurnSourceObservers.removeValue(forKey: progressObserver) }
+            var depthWaitSpent = false
             var bracket: FollowTurnResponseBracket?
             let bracketObserver = UUID()
             defer { self.followTurnSourceObservers.removeValue(forKey: bracketObserver) }
@@ -953,12 +966,47 @@ final class FollowNavigationController {
                 burst: { command, budget, _, boundary, plannedSource in
                     guard self.operationGeneration == owner, evidence?.fenced != true, !Task.isCancelled,
                           self.recoveryAuthorized, !self.stopUnconfirmed else { throw CancellationError() }
-                      guard let start = self.followTurnSourceGate.latest else { throw CancellationError() }
-                     guard start.pose?.yaw == plannedSource.pose?.yaw else {
-                         evidence?.recordCommandReceipt(.init(httpStatus: nil, acknowledged: false,
-                             acknowledgementUTC: nil, attempts: 0, outcome: "fenced"))
-                         throw FollowTurnBurstTransportDenial.fenced
-                     }
+                    let previouslyWaitedForDepth = depthWaitSpent
+                    let prepared = try await self.prepareFollowTurnDepth(command, runtime: runtime, owner: owner,
+                        evidence: evidence, waitSpent: &depthWaitSpent)
+                    guard self.operationGeneration == owner, evidence?.fenced != true, !Task.isCancelled,
+                          self.recoveryAuthorized, !self.stopUnconfirmed else { throw CancellationError() }
+                    guard let start = self.followTurnSourceGate.latest else { throw CancellationError() }
+                    if start.pose?.yaw != plannedSource.pose?.yaw {
+                        if depthWaitSpent && !previouslyWaitedForDepth { throw FollowTurnPreparationError.replan }
+                        evidence?.recordCommandReceipt(.init(httpStatus: nil, acknowledged: false,
+                            acknowledgementUTC: nil, attempts: 0, outcome: "fenced"))
+                        throw FollowTurnBurstTransportDenial.fenced
+                    }
+                    if prepared.arc {
+                        guard let baseline = start.pose else { throw CancellationError() }
+                        // Charge before any suspension; denied/uncertain requests
+                        // never refund a reservation and permit unlimited creeping.
+                        self.depthRecoveryAttempts += 1
+                        let excursionObserver = UUID()
+                        @MainActor func checkExcursion(_ sample: NavigationPoseSample) {
+                            guard self.operationGeneration == owner, evidence?.fenced != true,
+                                  let pose = sample.pose else { return }
+                            if pose.position.distance(to: baseline.position) > 0.12 ||
+                               abs(FollowReacquisitionPlanner.wrap(pose.yaw - baseline.yaw)) > 0.35 {
+                                evidence?.recordFailure(.depthUnavailable(.blindSweptVolume), cause: .depthRecoveryExcursion)
+                                runtime.fail(.depthUnavailable(.blindSweptVolume))
+                                self.pendingFollowTurnBurst?.inhibit(at: self.sourceNow())
+                            }
+                        }
+                        self.followTurnSourceObservers[excursionObserver] = checkExcursion
+                        defer { self.followTurnSourceObservers.removeValue(forKey: excursionObserver) }
+                        var receipt = try await self.executeFollowTurnBurst(prepared.command, requestedBudget: 0.080,
+                            purpose: purpose, runtime: runtime, plannedYaw: start.pose?.yaw)
+                        if let latest = self.followTurnSourceGate.latest { checkExcursion(latest) }
+                        receipt.requiresReobservation = true
+                        // Earlier pure-turn bursts in this operation are not a
+                        // calibration/sweep completion for the translating outcome.
+                        evidence?.measuredScanResponse = nil
+                        evidence?.searchSweepProgress = nil
+                        evidence?.searchSweepTravel = nil
+                        return receipt
+                    }
                      if let evidence {
                          let snapshot = runtime.progress.watchdog.diagnosticSnapshot(
                              distanceToGoal: runtime.progress.distanceToGoal, now: self.now())
@@ -1186,8 +1234,9 @@ final class FollowNavigationController {
             // Losing its captured owner still interrupts the old response; only
             // the replacing serialized confirmation can decide the new latch.
             let interrupted = Task.isCancelled || (operationGeneration != owner && evidence?.fenced == true)
-            if origin == "pulse", !interrupted {
-                // Same pulse-stop latch rule; capture before emitting the response.
+            if origin == "pulse" || origin == "cleanup", operationGeneration == owner, !interrupted {
+                // An owned cleanup failure has the same stop obligation as a pulse.
+                // A stale operation cannot latch or publish over its replacement.
                 stopUnconfirmed = true
                 evidence?.recordStop(.failed)
             }
@@ -1265,7 +1314,13 @@ final class FollowNavigationController {
         guard !Task.isCancelled, operationGeneration == owner, evidence?.fenced != true,
               !stopUnconfirmed, recoveryAuthorized else { return false }
         runtime.expire(at: now())
-        guard runtime.failure == nil else { return false }
+        if let failure = runtime.failure {
+            evidence?.recordFailure(failure)
+            return false
+        }
+        guard validateSearchClearance(evidence?.context.request, evidence: evidence) else {
+            runtime.fail(.depthUnavailable(.blindSweptVolume)); return false
+        }
         guard let sample = followTurnSourceGate.latest else { runtime.failTracking("missing_source"); return false }
         if let rejection = sample.rejection(at: sourceNow(), expectedGeneration: runtime.generation, requireEnriched: true) {
             runtime.failTracking(rejection)
@@ -1284,8 +1339,16 @@ final class FollowNavigationController {
         if let health = sourceHealth?(), health.trackingQuality != .normal || health.generation != runtime.generation {
             runtime.fail(.trackingLost); return false
         }
+        let validationDate = now()
+        if runtime.requiresKnownAck {
+            guard let ack = runtime.lastAck else { runtime.fail(.commsLost); return false }
+            let age = validationDate.timeIntervalSince(ack)
+            guard age.isFinite, age >= 0, age <= guardLayer.watchdogTimeout else {
+                runtime.fail(.commsLost); return false
+            }
+        }
         switch guardLayer.evaluate(forwardClearance: currentForwardClearance(), lastAckAt: runtime.lastAck,
-            now: now(), feedback: nil, requireFreshAck: requireFreshAck ?? runtime.progress.hasSentCommand,
+            now: validationDate, feedback: nil, requireFreshAck: requireFreshAck ?? runtime.progress.hasSentCommand,
             checkForwardObstacle: false) {
         case .go: return true
         case .stopCommsLost: runtime.fail(.commsLost)
@@ -1518,7 +1581,11 @@ final class FollowNavigationController {
                               plannedYaw: Double? = nil, sendValidUntil: Double? = nil) async -> FollowTurnBurstSendReceipt {
         let owner = operationGeneration
         let evidence = FollowMotionTaskScope.evidence
-        let requireFreshAckForSend = runtime?.progress.hasSentCommand ?? false
+        let bypassInitialSearchDepth = permitsInitialSearchDepthBypass(command, purpose: purpose, evidence: evidence)
+        let isRecoveryArc = (purpose == .followScan || purpose == .followAlignment) &&
+            command.left > 0 && command.right > 0
+        if isRecoveryArc { runtime?.requiresKnownAck = true }
+        let requireFreshAckForSend = isRecoveryArc || (runtime?.progress.hasSentCommand ?? false)
         if let runtime, !validateFollowTurnRuntime(runtime, owner: owner, evidence: evidence) {
             let entry = sourceNow()
             return .init(sendEntryUptime: entry, deadline: entry + requestedBudget, responseUptime: entry,
@@ -1526,6 +1593,7 @@ final class FollowNavigationController {
         }
         var entry = sourceNow()
         var deadline = entry + requestedBudget
+        var depthValidUntil = Double.infinity
         guard pendingFollowTurnBurst == nil else {
             return .init(sendEntryUptime: entry, deadline: deadline, responseUptime: entry,
                 result: .init(receipt: .init(httpStatus: nil, acknowledged: false, acknowledgementUTC: nil,
@@ -1540,6 +1608,38 @@ final class FollowNavigationController {
                 stopObligation: false)
         }
         let fence = FollowTurnBurstFence()
+        let grant = evidence?.context.request?.searchClearance
+        let grantObserver = UUID()
+        grant?.revocationObservers[grantObserver] = { [weak grant] in
+            if let failure = runtime?.failure { evidence?.recordFailure(failure) }
+            if let grant { self.recordSearchClearanceRejection(grant, evidence: evidence) }
+            fence.inhibit(at: self.sourceNow())
+        }
+        defer { grant?.revocationObservers.removeValue(forKey: grantObserver) }
+        // Raw projection completes independently of pose callbacks. Subscribe
+        // before arming; new hazards may only revoke this immutable fence, never
+        // refresh the original depth/clearance expiry or reauthorize a veto.
+        let removeDepthObserver: (() -> Void)? = (grant == nil || bypassInitialSearchDepth) ? nil : observeDepthSafety? { snapshot in
+            guard self.operationGeneration == owner, evidence?.fenced != true else { return }
+            let observation = snapshot.map { DepthSafetyEvaluator.evaluate($0, command: command,
+                now: self.sourceNow(), operatorClearedRotation: true) }
+                ?? .unavailable(.missingRawDepth, sampleAge: .infinity, motionClass: .classify(command))
+            guard case .allow(let accepted, _) = self.guardLayer.evaluate(command: command, depthSafety: observation),
+                  accepted == command else {
+                let failure: NavigationFailure
+                switch observation.state {
+                case .stop: failure = .obstacle
+                case .unavailable(let reason): failure = .depthUnavailable(reason)
+                case .caution: failure = .obstacle
+                case .clear: failure = .depthUnavailable(.malformedDepth)
+                }
+                evidence?.recordFailure(failure)
+                runtime?.fail(failure)
+                fence.inhibit(at: self.sourceNow())
+                return
+            }
+        }
+        defer { removeDepthObserver?() }
         let arming = FollowTurnBurstArming()
         evidence?.burstTrace?.prepareSender(budget: requestedBudget, uptime: entry, settleWait: runtime?.settleWait ?? 0.300)
         let drain = FollowTurnBurstDrain()
@@ -1575,7 +1675,9 @@ final class FollowNavigationController {
                 requireFreshAck: requireFreshAckForSend) { return false }
             let time = self.sourceNow()
             let date = self.now()
-            var expiry = sendValidUntil ?? .infinity
+            guard self.validateSearchClearance(evidence?.context.request, evidence: evidence) else { return false }
+            var expiry = min(sendValidUntil ?? .infinity, depthValidUntil)
+            if let grant { expiry = min(expiry, grant.expiresAt) }
             if let runtime {
                 guard let timestamp = self.followTurnSourceGate.latest?.sourceTimestamp else { return false }
                 expiry = min(expiry, (timestamp + 0.500).nextUp)
@@ -1602,7 +1704,28 @@ final class FollowNavigationController {
         let observerID = UUID()
         if observation != nil {
             followTurnSourceObservers[observerID] = { sample in
+                if let grant, let request = evidence?.context.request {
+                    guard grant.validate(sample: sample, session: request.sessionGeneration, now: self.sourceNow()) else {
+                        fence.inhibit(at: self.sourceNow()); return
+                    }
+                }
                 guard arming.epoch != nil else { return }
+                if grant != nil && !bypassInitialSearchDepth {
+                    let freshDepth = FollowSearchRotationScope.$authorized.withValue(true) { self.depthSafetyObservation(command) }
+                    guard case .allow(let accepted, _) = self.guardLayer.evaluate(command: command, depthSafety: freshDepth),
+                          accepted == command else {
+                        let failure: NavigationFailure
+                        switch freshDepth.state {
+                        case .stop: failure = .obstacle
+                        case .unavailable(let reason): failure = .depthUnavailable(reason)
+                        case .caution: failure = .obstacle
+                        case .clear: failure = .depthUnavailable(.malformedDepth)
+                        }
+                        evidence?.recordFailure(failure)
+                        runtime?.fail(failure)
+                        fence.inhibit(at: self.sourceNow()); return
+                    }
+                }
                 runtime?.observe(sample, uptime: self.sourceNow(), date: self.now())
                 if runtime?.failure != nil { fence.inhibit(at: self.sourceNow()); return }
                 guard self.operationGeneration == owner, evidence?.fenced != true,
@@ -1672,6 +1795,9 @@ final class FollowNavigationController {
                     var wake = sourceNow() < deadline ? deadline : .infinity
                     wake = min(wake, (latest.sourceTimestamp! + 0.500).nextUp)
                     if let remaining = runtime?.progress.remaining(at: now()) { wake = min(wake, sourceNow() + remaining) }
+                    if isRecoveryArc, let ack = runtime?.lastAck {
+                        wake = min(wake, (sourceNow() + max(0, guardLayer.watchdogTimeout - now().timeIntervalSince(ack))).nextUp)
+                    }
                     if let authorization = FollowRecoveryScope.authorization {
                         wake = min(wake, sourceNow() + max(0, authorization.deadline - authorization.now()))
                     }
@@ -1694,6 +1820,8 @@ final class FollowNavigationController {
                           recoveryAuthorized else { fence.inhibit(at: sourceNow()); return }
                     runtime.expire(at: now())
                     if runtime.failure != nil { fence.inhibit(at: sourceNow()); return }
+                    if isRecoveryArc, !validateFollowTurnRuntime(runtime, owner: owner, evidence: evidence,
+                        requireFreshAck: true) { fence.inhibit(at: sourceNow()); return }
                     if sourceStopped { return }
                     if sourceNow() >= deadline {
                         fence.inhibit(at: deadline)
@@ -1717,6 +1845,9 @@ final class FollowNavigationController {
                     var wake = sourceNow() < deadline ? deadline : .infinity
                     wake = min(wake, (sample.sourceTimestamp! + 0.500).nextUp)
                     if let remaining = runtime.progress.remaining(at: now()) { wake = min(wake, sourceNow() + remaining) }
+                    if isRecoveryArc, let ack = runtime.lastAck {
+                        wake = min(wake, (sourceNow() + max(0, guardLayer.watchdogTimeout - now().timeIntervalSince(ack))).nextUp)
+                    }
                     if let authorization = FollowRecoveryScope.authorization {
                         wake = min(wake, sourceNow() + max(0, authorization.deadline - authorization.now()))
                     }
@@ -1769,23 +1900,65 @@ final class FollowNavigationController {
                         failure: Task.isCancelled ? FollowTurnBurstTransportDenial.cancelled : .fenced)
                 }
                 let safeCommand: WheelCommand
-                switch guardLayer.evaluate(command: command, depthSafety: depthSafetyObservation(command)) {
-                case .allow(let limited, _): safeCommand = limited
-                case .stopDepth:
-                    runtime?.fail(.obstacle)
-                    evidence?.recordFailure(.obstacle)
-                    fence.inhibit(at: entry)
-                    return RoverCommandDiagnosticResult(receipt: .init(httpStatus: nil, acknowledged: false,
-                        acknowledgementUTC: nil, attempts: 0, outcome: "depth_safety_stop"), failure: DepthSafetyStop())
+                let depthReadStarted = sourceNow()
+                if permitsInitialSearchDepthBypass(command, purpose: purpose, evidence: evidence) {
+                    safeCommand = command
+                    recordInitialSearchDepthBypass(evidence, disposition: "sender")
+                    if let grant { deadline = min(deadline, grant.expiresAt) }
+                } else {
+                    switch exactDepthDecision(command, disposition: "sender") {
+                    case .allow(let limited, let observation):
+                        safeCommand = limited
+                        // Freeze the original evidence expiry. New pose callbacks
+                        // cannot renew it, even while the transport actor is queued.
+                        depthValidUntil = depthReadStarted + DepthSafetyEvaluator.maximumRawDepthAge - observation.sampleAge
+                        guard observation.sampleAge.isFinite, observation.sampleAge >= 0,
+                              depthValidUntil.isFinite, sourceNow() < depthValidUntil else {
+                            let stale = DepthSafetyObservation.unavailable(.staleRawDepth,
+                                sampleAge: observation.sampleAge + max(0, sourceNow() - depthReadStarted),
+                                motionClass: .classify(limited))
+                            recordDepthObservation(stale, disposition: "expired_before_send")
+                            let failure = recordDepthRejection(stale)
+                            runtime?.fail(failure)
+                            return .init(receipt: .init(httpStatus: nil, acknowledged: false,
+                                acknowledgementUTC: nil, attempts: 0, outcome: "depth_safety_stop"), failure: DepthSafetyStop(failure: failure))
+                        }
+                        deadline = min(deadline, depthValidUntil)
+                        if let grant { deadline = min(deadline, grant.expiresAt) }
+                    case .stopDepth(let observation):
+                        let failure = recordDepthRejection(observation)
+                        runtime?.fail(failure)
+                        fence.inhibit(at: entry)
+                        return RoverCommandDiagnosticResult(receipt: .init(httpStatus: nil, acknowledged: false,
+                            acknowledgementUTC: nil, attempts: 0, outcome: "depth_safety_stop"), failure: DepthSafetyStop(failure: failure))
+                    }
+                }
+                // Providers/logging can reenter or advance clocks. Validate all
+                // current source/ACK/forward gates again before arming an arc.
+                let runtimeValid = runtime.map { validateFollowTurnRuntime($0, owner: owner, evidence: evidence,
+                    requireFreshAck: isRecoveryArc || requireFreshAckForSend) } ?? true
+                var arcGeneralSafe = true
+                if isRecoveryArc {
+                    let clearance = currentForwardClearance()
+                    let date = now()
+                    let age = runtime?.lastAck.map { date.timeIntervalSince($0) }
+                    arcGeneralSafe = !clearance.isNaN && clearance >= guardLayer.stopDistance &&
+                        age.map { $0 >= 0 && $0 <= RoverConfig.commsWatchdogTimeout } == true
+                    if !arcGeneralSafe, operationGeneration == owner, evidence?.fenced != true {
+                        let reason: NavigationFailure = !clearance.isNaN && clearance >= guardLayer.stopDistance ? .commsLost : .obstacle
+                        runtime?.fail(reason)
+                        evidence?.recordFailure(reason)
+                    }
                 }
                 // The depth provider can invoke callbacks; do not arm a replaced owner.
-                guard recoveryAuthorized, !Task.isCancelled, operationGeneration == owner, evidence?.fenced != true,
+                let currentAuthority = refreshTransportAuthority()
+                guard currentAuthority, runtimeValid, arcGeneralSafe, recoveryAuthorized, !Task.isCancelled, operationGeneration == owner, evidence?.fenced != true,
                       !stopUnconfirmed, pendingFollowTurnBurst == nil,
                       evidence?.targetYaw == nil || followTurnSourceGate.latest?.pose?.yaw == preparedYaw else {
                     return RoverCommandDiagnosticResult(receipt: .init(httpStatus: nil, acknowledged: false,
                         acknowledgementUTC: nil, attempts: 0, outcome: "fenced"), failure: FollowTurnBurstTransportDenial.fenced)
                 }
-                guard let epoch = fence.arm(entry: entry, budget: requestedBudget) else {
+                guard let epoch = fence.arm(entry: entry, budget: deadline - entry) else {
                     return RoverCommandDiagnosticResult(receipt: .init(httpStatus: nil, acknowledged: false,
                         acknowledgementUTC: nil, attempts: 0, outcome: "invalid_budget"),
                         failure: FollowTurnBurstTransportDenial.invalidBudget)
@@ -1793,11 +1966,44 @@ final class FollowNavigationController {
                 pendingFollowTurnBurst = fence
                 pendingFollowTurnBurstDrain = drain
                 arming.arm(epoch)
-                evidence?.burstTrace?.senderEntry(entry, deadline: deadline, budget: requestedBudget)
-                let result = await sendFollowBurstCommand(safeCommand)
+                evidence?.burstTrace?.senderEntry(entry, deadline: deadline, budget: deadline - entry)
+                var result = await sendFollowBurstCommand(safeCommand)
                 // Capture/cancel synchronously at the actual sender return, not
                 // after the task-local wrapper's next actor resumption.
                 response = sourceNow()
+                // A queued transport can return before the monitor observes the
+                // immutable grant deadline. Reconcile that earlier limiting
+                // authority before generic burst/depth expiry attribution.
+                if let grant, let request = evidence?.context.request,
+                   response >= grant.expiresAt, grant.expiresAt < entry + requestedBudget,
+                   grant.expiresAt <= depthValidUntil,
+                   result.receipt.attempts == 0, transportCapture.attempts.isEmpty,
+                   let denial = result.failure as? FollowTurnBurstTransportDenial,
+                   denial == .expired || denial == .fenced,
+                   !Task.isCancelled, operationGeneration == owner, evidence?.fenced != true,
+                   !stopUnconfirmed, recoveryAuthorized, runtime?.failure == nil,
+                   !grant.validate(sample: currentPoseSample?(), session: request.sessionGeneration, now: response) {
+                    recordSearchClearanceRejection(grant, evidence: evidence)
+                    let failure = NavigationFailure.depthUnavailable(.blindSweptVolume)
+                    runtime?.fail(failure)
+                    result = .init(receipt: .init(httpStatus: nil, acknowledged: false,
+                        acknowledgementUTC: nil, attempts: 0, outcome: "search_clearance_stop"),
+                        failure: DepthSafetyStop(failure: failure))
+                }
+                if response >= depthValidUntil, depthValidUntil < entry + requestedBudget,
+                   result.receipt.attempts == 0, transportCapture.attempts.isEmpty,
+                   let denial = result.failure as? FollowTurnBurstTransportDenial,
+                   denial == .expired || denial == .fenced,
+                   !Task.isCancelled, operationGeneration == owner, evidence?.fenced != true, runtime?.failure == nil {
+                    let stale = DepthSafetyObservation.unavailable(.staleRawDepth,
+                        sampleAge: DepthSafetyEvaluator.maximumRawDepthAge + response - depthValidUntil,
+                        motionClass: .classify(safeCommand))
+                    recordDepthObservation(stale, disposition: "expired_at_transport")
+                    let failure = recordDepthRejection(stale)
+                    runtime?.fail(failure)
+                    result = .init(receipt: .init(httpStatus: nil, acknowledged: false,
+                        acknowledgementUTC: nil, attempts: 0, outcome: "depth_safety_stop"), failure: DepthSafetyStop(failure: failure))
+                }
                 if let evidence, fence.status?.stopObligation == true || response >= deadline {
                     evidence.burstTrace?.obligation(at: fence.stopObligationUptime ?? min(response, deadline),
                         observedAt: response,
@@ -2212,13 +2418,20 @@ final class FollowNavigationController {
             telemetry["target_approach_slowed"] = command == out.command ? "false" : "true"
             RuntimeFileLog.append("nav_drive_tick", fields: telemetry)
             let safeCommand: WheelCommand
-            switch guardLayer.evaluate(command: command, depthSafety: depthSafetyObservation(command)) {
+            switch exactDepthDecision(command, disposition: "pursuit") {
             case .allow(let limited, _): safeCommand = limited
-            case .stopDepth:
+            case .stopDepth(let observation):
+                let failure = recordDepthRejection(observation)
                 liveFollowGoal = nil
-                try? await stopRover()
-                finish(.failed(.obstacle))
-                return .failed(.obstacle)
+                let cleanupOwner = operationGeneration
+                do { try await rotationStop(origin: "cleanup") } catch {
+                    guard operationGeneration == cleanupOwner, !Task.isCancelled,
+                          FollowMotionTaskScope.evidence?.fenced != true else { return .cancelled }
+                    finish(.failed(.commandFailed))
+                    return .failed(.commandFailed)
+                }
+                finish(.failed(failure))
+                return .failed(failure)
             }
             guard !Task.isCancelled, FollowMotionTaskScope.evidence?.fenced != true, !stopUnconfirmed else { break }
             do {
@@ -2442,12 +2655,19 @@ final class FollowNavigationController {
                 }
             }
             let safeCommand: WheelCommand
-            switch guardLayer.evaluate(command: cmd, depthSafety: depthSafetyObservation(cmd)) {
+            switch exactDepthDecision(cmd, disposition: "legacy_turn") {
             case .allow(let limited, _): safeCommand = limited
-            case .stopDepth:
-                try? await rotationStop(origin: "cleanup")
-                finish(.failed(.obstacle))
-                return .failed(.obstacle)
+            case .stopDepth(let observation):
+                let failure = recordDepthRejection(observation)
+                let cleanupOwner = operationGeneration
+                do { try await rotationStop(origin: "cleanup") } catch {
+                    guard operationGeneration == cleanupOwner, !Task.isCancelled,
+                          FollowMotionTaskScope.evidence?.fenced != true else { return .cancelled }
+                    finish(.failed(.commandFailed))
+                    return .failed(.commandFailed)
+                }
+                finish(.failed(failure))
+                return .failed(failure)
             }
             guard !Task.isCancelled, operationGeneration == ownedGeneration,
                   evidence?.fenced != true, !stopUnconfirmed else { break }
@@ -2508,6 +2728,201 @@ final class FollowNavigationController {
         return .cancelled
     }
 
+    private func prepareFollowTurnDepth(_ command: WheelCommand, runtime: FollowTurnRuntimeState, owner: UInt,
+                                       evidence: FollowMotionOperationEvidence?, waitSpent: inout Bool) async throws
+        -> (command: WheelCommand, arc: Bool) {
+        func owned() -> Bool {
+            !Task.isCancelled && operationGeneration == owner && evidence?.fenced != true &&
+                !stopUnconfirmed && recoveryAuthorized
+        }
+        guard owned() else { throw CancellationError() }
+        if permitsInitialSearchDepthBypass(command, purpose: evidence?.context.purpose, evidence: evidence) {
+            recordInitialSearchDepthBypass(evidence, disposition: "turn")
+            guard owned() else { throw CancellationError() }
+            return (command, false)
+        }
+        var decision = exactDepthDecision(command, disposition: "turn")
+        guard owned() else { throw CancellationError() }
+        if case .stopDepth(let initial) = decision,
+           initial.state == .unavailable(.missingRawDepth) || initial.state == .unavailable(.staleRawDepth), !waitSpent {
+            // Every calibrated burst starts stopped. Keep the original snapshot
+            // age; retries call the real provider and never manufacture freshness.
+            guard pendingFollowTurnBurst == nil, evidence?.stopOutcome == .confirmed else { throw CancellationError() }
+            waitSpent = true
+            let deadline = sourceNow() + 0.6
+            for _ in 0..<12 {
+                guard owned(), sourceNow() < deadline else { break }
+                await sleep(.milliseconds(50))
+                guard owned() else { throw CancellationError() }
+                if sourceNow() >= deadline { break }
+                guard await refreshFollowTurnRuntime(runtime, owner: owner, evidence: evidence,
+                    requireFreshAck: true, deadline: deadline) else {
+                    if owned(), runtime.failure == nil, sourceNow() >= deadline { break }
+                    throw CancellationError()
+                }
+                guard owned() else { throw CancellationError() }
+                decision = exactDepthDecision(command, disposition: "stopped_retry")
+                guard owned() else { throw CancellationError() }
+                if case .stopDepth(let observation) = decision,
+                   observation.state == .unavailable(.missingRawDepth) || observation.state == .unavailable(.staleRawDepth) {
+                    continue
+                }
+                break
+            }
+        }
+        guard owned() else { throw CancellationError() }
+        switch decision {
+        case .allow(let safe, _): return (safe, false)
+        case .stopDepth(let rejected):
+            guard evidence?.context.request?.isSearchSweep != true,
+                  evidence?.context.request?.searchClearance == nil,
+                  rejected.state == .unavailable(.blindSweptVolume), DepthSafetyMotionClass.classify(command) == .rotating else {
+                runtime.fail(recordDepthRejection(rejected)); throw DepthSafetyStop(failure: runtime.failure!)
+            }
+            guard depthRecoveryAttempts < 2 else {
+                evidence?.recordFailure(.depthUnavailable(.blindSweptVolume), cause: .depthRecoveryExhausted)
+                runtime.fail(.depthUnavailable(.blindSweptVolume))
+                throw DepthSafetyStop(failure: .depthUnavailable(.blindSweptVolume))
+            }
+            // Keep the proven outer breakaway magnitude, but use a shallow arc:
+            // the old 1:2 wheel ratio sweeps outside a forward depth frustum.
+            let outer = RoverConfig.minimumRotateWheelSpeed
+            let arc = command.right > command.left
+                ? WheelCommand(left: outer * 0.8, right: outer)
+                : WheelCommand(left: outer, right: outer * 0.8)
+            let arcDecision = exactDepthDecision(arc, disposition: "recovery_arc")
+            guard owned() else { throw CancellationError() }
+            guard case .allow(let safe, _) = arcDecision else {
+                if case .stopDepth(let observation) = arcDecision { runtime.fail(recordDepthRejection(observation)) }
+                throw DepthSafetyStop(failure: runtime.failure ?? .depthUnavailable(.blindSweptVolume))
+            }
+            guard await refreshFollowTurnRuntime(runtime, owner: owner, evidence: evidence, requireFreshAck: true) else {
+                throw CancellationError()
+            }
+            guard owned() else { throw CancellationError() }
+            let clearance = currentForwardClearance()
+            let date = now()
+            guard owned() else { throw CancellationError() }
+            guard let ack = runtime.lastAck, date.timeIntervalSince(ack) >= 0,
+                  date.timeIntervalSince(ack) <= RoverConfig.commsWatchdogTimeout else {
+                runtime.fail(.commsLost); throw DepthSafetyStop(failure: .commsLost)
+            }
+            guard !clearance.isNaN, clearance >= guardLayer.stopDistance else {
+                runtime.fail(.obstacle); throw DepthSafetyStop(failure: .obstacle)
+            }
+            return (safe, true)
+        }
+    }
+
+    /// Controller-owned initial acquisition only. This is a motion policy, never
+    /// camera evidence or an implicit operator clearance grant. Existing source,
+    /// transport, stop, sweep and ownership fences remain authoritative.
+    private func permitsInitialSearchDepthBypass(_ command: WheelCommand, purpose: FollowMotionPurpose?,
+                                                 evidence: FollowMotionOperationEvidence?) -> Bool {
+        guard purpose == .followScan, let evidence, activeFollowEvidence === evidence,
+              evidence.ownedGeneration == operationGeneration, !evidence.fenced,
+              evidence.context.purpose == .followScan,
+              let request = evidence.context.request, request.purpose == .followScan,
+              request.isSearchSweep, request.phase == "searching",
+              let angle = evidence.context.requestedRotation, angle.isFinite, angle != 0, abs(angle) <= .pi,
+              FollowRecoveryScope.heading == nil, FollowRecoveryScope.authorization == nil,
+              command.left.isFinite, command.right.isFinite, command.left != 0,
+              command.left == -command.right,
+              abs(command.left) <= FollowTurnBurstPlanner.Profile(purpose: .scan).fixedWheelMagnitude else { return false }
+        return true
+    }
+
+    private func recordInitialSearchDepthBypass(_ evidence: FollowMotionOperationEvidence?, disposition: String) {
+        let fields: [String: FollowDiagnosticValue] = [
+            "depth_policy": .string("initial_search_pure_rotation_bypass"),
+            "depth_candidate_disposition": .string(disposition)]
+        evidence?.depthDiagnosticFields = fields
+        diagnosticEmitter?.emit(.init(event: "follow_depth.initial_search_bypassed", context: .init(
+            sessionGeneration: evidence?.context.request?.sessionGeneration,
+            operationID: evidence?.context.controllerOperationID, purpose: evidence?.context.purpose?.rawValue,
+            phase: evidence?.context.request?.phase, reason: "initial_person_acquisition"), payload: fields))
+    }
+
+    private func recordSearchClearanceRejection(_ grant: FollowSearchClearanceGrant,
+                                               evidence: FollowMotionOperationEvidence?) {
+        evidence?.searchClearanceDiagnosticFields = grant.diagnosticFields
+        evidence?.recordFailure(.depthUnavailable(.blindSweptVolume), cause: grant.revocationCause)
+    }
+
+    private func validateSearchClearance(_ request: FollowMotionRequestContext?,
+                                         evidence: FollowMotionOperationEvidence? = nil) -> Bool {
+        guard let request, let grant = request.searchClearance else { return true }
+        let evidence = evidence ?? FollowMotionTaskScope.evidence
+        if request.purpose != .followScan && request.purpose != .followAlignment {
+            grant.revoke(detail: "non_rotation_purpose", now: sourceNow())
+        }
+        if let health = sourceHealth?(), health.trackingQuality != .normal || health.generation != grant.sourceGeneration {
+            grant.revoke(cause: .searchClearanceSourceInvalid, detail: "source_health_changed", now: sourceNow())
+        }
+        let valid = grant.validate(sample: currentPoseSample?(), session: request.sessionGeneration, now: sourceNow())
+        if !valid { recordSearchClearanceRejection(grant, evidence: evidence) }
+        return valid
+    }
+
+    private func searchDepthObservation(_ command: WheelCommand) -> DepthSafetyObservation {
+        let evidence = FollowMotionTaskScope.evidence
+        let request = evidence?.context.request
+        if let grant = request?.searchClearance, command.left != -command.right {
+            grant.revoke(detail: "translation_requested", now: sourceNow())
+        }
+        guard validateSearchClearance(request, evidence: evidence) else {
+            return .unavailable(.blindSweptVolume, sampleAge: .infinity, motionClass: .classify(command))
+        }
+        return FollowSearchRotationScope.$authorized.withValue(request?.searchClearance != nil) {
+            depthSafetyObservation(command)
+        }
+    }
+
+    /// Caution changes curvature visibility and stopping distance; authorize the
+    /// exact scaled wheels too. A second scaling is rejected instead of iterated.
+    private func exactDepthDecision(_ command: WheelCommand, disposition: String) -> ObstacleGuard.DepthDecision {
+        let observation = searchDepthObservation(command)
+        recordDepthObservation(observation, disposition: disposition)
+        switch guardLayer.evaluate(command: command, depthSafety: observation) {
+        case .stopDepth: return .stopDepth(observation)
+        case .allow(let limited, _) where limited == command: return .allow(command, depthSafety: observation)
+        case .allow(let limited, _):
+            let exact = searchDepthObservation(limited)
+            recordDepthObservation(exact, disposition: disposition + "_scaled")
+            if case .allow(let accepted, _) = guardLayer.evaluate(command: limited, depthSafety: exact), accepted == limited {
+                return .allow(limited, depthSafety: exact)
+            }
+            return .stopDepth(exact)
+        }
+    }
+
+    private func recordDepthObservation(_ observation: DepthSafetyObservation, disposition: String) {
+        func finite(_ value: Double) -> FollowDiagnosticValue { value.isFinite ? .number(value) : .null }
+        let fields: [String: FollowDiagnosticValue] = [
+            "depth_state": .string(observation.state.telemetryReason), "depth_age_s": finite(observation.sampleAge),
+            "depth_coverage_provenance": .string(observation.coverageProvenance),
+            "depth_clearance_m": finite(observation.clearance), "depth_support_count": .number(Double(observation.supportCount)),
+            "depth_motion_class": .string(observation.motionClass.rawValue), "depth_candidate_disposition": .string(disposition)]
+        let evidence = FollowMotionTaskScope.evidence
+        evidence?.depthDiagnosticFields = fields
+        diagnosticEmitter?.emit(.init(event: "follow_depth.candidate", context: .init(
+            sessionGeneration: evidence?.context.request?.sessionGeneration,
+            operationID: evidence?.context.controllerOperationID, purpose: evidence?.context.purpose?.rawValue,
+            phase: evidence?.context.request?.phase, reason: observation.state.telemetryReason), payload: fields))
+    }
+
+    private func recordDepthRejection(_ observation: DepthSafetyObservation) -> NavigationFailure {
+        let failure: NavigationFailure
+        switch observation.state {
+        case .stop: failure = .obstacle
+        case .unavailable(let reason): failure = .depthUnavailable(reason)
+        case .caution: failure = .obstacle
+        case .clear: failure = .depthUnavailable(.malformedDepth)
+        }
+        FollowMotionTaskScope.evidence?.recordFailure(failure)
+        return failure
+    }
+
     private func finish(_ result: NavigationResult) {
         activePolicy = nil
         liveFollowGoal = nil
@@ -2515,7 +2930,7 @@ final class FollowNavigationController {
         case .arrived:
             state = .arrived
             publishSafetyState(.idle)
-        case .cancelled:
+        case .cancelled, .reobservationRequired:
             state = .idle
             publishSafetyState(.idle)
         case .failed(let failure):
@@ -2549,6 +2964,7 @@ final class FollowNavigationController {
         case .noPath: "No path to goal."
         case .pathRejected: "Path rejected by navigation policy."
         case .obstacle: "Obstacle ahead."
+        case .depthUnavailable(let reason): reason.followMotionMessage
         case .commsLost: "Rover command link lost."
         case .tipping: "Rover may be tipping."
         case .stalled: "Navigation stalled."

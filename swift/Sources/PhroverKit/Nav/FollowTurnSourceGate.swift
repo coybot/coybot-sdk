@@ -44,6 +44,8 @@ final class FollowTurnRuntimeState {
     let generation: UInt64
     var progress = FollowTurnWaitingProgress()
     var lastAck: Date?
+    /// Translating recovery requires a known, non-future ACK throughout its lifetime.
+    var requiresKnownAck = false
     private(set) var failure: NavigationFailure?
     private(set) var sourceRejection: String?
     private var previous: NavigationPoseSample

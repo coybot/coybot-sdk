@@ -5,6 +5,7 @@ struct FollowTurnBurstExecutionReceipt {
     let send: FollowTurnBurstSendReceipt
     let confirmedStopFence: FollowTurnStopFence?
     var stopObligationUptime: Double? = nil
+    var requiresReobservation = false
 }
 
 /// One serialized burst. The controller supplies operation-fenced boundaries;
@@ -23,6 +24,8 @@ enum FollowTurnBurstExecutor {
         return .init(send: receipt, confirmedStopFence: fence)
     }
 }
+
+enum FollowTurnPreparationError: Error { case replan }
 
 /// Shared follow operation loop. Its target and progress epoch are never rebased
 /// at burst stops. Controller closures retain source, safety and motor ownership.
@@ -88,6 +91,7 @@ enum FollowTurnOperationExecutor {
                 do { receipt = try await burst(.init(left: -signed, right: signed), budget, progress, calibration.lastSourceSample, sample) }
                 catch {
                     guard authorized(), !Task.isCancelled else { return .cancelled }
+                    if error is FollowTurnPreparationError, runtime.failure == nil { continue }
                     if let failure = runtime.failure { return .failed(failure) }
                     return .failed(.commandFailed)
                 }
@@ -133,6 +137,9 @@ enum FollowTurnOperationExecutor {
                     }
                     return .failed(.commandFailed)
                 }
+                // Translation changes the target geometry. It cannot be used as
+                // a pure-yaw calibration response or angular/sweep arrival.
+                if receipt.requiresReobservation { return .reobservationRequired }
                 let settled: NavigationPoseSample
                 switch await stoppedSource(fence, progress) {
                 case .sample(let sample): settled = sample

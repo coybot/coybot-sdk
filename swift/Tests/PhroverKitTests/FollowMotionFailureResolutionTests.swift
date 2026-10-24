@@ -2,6 +2,40 @@ import XCTest
 @testable import PhroverKit
 
 final class FollowMotionFailureResolutionTests: XCTestCase {
+    @MainActor
+    func testEarlierHazardAndFailureSurviveLaterClearanceRevocation() throws {
+        for earlier in [NavigationFailure.obstacle, .commsLost, .rotationResolutionInsufficient] {
+            let request = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 4, purpose: .followScan, phase: "searching")
+            let evidence = FollowMotionOperationEvidence(context: .init(request: request, controllerOperationID: 7,
+                purpose: .followScan, profile: nil))
+            evidence.recordFailure(earlier)
+            evidence.recordFailure(.depthUnavailable(.blindSweptVolume), cause: .searchClearanceExpired)
+            evidence.recordStop(.confirmed)
+            let failure = try XCTUnwrap(evidence.failure(source: .result))
+            XCTAssertEqual(failure.reason, earlier)
+            XCTAssertNil(failure.context.failureCause)
+            evidence.recordStop(.failed)
+            let stopped = FollowMotionFailureResolution(try XCTUnwrap(evidence.failure(source: .confirmation)))
+            XCTAssertEqual(stopped.message, "Motor stop could not be confirmed. Motion is blocked.")
+        }
+    }
+
+    func testClearanceCauseSurvivesGenericDeliveryAndStopFailureWins() {
+        let request = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 4, purpose: .followScan, phase: "searching")
+        let context = FollowMotionOperationContext(request: request, controllerOperationID: 7, purpose: .followScan,
+            profile: nil, failureCause: .searchClearanceSpaceExceeded)
+        let generic = FollowMotionOperationContext(request: request, controllerOperationID: 7, purpose: .followScan, profile: nil)
+        var result = FollowMotionFailureResolution(.init(context: context, reason: .depthUnavailable(.blindSweptVolume),
+            stopOutcome: .pending, source: .stream, turnDiagnosticFields: ["search_clearance_observed_displacement_m": .number(0.201)]))
+        result.consume(.init(context: generic, reason: .depthUnavailable(.blindSweptVolume), stopOutcome: .confirmed, source: .result))
+        XCTAssertEqual(result.diagnosticReason, "search_clearance_space_exceeded")
+        XCTAssertTrue(result.message.contains("observed movement"))
+        XCTAssertFalse(result.message.contains("camera cannot see"))
+        XCTAssertEqual(result.turnDiagnosticFields["search_clearance_observed_displacement_m"], .number(0.201))
+        result.consume(.init(context: generic, reason: .commandFailed, stopOutcome: .failed, source: .confirmation))
+        XCTAssertEqual(result.message, "Motor stop could not be confirmed. Motion is blocked.")
+    }
+
     func testReadyGuardCauseAndMeasurementsSurviveGenericDeliveryAndStopFailureWins() {
         let request = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 4, purpose: .followReady, phase: "aligning")
         let context = FollowMotionOperationContext(request: request, controllerOperationID: 7, purpose: .followReady,

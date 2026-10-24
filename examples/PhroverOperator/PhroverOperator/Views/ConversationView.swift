@@ -232,7 +232,7 @@ struct ConversationView: View {
                             stop: { await router.stop() }, followState: { follow.state },
                             targetFrame: { follow.trackedPersonFrameID },
                             readySignalClearance: { follow.readySignalClearance },
-                            inhibit: { follow.inhibitMotion() },
+                            inhibit: { router.inhibitMotion() },
                             submitFinalized: { text, receivedAt in
                                 await router.submit(text, finalizedTextReceivedAt: receivedAt)
                             }, monotonic: { followClock.now })

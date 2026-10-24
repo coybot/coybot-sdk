@@ -3,6 +3,31 @@ import XCTest
 
 @MainActor
 final class OperatorCommandRouterTests: XCTestCase {
+    func testLifecycleInhibitionPreemptsDelayedConfirmedStart() async {
+        let mission = RecordingOperatorMission()
+        mission.suspendStop = true
+        let follow = RecordingOperatorFollow()
+        let router = OperatorCommandRouter(mission: mission, follow: follow)
+        let starting = Task { await router.submit("follow me", searchClearance:
+            .init(sourceGeneration: 1, origin: .zero, confirmedAt: 0)) }
+        await mission.waitForStop()
+        router.inhibitMotion()
+        mission.releaseStop()
+        let result = await starting.value
+        XCTAssertEqual(result, .rejected("Follow request cancelled."))
+        XCTAssertFalse(follow.state.isActive)
+    }
+
+    func testConfirmationPreparationDoesNotStopOtherTabActivity() async {
+        let mission = RecordingOperatorMission()
+        let follow = RecordingOperatorFollow()
+        let router = OperatorCommandRouter(mission: mission, follow: follow, mayStartFollow: { false })
+        let result = await router.prepareInitialFollowSearch()
+        XCTAssertEqual(result, .rejected("Stop the other rover activity before following."))
+        XCTAssertTrue(mission.events.isEmpty)
+        XCTAssertFalse(follow.state.isActive)
+    }
+
     func testBusyMissionRejectionDescribesTheRunningMission() async {
         let mission = RecordingOperatorMission()
         let router = OperatorCommandRouter(mission: mission, follow: RecordingOperatorFollow())

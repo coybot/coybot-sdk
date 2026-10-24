@@ -19,6 +19,10 @@ public final class FollowMeCoordinator {
     public private(set) var state: FollowMeState = .idle {
         didSet {
             if state != oldValue {
+                if state == .signalingReady || state == .following || state == .reacquiring {
+                    searchClearance?.revoke()
+                    searchClearance = nil
+                }
                 let changedAt = clock.now
                 let previousPhaseElapsed = phaseStartedAt.map { changedAt - $0 }
                 phaseStartedAt = changedAt
@@ -59,6 +63,7 @@ public final class FollowMeCoordinator {
     private let failureEmitter: FollowDiagnosticEmitter
     // At most one terminal delivery window; prune after stream/result/cleanup drain.
     private var failureResolution: FollowMotionFailureResolution?
+    private var searchClearance: FollowSearchClearanceGrant?
     private var activeRequest: FollowMotionRequestContext?
     private var summaryBudget = FollowSummaryBudget()
     private var diagnosticStopState = "unknown"
@@ -86,6 +91,7 @@ public final class FollowMeCoordinator {
     private var alignmentSerial: UInt64 = 0
     private var alignmentConfirmedAfter: ARFrameID?
     private var alignmentCompletionTime: TimeInterval?
+    private var awaitingDepthReobservation = false
     private var newestStopFence: FollowTurnStopFence?
     private var ingestedSource = FollowTurnSourceGate()
     private var alignmentSourceWaiter: CheckedContinuation<Void, Never>?
@@ -174,13 +180,19 @@ public final class FollowMeCoordinator {
         await startSession(commandReceivedAt: commandReceivedAt)
     }
 
-    private func startSession(commandReceivedAt: TimeInterval?) async -> Bool {
+    func start(commandReceivedAt: TimeInterval, searchClearance: FollowSearchClearanceConfirmation) async -> Bool {
+        await startSession(commandReceivedAt: commandReceivedAt, confirmation: searchClearance)
+    }
+
+    private func startSession(commandReceivedAt: TimeInterval?, confirmation: FollowSearchClearanceConfirmation? = nil) async -> Bool {
         guard !isActive, stopTask == nil, !stopBlocked else { return isActive }
         guard perception.detectorReady, perception.personLabelAvailable else {
             state = .failed("Person detector unavailable.")
             return false
         }
         generation &+= 1
+        searchClearance?.revoke()
+        searchClearance = confirmation?.consume(session: generation)
         self.commandReceivedAt = commandReceivedAt
         sessionStartedAt = clock.now
         phaseStartedAt = nil
@@ -219,6 +231,7 @@ public final class FollowMeCoordinator {
         latestFrame = nil
         latestBatch = nil
         newestStopFence = nil
+        awaitingDepthReobservation = false
         ingestedSource = FollowTurnSourceGate()
         evaluatedPendingSnapshot = nil
         currentAssociation = nil
@@ -304,6 +317,7 @@ public final class FollowMeCoordinator {
     /// Synchronously fence observations and goals when the app is leaving the foreground
     /// or Talk. The caller must subsequently await stop() before handing off motion.
     public func inhibitMotion() {
+        searchClearance?.revoke()
         guard isActive, stopTask == nil else { return }
         emitRecovery("fenced", reason: "lifecycle_inhibition", stop: "pending")
         pendingRecoveryTermination = recoveryTermination(reason: "lifecycle_inhibition", phase: .stopped)
@@ -335,6 +349,7 @@ public final class FollowMeCoordinator {
     }
 
     private func finish(_ result: FollowMeState, resolvingFailure: Bool = false) async -> Bool {
+        searchClearance?.revoke()
         if let stopTask {
             // Only one waiter publishes terminal state and clears the task.
             // Followers must not overwrite resolved failure text or clear a
@@ -493,6 +508,26 @@ public final class FollowMeCoordinator {
                 stopOutcome: result.stopOutcome, source: .result))
             return true
         }
+        // An initial turn must stop and obtain a newly captured,
+        // settled perception frame even when the configured look delay is zero.
+        let initialSearchStopped = result.result == .arrived &&
+            ((result.context.purpose == .followScan && result.context.controllerOperationID != nil) ||
+             result.context.request?.searchClearance != nil) &&
+            result.context.request?.isSearchSweep == true && result.context.request?.phase == "searching"
+        if result.result == .reobservationRequired || initialSearchStopped,
+           result.context.request == activeRequest, result.context.request?.sessionGeneration == generation {
+            guard result.stopOutcome == .confirmed, let fence = result.turnStopFence,
+                  fence.context == result.context else {
+                await resolveFailure(.init(context: result.context, reason: .commandFailed,
+                    stopOutcome: result.stopOutcome, source: .result))
+                return true
+            }
+            captureStopFence(fence)
+            awaitingDepthReobservation = true
+            if result.result == .reobservationRequired { scanResponseSeed = nil }
+            alignmentConfirmedAfter = nil
+            alignmentCompletionTime = nil
+        }
         // Cancellation/success can carry terminal stop evidence, but cannot invent a failure.
         if let record = failureResolution, matches(result.context, record.context) {
             await resolveFailure(.init(context: result.context, reason: record.primaryReason,
@@ -525,6 +560,8 @@ public final class FollowMeCoordinator {
             guard generation == token, isActive, !stopBlocked else { return }
             ingestedSource.include(.init(frameID: batch.frameID, sourceTimestamp: batch.timestamp))
             let receivedAt = clock.now
+            searchClearance?.validate(sample: .init(pose: batch.pose, frameID: batch.frameID,
+                sourceTimestamp: batch.timestamp, trackingQuality: batch.trackingQuality), session: token, now: receivedAt)
             if let expected = recoveryEpisode?.anchor?.frameID.generation, batch.frameID.generation != expected {
                 _ = await finish(.failed("AR session reset during recovery."))
                 return
@@ -576,7 +613,7 @@ public final class FollowMeCoordinator {
         latestBatch = batch
         let now = clock.now
         frameWatchdogTask?.cancel()
-        let issue = FollowFrameHealth.issue(batch, now: now, configuration: config)
+        let issue = frameIssue(batch, now: now)
         updatePerceptionIssue(issue)
         var associationAvailable = false
         let frameContext = FollowDiagnosticContext(sessionGeneration: token, phase: String(describing: state),
@@ -630,6 +667,13 @@ public final class FollowMeCoordinator {
                 return
             }
         }
+        // A translating recovery invalidates the old target geometry, including
+        // queued inference completed before motor stop. Reuse the full source
+        // generation/sequence/timestamp and 300ms settled-stop admission gate.
+        if awaitingDepthReobservation {
+            guard matchedFrameClearsNewestStop(batch) else { return }
+            awaitingDepthReobservation = false
+        }
         switch state {
         case .searching:
             let evaluated = tracker.selectInitialEvaluated(batch.people, now: now, frameID: batch.frameID)
@@ -642,6 +686,13 @@ public final class FollowMeCoordinator {
                 }
                 locked = selected
                 adoptMemory(selected, batch: batch, association: .initial)
+                // Acquisition ends the exception before alignment or a direct
+                // following goal can be scheduled from this very same frame.
+                if let issue = FollowFrameHealth.issue(batch, now: now, configuration: config) {
+                    state = .aligning
+                    await perceptionUnavailable(issue, generation: token)
+                    return
+                }
                 if config.departureRangeIncrease > 0 {
                     state = .aligning
                     align(generation: token)
@@ -1007,7 +1058,7 @@ public final class FollowMeCoordinator {
             guard angle.isFinite else { return }
             let id = self.operation
             let context = FollowMotionRequestContext(sessionGeneration: token, requestToken: id,
-                purpose: .followAlignment, phase: capturedPhase)
+                purpose: .followAlignment, phase: capturedPhase, searchClearance: self.recoveryEpisode == nil ? self.searchClearance : nil)
             self.activeRequest = context
             let contextualResult = await self.motion.performContextual(.alignment(angle), context: context,
                 recovery: self.recoveryAuthorization(generation: token, operation: id))
@@ -1219,6 +1270,7 @@ public final class FollowMeCoordinator {
             }
             self.pendingAdmission = nil
             self.readySignalAttempted = true
+            self.searchClearance?.revoke()
             self.state = .signalingReady
             self.emitReadiness("follow_ready.admission_authorized", reason: "first_send_authorized")
             self.diagnosticStopState = "not_stopped"
@@ -1366,7 +1418,7 @@ public final class FollowMeCoordinator {
               batch.frameID.sequence > (fence.highestSequence ?? 0),
               batch.timestamp > fence.acknowledgementUptime,
               batch.timestamp > (fence.highestSourceTimestamp ?? -.infinity),
-              FollowFrameHealth.issue(batch, now: uptime, configuration: config) == nil else { return false }
+              frameIssue(batch, now: uptime) == nil else { return false }
         return true
     }
 
@@ -1386,12 +1438,14 @@ public final class FollowMeCoordinator {
     private func launchMovement(generation token: UInt64, purpose: FollowMotionPurpose,
                                 scanUsed: Double? = nil, scanRemaining: Double? = nil, scanStep: Double? = nil,
                                 action: @escaping @MainActor (FollowMotionRequestContext) async -> FollowMotionResult) {
+        if purpose == .followGoal || purpose == .followReady { searchClearance?.revoke() }
         operation &+= 1
         let id = operation
         let context = FollowMotionRequestContext(sessionGeneration: token, requestToken: id, purpose: purpose,
             phase: String(describing: state), scanUsed: scanUsed, scanRemaining: scanRemaining,
             scanResponseSeed: purpose == .followScan && scanResponseSeed?.sourceGeneration == latestFrame?.generation ? scanResponseSeed : nil,
-            isSearchSweep: purpose == .followScan && state == .searching)
+            isSearchSweep: purpose == .followScan && state == .searching,
+            searchClearance: purpose == .followScan && state == .searching ? searchClearance : nil)
         activeRequest = context
         movementTask = Task { [weak self] in
             let result = await action(context)
@@ -1433,10 +1487,21 @@ public final class FollowMeCoordinator {
         }
     }
 
+    /// Only initial acquisition may use source frames lacking depth. Other
+    /// health checks retain their original order and the frame is never altered.
+    private var initialSearchIgnoresDepth: Bool {
+        state == .searching && locked == nil && recoveryEpisode == nil && motion is any FollowMeContextualMotion
+    }
+
+    private func frameIssue(_ batch: FollowFrameBatch, now: TimeInterval) -> FollowPerceptionIssue? {
+        let issue = FollowFrameHealth.issue(batch, now: now, configuration: config)
+        return issue == .depthUnavailable && initialSearchIgnoresDepth ? nil : issue
+    }
+
     private var canScan: Bool {
-        guard isActive, !recoveryExpired, perceptionReady, !stopBlocked, stopTask == nil, confirmationTask == nil,
+        guard isActive, !recoveryExpired, !awaitingDepthReobservation, perceptionReady, !stopBlocked, stopTask == nil, confirmationTask == nil,
               perceptionIssue == nil, poseDeadline == nil, let batch = latestBatch,
-              batch.pose != nil, batch.depthAvailable,
+              batch.pose != nil, batch.depthAvailable || initialSearchIgnoresDepth,
               batch.trackingQuality != .limited, batch.trackingQuality != .unavailable,
               batch.timestamp.isFinite else { return false }
         let age = clock.now - batch.timestamp
@@ -1748,6 +1813,7 @@ public final class FollowMeCoordinator {
 
     private func perceptionUnavailable(_ issue: FollowPerceptionIssue, generation token: UInt64) async {
         guard generation == token else { return }
+        searchClearance?.revoke()
         updatePerceptionIssue(issue)
         // The deadline also marks an outage whose stop has already been requested.
         // Subsequent unhealthy frames update diagnostics without stopping again.

@@ -22,8 +22,10 @@ final class NavigationFollowSafetyTests: XCTestCase {
                     XCTAssertTrue(commands.allSatisfy { max(abs($0.left), abs($0.right)) <= 0.05 }, "\(request): \(commands)")
                 } else {
                     XCTAssertTrue(commands.isEmpty, "\(request): \(state)")
-                    XCTAssertEqual(result.result, .failed(.obstacle), "\(request): \(state)")
-                    XCTAssertEqual(nav.safetyState, .failed(.obstacle))
+                    if case .unavailable(let reason) = state {
+                        XCTAssertEqual(result.result, .failed(.depthUnavailable(reason)), "\(request): \(state)")
+                        XCTAssertEqual(nav.safetyState, .failed(.depthUnavailable(reason)))
+                    }
                 }
                 XCTAssertGreaterThanOrEqual(stops, 2)
             }
@@ -54,7 +56,9 @@ final class NavigationFollowSafetyTests: XCTestCase {
                     XCTAssertEqual(commands, [.init(left: -0.05, right: 0.05)])
                 } else {
                     XCTAssertTrue(commands.isEmpty)
-                    XCTAssertEqual(rotation, .failed(.obstacle))
+                    if case .unavailable(let reason) = state {
+                        XCTAssertEqual(rotation, .failed(.depthUnavailable(reason)))
+                    }
                 }
             }
         }
@@ -83,8 +87,8 @@ final class NavigationFollowSafetyTests: XCTestCase {
                 sourceTimestamp: 10.3, trackingQuality: .normal)
             nav.ingestFollowTurnSource(sample)
             let result = await motion.value
-            XCTAssertEqual(result.result, .failed(.obstacle))
-            XCTAssertEqual(nav.safetyState, .failed(.obstacle))
+            XCTAssertEqual(result.result, .failed(.depthUnavailable(.missingRawDepth)))
+            XCTAssertEqual(nav.safetyState, .failed(.depthUnavailable(.missingRawDepth)))
             XCTAssertEqual(sends, 0)
         }
     }

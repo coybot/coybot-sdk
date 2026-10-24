@@ -19,6 +19,7 @@ public enum NavigationFailure: Equatable, Sendable {
     case noPath
     case pathRejected(PathPolicyViolation)
     case obstacle
+    case depthUnavailable(DepthSafetyUnavailableReason)
     case commsLost
     case tipping
     case stalled
@@ -29,6 +30,8 @@ public enum NavigationFailure: Equatable, Sendable {
 }
 
 public enum NavigationResult: Equatable, Sendable {
+    /// A bounded translating recovery stopped; the caller must acquire new perception.
+    case reobservationRequired
     case arrived
     case failed(NavigationFailure)
     case cancelled

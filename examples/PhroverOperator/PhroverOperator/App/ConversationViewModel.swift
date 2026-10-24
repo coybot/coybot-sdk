@@ -44,6 +44,7 @@ final class ConversationViewModel {
                    inhibit: @escaping () -> Void = {},
                    submitFinalized: ((String, TimeInterval) async -> OperatorSubmission)? = nil,
                    monotonic: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+        self.inhibit()
         submissionGeneration &+= 1
         exitConfirmed = false
         exitPrepared = false
@@ -131,6 +132,7 @@ final class ConversationViewModel {
 
     func prepareToLeave() {
         guard !exitConfirmed, !exitPrepared else { return }
+        submissionGeneration &+= 1
         exitPrepared = true
         inhibit()
     }

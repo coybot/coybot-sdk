@@ -21,6 +21,25 @@ final class SilentSearchMapTransformTests: XCTestCase {
         XCTAssertEqual(event, .reactiveSafetyFailed)
     }
 
+    func testLiveSafetyMonitorMapsUnavailableDepthToReactiveSafetyFailure() async {
+        for reason: DepthSafetyUnavailableReason in [.missingRawDepth, .staleRawDepth, .invalidCalibration,
+                                                     .invalidCollisionGeometry, .malformedDepth, .blindSweptVolume] {
+            let navigation = AsyncStream.makeStream(of: NavigationSafetyState.self)
+            let link = AsyncStream.makeStream(of: RoverCommandLinkReadiness.self)
+            let monitor = LiveSilentSearchSafetyMonitor(
+                navigationStates: { navigation.stream }, commandLinkReadiness: { link.stream })
+            let events = monitor.events()
+            navigation.continuation.yield(.failed(.depthUnavailable(reason)))
+            // A wrongly ignored depth failure must produce an assertion failure,
+            // not leave this test waiting indefinitely for its first event.
+            navigation.continuation.yield(.failed(.commsLost))
+            let event = await firstEvent(from: events)
+            XCTAssertEqual(event, .reactiveSafetyFailed, "\(reason)")
+            navigation.continuation.finish()
+            link.continuation.finish()
+        }
+    }
+
     func testLiveSafetyMonitorEmitsTransportForMovementFailureAndIdleLinkLoss() async {
         let navigation = AsyncStream.makeStream(of: NavigationSafetyState.self)
         let link = AsyncStream.makeStream(of: RoverCommandLinkReadiness.self)

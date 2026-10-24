@@ -84,7 +84,7 @@ public final class NavigationSilentSearchMotion: SilentSearchMotion {
     private static func motionResult(from result: NavigationResult) -> SilentSearchMotionResult {
         switch result {
         case .arrived: .arrived
-        case .cancelled: .cancelled
+        case .cancelled, .reobservationRequired: .cancelled
         case .failed(let failure):
             switch failure {
             case .noPose: .failed(.noPose)
@@ -95,7 +95,7 @@ public final class NavigationSilentSearchMotion: SilentSearchMotion {
             case .tipping: .failed(.tipping)
             case .stalled: .failed(.stalled)
             case .rotationResolutionInsufficient: .failed(.rotationResolutionInsufficient)
-            case .trackingLost: .failed(.tracking)
+            case .trackingLost, .depthUnavailable: .failed(.tracking)
             case .cancelled: .cancelled
             }
         }

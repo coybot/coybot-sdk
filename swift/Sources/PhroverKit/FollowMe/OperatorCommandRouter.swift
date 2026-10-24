@@ -15,7 +15,12 @@ public protocol OperatorFollow: AnyObject {
 }
 
 extension MissionAgent: OperatorMission {}
-extension FollowMeCoordinator: OperatorFollow, OperatorFollowTimedStart {}
+extension FollowMeCoordinator: OperatorFollow, OperatorFollowTimedStart, OperatorFollowClearedStart {}
+
+@MainActor
+protocol OperatorFollowClearedStart: OperatorFollow {
+    func start(commandReceivedAt: TimeInterval, searchClearance: FollowSearchClearanceConfirmation) async -> Bool
+}
 
 /// Optional timing companion; existing public follow conformers remain compatible.
 @MainActor
@@ -75,7 +80,8 @@ public final class OperatorCommandRouter {
             monotonic: { clock.now }, utc: { Date() }, sink: eventSink)
     }
 
-    public func submit(_ text: String, finalizedTextReceivedAt: TimeInterval? = nil) async -> OperatorSubmission {
+    public func submit(_ text: String, finalizedTextReceivedAt: TimeInterval? = nil,
+                       searchClearance: FollowSearchClearanceConfirmation? = nil) async -> OperatorSubmission {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .rejected("Enter a request first.") }
         let kind = OperatorCommandKind.classify(text)
@@ -99,7 +105,7 @@ public final class OperatorCommandRouter {
             owner = .transitioning
             let task = Task { @MainActor in
                 await self.startFollow(token: token, kind: kind, commandID: commandID,
-                                       receivedAt: receivedAt, origin: origin)
+                                       receivedAt: receivedAt, origin: origin, searchClearance: searchClearance)
             }
             followStartTask = task
             let result = await task.value
@@ -122,7 +128,7 @@ public final class OperatorCommandRouter {
     }
 
     private func startFollow(token: UInt64, kind: OperatorCommandKind, commandID: UInt64,
-                             receivedAt: TimeInterval, origin: String) async -> OperatorSubmission {
+                             receivedAt: TimeInterval, origin: String, searchClearance: FollowSearchClearanceConfirmation?) async -> OperatorSubmission {
         guard generation == token else { return .rejected("Follow request cancelled.") }
         emitCommand("operator_command.ownership_stop_requested", kind: kind, commandID: commandID, receivedAt: receivedAt, origin: origin)
         missionTask?.cancel()
@@ -142,7 +148,9 @@ public final class OperatorCommandRouter {
         emitCommand("operator_command.ownership_stop_confirmed", kind: kind, commandID: commandID, receivedAt: receivedAt, origin: origin)
         emitCommand("operator_command.follow_start_requested", kind: kind, commandID: commandID, receivedAt: receivedAt, origin: origin)
         let started: Bool
-        if let timed = follow as? any OperatorFollowTimedStart { started = await timed.start(commandReceivedAt: receivedAt) }
+        if let searchClearance, let cleared = follow as? any OperatorFollowClearedStart {
+            started = await cleared.start(commandReceivedAt: receivedAt, searchClearance: searchClearance)
+        } else if let timed = follow as? any OperatorFollowTimedStart { started = await timed.start(commandReceivedAt: receivedAt) }
         else { started = await follow.start() }
         guard generation == token else { return .rejected("Follow request cancelled.") }
         guard started else {
@@ -163,6 +171,22 @@ public final class OperatorCommandRouter {
                 "command_received_at_s": .number(receivedAt), "command_elapsed_s": valid ? .number(now - receivedAt) : .null,
                 "receipt_origin": .string(origin), "receipt_time_availability": .string(valid ? "available" : "invalid"),
                 "physical_utterance_time_availability": .string("not_measured"), "timing_clock": .string("system_uptime")]))
+    }
+
+    /// Preserve other-tab ownership before preparing the explicit phone assertion.
+    public func prepareInitialFollowSearch() async -> OperatorSubmission {
+        guard owner == .mission || owner == .follow || (owner == .stopping && stopTask != nil) || mayStartFollow() else {
+            return .rejected("Stop the other rover activity before following.")
+        }
+        return await stop()
+    }
+
+    /// Fence a delayed start synchronously before background/leave cleanup awaits.
+    public func inhibitMotion() {
+        generation &+= 1
+        followStartTask = nil
+        owner = .stopping
+        follow.inhibitMotion()
     }
 
     public func stop() async -> OperatorSubmission {

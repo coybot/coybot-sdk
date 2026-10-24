@@ -1,10 +1,30 @@
 import XCTest
 @testable import PhroverOperator
-import PhroverKit
+@testable import PhroverKit
 import RoverNav
 
 @MainActor
 final class ConversationViewModelTests: XCTestCase {
+    func testFollowSpeechImmediatelyUsesOrdinarySubmission() async {
+        var submitted: [String] = []
+        var stops = 0
+        let model = ConversationViewModel(submit: { submitted.append($0); return .accepted },
+                                          stop: { stops += 1; return .accepted })
+        await model.submitFinalSpeech("follow me")
+        XCTAssertEqual(submitted, ["follow me"])
+        XCTAssertEqual(stops, 0, "The ordinary router owns admission and stop confirmation")
+    }
+
+    func testRepeatedFollowWhileActiveDoesNotPromptStopOrRenewClearance() async {
+        var stops = 0
+        var submissions = 0
+        let model = ConversationViewModel(submit: { _ in submissions += 1; return .accepted },
+            stop: { stops += 1; return .accepted }, followState: { .searching })
+        await model.submitFinalSpeech("follow me")
+        XCTAssertEqual(submissions, 1)
+        XCTAssertEqual(stops, 0)
+    }
+
     func testRuntimeInitializationIsSingleAndCancelledLoadCannotReplaceRuntime() throws {
         let model = ConversationRuntimeLifetime()
         let old = try XCTUnwrap(model.beginRuntimeInitialization())
@@ -71,7 +91,7 @@ final class ConversationViewModelTests: XCTestCase {
         XCTAssertTrue(disappeared)
         XCTAssertEqual(stops, 1)
         XCTAssertEqual(inhibits, inhibitsAtHandoff)
-        await model.submitFinalSpeech("follow me") // A later Talk command starts a new exit epoch.
+        await model.submitFinalSpeech("go to kitchen") // A later Talk command starts a new exit epoch.
         _ = await model.leaveTalk()
         XCTAssertEqual(stops, 2)
     }
@@ -83,7 +103,7 @@ final class ConversationViewModelTests: XCTestCase {
         })
         let leaving = Task { await model.leaveTalk() }
         while acknowledgement == nil { await Task.yield() }
-        await model.submitFinalSpeech("follow me")
+        await model.submitFinalSpeech("go to kitchen")
         acknowledgement?.resume(returning: .accepted)
         let left = await leaving.value
         XCTAssertFalse(left, "A later command needs its own stop acknowledgement before handoff")
@@ -115,7 +135,7 @@ final class ConversationViewModelTests: XCTestCase {
         var legacySubmissions = 0
         let model = ConversationViewModel()
         model.configure(submit: { _ in legacySubmissions += 1; return .accepted },
-            stop: { .accepted }, followState: { .idle }, submitFinalized: { text, time in
+            stop: { .accepted }, followState: { .searching }, submitFinalized: { text, time in
                 receivedText = text
                 receivedAt = time
                 now = 42.3
@@ -232,17 +252,46 @@ final class ConversationViewModelTests: XCTestCase {
         }
     }
 
-    func testFinalSpeechRoutesFollowMeWithoutTextEntry() async {
+    func testFinalSpeechRoutesFollowMeWithOriginalFinalizedTimestamp() async {
         var received: [String] = []
-        let model = ConversationViewModel(submit: { text in
-            received.append(text)
-            return .accepted
-        }, stop: { .accepted }, followState: { .idle })
-
+        var timestamps: [TimeInterval] = []
+        let model = ConversationViewModel(submitFinalized: { text, time in
+            received.append(text); timestamps.append(time); return .accepted
+        }, monotonic: { 42 })
         await model.submitFinalSpeech("follow me")
-
         XCTAssertEqual(received, ["follow me"])
+        XCTAssertEqual(timestamps, [42])
         XCTAssertNil(model.errorMessage)
+    }
+
+    func testStopNewCommandLeaveAndReconfigureFenceOldFollowSubmissionCompletion() async {
+        for action in 0..<4 {
+            var release: CheckedContinuation<OperatorSubmission, Never>?
+            let entered = expectation(description: "follow submission entered \(action)")
+            let model = ConversationViewModel(submit: { text in
+                if text == "follow me" { return await withCheckedContinuation { release = $0; entered.fulfill() } }
+                return .rejected("New command guidance")
+            }, stop: { .accepted })
+            let starting = Task { await model.submitFinalSpeech("follow me") }
+            await fulfillment(of: [entered], timeout: 2)
+            guard let release else { starting.cancel(); return }
+            defer { starting.cancel() }
+            switch action {
+            case 0: await model.stopFollowing()
+            case 1: await model.submitFinalSpeech("go to the kitchen")
+            case 2: model.prepareToLeave()
+            default: model.configure(submit: { _ in .accepted }, stop: { .accepted }, followState: { .idle })
+            }
+            release.resume(returning: .rejected("Stale follow failure"))
+            await starting.value
+            XCTAssertEqual(model.errorMessage, action == 1 ? "New command guidance" : nil)
+        }
+    }
+
+    func testUnavailableARGuidanceComesFromOrdinaryFollowAdmission() async {
+        let model = ConversationViewModel(submit: { _ in .rejected("Fresh AR tracking is required.") })
+        await model.submitFinalSpeech("follow me")
+        XCTAssertEqual(model.errorMessage, "Fresh AR tracking is required.")
     }
 
     func testRejectedFinalSpeechDisplaysGuidanceWhileStopRemainsAvailable() async {

@@ -79,6 +79,7 @@ struct FollowMotionFailureResolution {
         case .noPose: return "no_pose"
         case .noPath: return "no_path"
         case .pathRejected: return "path_rejected"
+        case .depthUnavailable(let reason): return context.failureCause?.rawValue ?? reason.rawValue
         case .obstacle: return "obstacle"
         case .commsLost: return "comms_lost"
         case .tipping: return "tipping"
@@ -105,6 +106,17 @@ struct FollowMotionFailureResolution {
             return context.failureCause == .poseSourceStale
                 ? "Camera pose is stale. Motion stopped; wait for fresh camera frames."
                 : "AR tracking lost. Wait for tracking to recover."
+        case .depthUnavailable(let reason):
+            if let description = context.failureCause?.searchClearanceDescription {
+                return "Search rotation stopped: \(description). Check the turning space and restart following."
+            }
+            if context.failureCause == .depthRecoveryExhausted {
+                return "Depth recovery limit reached. Reposition the rover or camera and restart following."
+            }
+            if context.failureCause == .depthRecoveryExcursion {
+                return "Depth recovery exceeded its measured movement limit. Motion stopped; reposition the rover."
+            }
+            return reason.followMotionMessage
         case .obstacle: return "Obstacle detected. Motion stopped."
         case .commsLost: return "Rover communication lost. Motion stopped."
         case .tipping: return "Rover tipping detected. Motion stopped."
@@ -134,6 +146,20 @@ struct FollowMotionFailureResolution {
         case .pathRejected: return "Navigation path rejected."
         case .commandFailed: return "Navigation command failed."
         case .cancelled: return "Navigation cancelled."
+        }
+    }
+}
+
+
+extension DepthSafetyUnavailableReason {
+    var followMotionMessage: String {
+        switch self {
+        case .missingRawDepth: "Depth is unavailable. Motion stopped; wait for depth sensing to resume."
+        case .staleRawDepth: "Depth is stale. Motion stopped; wait for fresh depth frames."
+        case .blindSweptVolume: "The camera cannot see the space needed to move. Reposition the rover or camera and try again."
+        case .invalidCalibration: "Depth calibration is invalid. Motion stopped; check camera mounting calibration."
+        case .invalidCollisionGeometry: "Rover collision geometry is invalid. Motion stopped; check rover configuration."
+        case .malformedDepth: "Depth data is invalid. Motion stopped; restart depth sensing."
         }
     }
 }

@@ -612,6 +612,10 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
     func testRecoveryDeadlineAndOwnershipAreRecheckedAfterEverySuspension() async {
         var outcomes: [Int] = []
         for boundary in ["pre_stop", "feedback", "detection", "send", "pulse_wait", "settle", "final_stop", "nonfinite_heading"] {
+            if boundary == "pulse_wait" {
+                outcomes.append(contentsOf: await recoveryCancellationAtActualPulseWait())
+                continue
+            }
             var time = 8.0
             let source = FollowRecoveryDiagnosticSourceFixture()
             var allowed = true
@@ -624,15 +628,18 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
                     if boundary == "feedback" { time = 12 }
                     if boundary == "detection" { allowed = false }
                     return Date()
-                }, sendCommand: { _ in sends += 1; await Task.yield(); if boundary == "send" { time = 12 }; yaw = 0.3 },
+                }, sendCommand: { _ in
+                    sends += 1; await Task.yield(); if boundary == "send" { time = 12 }
+                    yaw = 0.3
+                },
                 stopRover: {
                     stops += 1; await Task.yield()
                     if boundary == "pre_stop", stops == 1 { time = 12 }
                     if boundary == "final_stop", stops == 2 { time = 12 }
                 }, sleep: { duration in
                     await Task.yield()
-                    if sends > 0, (boundary == "pulse_wait" && Self.seconds(duration) <= 0.080 + 1e-12)
-                        || (boundary == "settle" && Self.seconds(duration) >= 0.299) { time = 12 }
+                    guard !Task.isCancelled else { return }
+                    if sends > 0, boundary == "settle", Self.seconds(duration) >= 0.299 { time = 12 }
                     let durationSeconds = Self.seconds(duration)
                     time += durationSeconds
                     source.uptime = time - durationSeconds
@@ -651,6 +658,78 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
             outcomes.append(result.result == .cancelled ? 1 : 0)
         }
         XCTAssertEqual(outcomes, [0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1])
+    }
+
+    /// Independent safety timers use the same sleeper as pulse waiting. They
+    /// must never advance a shared fake clock or identify this stage by duration.
+    /// Drive source time explicitly after the real controller reports its wait.
+    private func recoveryCancellationAtActualPulseWait() async -> [Int] {
+        var outcome = [0, 0]
+        for expireDeadline in [true, false] {
+            let initialSettle = expectation(description: "recovery initial post-stop source wait")
+            let pulseWait = expectation(description: "recovery actual pulse wait")
+            let completed = expectation(description: "recovery cancellation drained")
+            let source = FollowRecoveryDiagnosticSourceFixture()
+            let clock = FollowRecoveryDriverClock()
+            var allowed = true
+            var sends = 0
+            var stops = 0
+            var initialSettleReached = false
+            var pulseWaitReached = false
+            var result: FollowMotionResult?
+            let emitter = FollowDiagnosticEmitter(streamID: "recovery-controlled-pulse-wait",
+                monotonic: { clock.now }, utc: { Date() }) { event, _ in
+                    if event == "follow_scan.settle_begin", sends == 0, !initialSettleReached {
+                        initialSettleReached = true
+                        initialSettle.fulfill()
+                    }
+                    if event == "follow_scan.pulse_wait_begin", !pulseWaitReached {
+                        pulseWaitReached = true
+                        pulseWait.fulfill()
+                    }
+                }
+            let controller = FollowNavigationController(currentPose: { source.pose }, forwardClearance: { 2 },
+                plan: { _, goal in [goal] }, lastAckAt: { Date(timeIntervalSince1970: clock.now) },
+                sendCommand: { _ in sends += 1 }, stopRover: { stops += 1 },
+                sleep: { duration in try? await Task.sleep(for: duration) },
+                now: { Date(timeIntervalSince1970: clock.now) }, diagnosticEmitter: emitter,
+                poseSample: { source.snapshot }, sourceNow: { clock.now },
+                sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot },
+                transportUptime: { clock.now })
+            source.controller = controller
+            let request = FollowRecoveryHeadingRequest(stageHeading: 0.3,
+                authorization: .init(episodeID: UUID(), expectedGeneration: 4, deadline: 12,
+                    now: { clock.now }, canContinue: { allowed }))
+            let context = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 4,
+                purpose: .followScan, phase: "reacquiring")
+            let caller = Task {
+                result = await NavigationFollowMeMotion(navigation: controller).performRecoveryHeading(request, context: context)
+                completed.fulfill()
+            }
+            defer {
+                caller.cancel()
+                source.events.continuation.finish()
+            }
+            await fulfillment(of: [initialSettle], timeout: 2)
+            guard initialSettleReached else { return [sends, 0] }
+            // One real, settled source frame admits the first burst. Neither its
+            // timer nor any monitor advances this clock while awaiting the event.
+            clock.now = 8.301
+            source.capture(after: 0.301)
+            await fulfillment(of: [pulseWait], timeout: 2)
+            guard pulseWaitReached else { return [sends, 0] }
+            XCTAssertEqual(sends, 1)
+            XCTAssertEqual(stops, 1, "Inject before the burst stop, while pulse_wait owns the suspension")
+            if expireDeadline { clock.now = 12; source.uptime = 12 }
+            else { allowed = false }
+            source.capture(after: 0) // Wake the actual source wait after invalidation.
+            await fulfillment(of: [completed], timeout: 2)
+            XCTAssertEqual(result?.result, .cancelled,
+                expireDeadline ? "Deadline expires during actual pulse wait" : "Ownership revoked during actual pulse wait")
+            XCTAssertEqual(sends, 1, "No second burst after recovery loses authority")
+            outcome = [sends, result?.result == .cancelled ? 1 : 0]
+        }
+        return outcome
     }
 
     func testRecoveryRequiresRealFreshExpectedGenerationAtStopAndAfterFeedback() async {
@@ -1163,8 +1242,8 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         XCTAssertEqual(events.compactMap { $0["event"] as? String }, [
             "follow_scan.operation_begin", "follow_scan.stop_begin", "follow_scan.stop_response",
             "follow_scan.settle_begin", "follow_scan.stopped_source_rejected", "follow_scan.stopped_source_accepted", "follow_scan.settle_end",
-            "follow_scan.burst_plan",
-            "follow_scan.pulse_begin", "follow_scan.send_begin", "follow_scan.send_ack",
+            "follow_scan.burst_plan", "follow_depth.candidate",
+            "follow_scan.pulse_begin", "follow_scan.send_begin", "follow_depth.candidate", "follow_scan.send_ack",
             "follow_scan.pulse_wait_begin", "follow_scan.burst_wait_end", "follow_scan.pulse_wait_end",
             "follow_scan.burst_stop_obligation",
             "follow_scan.stop_begin", "follow_scan.stop_response",
@@ -2565,5 +2644,16 @@ private final class FollowRecoveryDiagnosticSourceFixture {
             frameID: .init(generation: generation, sequence: snapshot.frameID!.sequence + 1),
             sourceTimestamp: uptime - age, trackingQuality: .normal)
         controller?.ingestFollowTurnSource(snapshot)
+    }
+}
+
+/// Read by both MainActor controller code and synchronous transport eligibility.
+/// Only the test driver writes time; sleeps and safety monitors cannot advance it.
+private final class FollowRecoveryDriverClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 8.0
+    var now: Double {
+        get { lock.withLock { value } }
+        set { lock.withLock { value = newValue } }
     }
 }

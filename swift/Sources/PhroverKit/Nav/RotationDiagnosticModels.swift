@@ -13,6 +13,23 @@ struct FollowScanResponseSeed: Sendable, Equatable {
 
 /// Internal cause carried with the existing public navigation failure category.
 enum FollowMotionFailureCause: String, Sendable {
+    case searchClearanceExpired = "search_clearance_expired"
+    case searchClearanceSpaceExceeded = "search_clearance_space_exceeded"
+    case searchClearanceSourceInvalid = "search_clearance_source_invalid"
+    case searchClearanceInvalidated = "search_clearance_invalidated"
+
+    var searchClearanceDescription: String? {
+        switch self {
+        case .searchClearanceExpired: "the operator-confirmed turning space expired"
+        case .searchClearanceSpaceExceeded: "observed movement exceeded the confirmed turning-space budget"
+        case .searchClearanceSourceInvalid: "tracking or camera-source validity changed"
+        case .searchClearanceInvalidated: "the operator-confirmed turning space was invalidated"
+        default: nil
+        }
+    }
+
+    case depthRecoveryExhausted = "depth_recovery_exhausted"
+    case depthRecoveryExcursion = "depth_recovery_excursion"
     case burstPreSendExpired = "burst_pre_send_expired"
     case calibrationEvidenceIncomplete = "calibration_evidence_incomplete"
     case poseSourceStale = "pose_source_stale"
@@ -55,9 +72,11 @@ struct FollowMotionRequestContext: Sendable, Equatable {
     /// Initial person search is a directed sweep, not an absolute heading task.
     /// Recovery and alignment leave this false.
     let isSearchSweep: Bool
+    let searchClearance: FollowSearchClearanceGrant?
     init(sessionGeneration: UInt64, requestToken: UInt64, purpose: FollowMotionPurpose, phase: String,
           scanUsed: Double? = nil, scanRemaining: Double? = nil, scanResponseSeed: FollowScanResponseSeed? = nil,
-          isSearchSweep: Bool = false) {
+          isSearchSweep: Bool = false, searchClearance: FollowSearchClearanceGrant? = nil) {
+        self.searchClearance = searchClearance
         self.isSearchSweep = isSearchSweep
         self.scanResponseSeed = scanResponseSeed
         self.sessionGeneration = sessionGeneration
@@ -170,6 +189,8 @@ struct FollowMotionResult: Sendable {
 /// Facts are captured synchronously by NavigationController and frozen for delivery.
 @MainActor
 final class FollowMotionOperationEvidence {
+    var searchClearanceDiagnosticFields: [String: FollowDiagnosticValue] = [:]
+    var depthDiagnosticFields: [String: FollowDiagnosticValue] = [:]
     var readyDiagnosticFields: [String: FollowDiagnosticValue] = [:]
     var searchSweepTravel: Double?
     var searchSweepProgress: Double?
@@ -214,7 +235,7 @@ final class FollowMotionOperationEvidence {
             failureCause: failureCause)
     }
     func recordFailure(_ reason: NavigationFailure, cause: FollowMotionFailureCause? = nil) {
-        if primaryFailure == nil || primaryFailure == .commandFailed {
+        if primaryFailure == nil || primaryFailure == .commandFailed || (reason == .obstacle && failureCause?.searchClearanceDescription != nil) {
             primaryFailure = reason
             failureCause = cause
         } else if primaryFailure == reason, let cause {
@@ -236,7 +257,7 @@ final class FollowMotionOperationEvidence {
                 "stage_index": recoveryStageIndex.map { .number(Double($0)) } ?? .null,
                 "segment_index": recoverySegmentIndex.map { .number(Double($0)) } ?? .null,
                 "stage_segment_availability": .string(recoveryStageIndex == nil ? "not_supplied" : "captured_coordinator_cursor")
-            ]) { _, value in value } } ?? [:]).merging(readyDiagnosticFields) { _, value in value })
+            ]) { _, value in value } } ?? [:]).merging(readyDiagnosticFields) { _, value in value }.merging(depthDiagnosticFields) { _, value in value }.merging(searchClearanceDiagnosticFields) { _, value in value })
     }
     func result(_ result: NavigationResult) -> FollowMotionResult {
         .init(result: result, context: context, failure: failure(source: .result),

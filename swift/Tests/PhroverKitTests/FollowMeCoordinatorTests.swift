@@ -5,6 +5,159 @@ import XCTest
 
 @MainActor
 final class FollowMeCoordinatorTests: XCTestCase {
+    func testInitialSearchStartsAndContinuesWithoutDepthButAcquisitionRestoresDepthGate() async throws {
+        let perception = FollowPerceptionFake()
+        let motion = ContextualFollowMotionFake()
+        let clock = ManualFollowClock()
+        motion.legacy.useSourceClock(clock)
+        motion.legacy.suspendRotation = true
+        var config = FollowMeConfiguration()
+        config.stationaryPauseSeconds = 0
+        config.scanObservationSeconds = 0
+        let coordinator = FollowMeCoordinator(perception: perception, motion: motion, clock: clock,
+            configuration: config, eventSink: { _, _ in })
+        _ = await coordinator.start(); await drain()
+        perception.send(frame(1, depth: false)); await drain()
+        XCTAssertEqual(motion.contexts.count, 1, "Missing depth must not block initial search admission")
+        guard let first = motion.contexts.first else { _ = await coordinator.stop(); return }
+        let operation = FollowMotionOperationContext(request: first, controllerOperationID: 1, purpose: .followScan, profile: nil)
+        motion.resultOverride = .init(result: .arrived, context: operation, failure: nil, stopOutcome: .confirmed,
+            turnStopFence: .init(identity: UUID(), operationGeneration: 1, context: operation,
+                acknowledgementUptime: 0, sourceGeneration: 1, highestSequence: 1, highestSourceTimestamp: 0))
+        motion.legacy.releaseRotation(); await drain()
+        clock.advance(to: 0.301); perception.send(frame(2, at: 0.301, depth: false)); await drain()
+        XCTAssertEqual(motion.contexts.count, 2, "Fresh post-stop source permits another initial pulse without depth")
+        perception.send(frame(3, at: 0.301, depth: false, people: [person(3, at: 0.301)])); await drain()
+        XCTAssertEqual(coordinator.state, .aligning)
+        XCTAssertTrue(motion.legacy.alignments.isEmpty)
+        XCTAssertTrue(motion.legacy.goals.isEmpty)
+        XCTAssertEqual(coordinator.perceptionIssue, .depthUnavailable)
+        _ = await coordinator.stop(); motion.legacy.releaseRotation()
+    }
+
+    func testInitialClearanceIsScopedToSessionAndStopRevokesOutstandingRequest() async throws {
+        let perception = FollowPerceptionFake()
+        let motion = ContextualFollowMotionFake()
+        let clock = ManualFollowClock()
+        motion.legacy.useSourceClock(clock)
+        motion.legacy.suspendRotation = true
+        var config = FollowMeConfiguration()
+        config.stationaryPauseSeconds = 0
+        let coordinator = FollowMeCoordinator(perception: perception, motion: motion, clock: clock,
+            configuration: config, eventSink: { _, _ in })
+        let confirmation = FollowSearchClearanceConfirmation(sourceGeneration: 1, origin: .zero, confirmedAt: 0)
+        _ = await coordinator.start(commandReceivedAt: 0, searchClearance: confirmation)
+        await drain()
+        perception.send(frame(1)); await drain()
+        let context = try XCTUnwrap(motion.contexts.first)
+        let grant = try XCTUnwrap(context.searchClearance)
+        XCTAssertFalse(grant.revoked)
+        XCTAssertTrue(context.isSearchSweep)
+        coordinator.inhibitMotion()
+        XCTAssertTrue(grant.revoked, "Pending transports must lose authorization synchronously")
+        motion.legacy.releaseRotation()
+        _ = await coordinator.stop()
+        _ = await coordinator.start(); await drain()
+        perception.send(frame(2)); await drain()
+        XCTAssertNil(motion.contexts.last?.searchClearance, "A new session cannot inherit old confirmation")
+        coordinator.inhibitMotion(); motion.legacy.releaseRotation(); _ = await coordinator.stop()
+    }
+
+    func testInitialScanWithoutGrantRequiresPostStopFrameEvenWithZeroLookDelay() async {
+        let perception = FollowPerceptionFake()
+        let motion = ContextualFollowMotionFake()
+        let clock = ManualFollowClock()
+        motion.legacy.useSourceClock(clock)
+        motion.legacy.suspendRotation = true
+        var config = FollowMeConfiguration()
+        config.stationaryPauseSeconds = 0
+        config.scanObservationSeconds = 0
+        let coordinator = FollowMeCoordinator(perception: perception, motion: motion, clock: clock,
+            configuration: config, eventSink: { _, _ in })
+        _ = await coordinator.start(commandReceivedAt: 0); await drain()
+        perception.send(frame(1)); await drain()
+        let context = motion.contexts[0]
+        let operation = FollowMotionOperationContext(request: context, controllerOperationID: 1, purpose: .followScan, profile: nil)
+        motion.resultOverride = .init(result: .arrived, context: operation, failure: nil, stopOutcome: .confirmed,
+            turnStopFence: .init(identity: UUID(), operationGeneration: 1, context: operation,
+                acknowledgementUptime: 0, sourceGeneration: 1, highestSequence: 1, highestSourceTimestamp: 0))
+        motion.legacy.releaseRotation(); await drain()
+        XCTAssertEqual(motion.contexts.count, 1, "Initial rotation cannot resume search on pre-stop perception")
+        clock.advance(to: 0.1); perception.send(frame(2, at: 0.1)); await drain()
+        XCTAssertEqual(motion.contexts.count, 1, "A new frame before the settle boundary is insufficient")
+        clock.advance(to: 0.301); perception.send(frame(3, at: 0.301)); await drain()
+        XCTAssertEqual(motion.contexts.count, 2)
+        XCTAssertEqual(motion.contexts.last?.scanUsed, 2 * config.scanIncrement,
+            "The completed pure turn spends its angular sweep")
+        _ = await coordinator.stop(); motion.legacy.releaseRotation()
+    }
+
+    func testTranslatingScanRequiresPostStopFrameEvenWithZeroLookDelay() async {
+        let perception = FollowPerceptionFake()
+        let motion = ContextualFollowMotionFake()
+        let clock = ManualFollowClock()
+        motion.legacy.useSourceClock(clock)
+        motion.legacy.suspendRotation = true
+        var config = FollowMeConfiguration()
+        config.stationaryPauseSeconds = 0
+        config.scanObservationSeconds = 0
+        let coordinator = FollowMeCoordinator(perception: perception, motion: motion, clock: clock,
+            configuration: config, eventSink: { _, _ in })
+        _ = await coordinator.start(); await drain()
+        perception.send(frame(1)); await drain()
+        let context = motion.contexts[0]
+        let operation = FollowMotionOperationContext(request: context, controllerOperationID: 1, purpose: .followScan, profile: nil)
+        motion.resultOverride = .init(result: .reobservationRequired, context: operation, failure: nil, stopOutcome: .confirmed,
+            turnStopFence: .init(identity: UUID(), operationGeneration: 1, context: operation,
+                acknowledgementUptime: 0, sourceGeneration: 1, highestSequence: 1, highestSourceTimestamp: 0))
+        motion.legacy.releaseRotation(); await drain()
+        XCTAssertEqual(motion.contexts.count, 1, "Translation cannot resume search on the pre-stop perception")
+        clock.advance(to: 0.1); perception.send(frame(2, at: 0.1)); await drain()
+        XCTAssertEqual(motion.contexts.count, 1, "A new frame before the settle boundary is insufficient")
+        clock.advance(to: 0.301); perception.send(frame(3, at: 0.301)); await drain()
+        XCTAssertEqual(motion.contexts.count, 2)
+        XCTAssertEqual(motion.contexts.last?.scanUsed, config.scanIncrement,
+            "The translating attempt must not spend the requested angular sweep")
+        _ = await coordinator.stop(); motion.legacy.releaseRotation()
+    }
+
+    func testTranslatingAlignmentRecomputesTargetAndCannotSignalReadyFromOldMatch() async {
+        let perception = FollowPerceptionFake()
+        let motion = ContextualFollowMotionFake()
+        let clock = ManualFollowClock()
+        motion.legacy.useSourceClock(clock)
+        motion.legacy.suspendAlignment = true
+        var config = FollowMeConfiguration()
+        config.stationaryPauseSeconds = 0
+        let coordinator = FollowMeCoordinator(perception: perception, motion: motion, clock: clock,
+            configuration: config, eventSink: { _, _ in })
+        _ = await coordinator.start(); await drain()
+        perception.send(frame(1, people: [person(1, x: 1)])); await drain()
+        clock.advance(to: 0.301)
+        perception.send(frame(2, at: 0.301, people: [person(2, at: 0.301, x: 1)])); await drain()
+        XCTAssertEqual(motion.legacy.alignments.count, 1)
+        guard let context = motion.contexts.last else { _ = await coordinator.stop(); return }
+        let operation = FollowMotionOperationContext(request: context, controllerOperationID: 1, purpose: .followAlignment, profile: nil)
+        motion.resultOverride = .init(result: .reobservationRequired, context: operation, failure: nil, stopOutcome: .confirmed,
+            turnStopFence: .init(identity: UUID(), operationGeneration: 1, context: operation,
+                acknowledgementUptime: 0.301, sourceGeneration: 1, highestSequence: 2, highestSourceTimestamp: 0.301))
+        motion.legacy.releaseAlignment(); await drain()
+        XCTAssertEqual(motion.legacy.readySignals, 0)
+        clock.advance(to: 0.602)
+        perception.send(frame(3, at: 0.602, pose: .init(position: .init(1, 0.1), yaw: 0.3),
+            people: [person(3, at: 0.602, x: 1, y: 4)])); await drain()
+        // Re-alignment confirms its own stop before selecting a new match.
+        clock.advance(to: 0.903)
+        perception.send(frame(4, at: 0.903, pose: .init(position: .init(1, 0.1), yaw: 0.3),
+            people: [person(4, at: 0.903, x: 1, y: 4)])); await drain()
+        XCTAssertEqual(motion.legacy.alignments.count, 2)
+        if motion.legacy.alignments.count == 2 {
+            XCTAssertEqual(motion.legacy.alignments[1], .pi / 2 - 0.3, accuracy: 0.0001)
+        }
+        XCTAssertEqual(motion.legacy.readySignals, 0)
+        _ = await coordinator.stop(); motion.legacy.releaseAlignment()
+    }
+
     func testInvalidSearchAttemptBudgetsFailBeforeDispatch() async {
         for (attempts, interruptions) in [(0, 8), (-1, 8), (72, 0), (72, -1)] {
             let perception = FollowPerceptionFake()
@@ -45,9 +198,12 @@ final class FollowMeCoordinatorTests: XCTestCase {
                 guard motion.contexts.count > step else { break }
                 let context = motion.contexts[step]
                 let cancelled = onlyInterruptions || step == 0
-                motion.resultOverride = .init(result: cancelled ? .cancelled : .arrived,
-                    context: .init(request: context, controllerOperationID: UInt64(step + 1), purpose: .followScan, profile: nil),
+                let operation = FollowMotionOperationContext(request: context, controllerOperationID: UInt64(step + 1),
+                    purpose: .followScan, profile: nil)
+                motion.resultOverride = .init(result: cancelled ? .cancelled : .arrived, context: operation,
                     failure: nil, stopOutcome: .confirmed,
+                    turnStopFence: .init(identity: UUID(), operationGeneration: UInt(step + 1), context: operation,
+                        acknowledgementUptime: clock.now, sourceGeneration: 1, highestSequence: nil, highestSourceTimestamp: clock.now),
                     measuredScanResponse: cancelled ? nil : .init(sourceGeneration: 1, responseRate: 2.1),
                     // Absolute sampled travel includes back-and-forth motion;
                     // only the net directed arc counts as search coverage.
@@ -60,6 +216,10 @@ final class FollowMeCoordinatorTests: XCTestCase {
                 motion.legacy.releaseRotation(); await drain()
                 if onlyInterruptions, coordinator.isActive {
                     perception.send(frame(UInt64(3 + step * 2), at: clock.now)); await drain()
+                }
+                if !cancelled {
+                    clock.advance(to: clock.now + 0.301)
+                    perception.send(frame(UInt64(20 + step), at: clock.now)); await drain()
                 }
                 if !onlyInterruptions && step == 1 {
                     XCTAssertEqual(coordinator.state, .searching, "One canceled request plus one completed turn is not a completed scan")
@@ -235,9 +395,11 @@ final class FollowMeCoordinatorTests: XCTestCase {
         perception.send(frame(1)); await drain()
         let first = try XCTUnwrap(motion.contexts.first)
         XCTAssertTrue(first.isSearchSweep)
-        motion.resultOverride = .init(result: .arrived,
-            context: .init(request: first, controllerOperationID: 1, purpose: .followScan, profile: nil),
+        let firstOperation = FollowMotionOperationContext(request: first, controllerOperationID: 1, purpose: .followScan, profile: nil)
+        motion.resultOverride = .init(result: .arrived, context: firstOperation,
             failure: nil, stopOutcome: .confirmed,
+            turnStopFence: .init(identity: UUID(), operationGeneration: 1, context: firstOperation,
+                acknowledgementUptime: 0, sourceGeneration: 1, highestSequence: 1, highestSourceTimestamp: 0),
             measuredScanResponse: .init(sourceGeneration: 1, responseRate: 5.519739222415692),
             searchSweepTravel: 0.483189002088996, searchSweepProgress: 0.483189002088996)
         motion.legacy.releaseRotation(); await drain()
@@ -252,9 +414,11 @@ final class FollowMeCoordinatorTests: XCTestCase {
             "The remaining arc includes measured overshoot, not just requested increments")
         XCTAssertEqual(motion.contexts.last?.scanRemaining, 0)
         let second = try XCTUnwrap(motion.contexts.last)
-        motion.resultOverride = .init(result: .arrived,
-            context: .init(request: second, controllerOperationID: 2, purpose: .followScan, profile: nil),
+        let secondOperation = FollowMotionOperationContext(request: second, controllerOperationID: 2, purpose: .followScan, profile: nil)
+        motion.resultOverride = .init(result: .arrived, context: secondOperation,
             failure: nil, stopOutcome: .confirmed,
+            turnStopFence: .init(identity: UUID(), operationGeneration: 2, context: secondOperation,
+                acknowledgementUptime: 1.01, sourceGeneration: 1, highestSequence: 5, highestSourceTimestamp: 1.01),
             measuredScanResponse: .init(sourceGeneration: 1, responseRate: 5.6), searchSweepTravel: 0.2, searchSweepProgress: 0.2)
         motion.legacy.releaseRotation(); await drain()
         for (id, time) in [(UInt64(6), 1.3), (7, 1.6), (8, 1.9), (9, 2.02)] {
@@ -304,9 +468,11 @@ final class FollowMeCoordinatorTests: XCTestCase {
         perception.send(frame(1)); await drain()
         let first = try XCTUnwrap(motion.contexts.first)
         XCTAssertNil(first.scanResponseSeed)
-        motion.resultOverride = .init(result: .arrived,
-            context: .init(request: first, controllerOperationID: 1, purpose: .followScan, profile: nil),
+        let operation = FollowMotionOperationContext(request: first, controllerOperationID: 1, purpose: .followScan, profile: nil)
+        motion.resultOverride = .init(result: .arrived, context: operation,
             failure: nil, stopOutcome: .confirmed,
+            turnStopFence: .init(identity: UUID(), operationGeneration: 1, context: operation,
+                acknowledgementUptime: 0, sourceGeneration: 1, highestSequence: 1, highestSourceTimestamp: 0),
             measuredScanResponse: .init(sourceGeneration: 1, responseRate: 10))
         motion.legacy.releaseRotation(); await drain()
         for (id, time) in [(UInt64(2), 0.3), (3, 0.6), (4, 0.9), (5, 1.01)] {

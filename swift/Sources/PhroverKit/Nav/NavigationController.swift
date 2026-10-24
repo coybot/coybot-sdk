@@ -183,7 +183,7 @@ public final class NavigationController {
                 defer { self.mirroringFollowState = false }
                 switch result.result {
                 case .arrived: self.state = .arrived; self.publishSafetyState(.idle)
-                case .cancelled: self.state = .idle; self.publishSafetyState(.idle)
+                case .cancelled, .reobservationRequired: self.state = .idle; self.publishSafetyState(.idle)
                 case .failed(let failure):
                     self.state = .failed(FollowNavigationController.message(for: failure))
                     self.publishSafetyState(.failed(failure))

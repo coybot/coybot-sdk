@@ -98,7 +98,29 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     public private(set) var pose: Pose2D?
     public private(set) var meshAnchors: [ARMeshAnchor] = []
     /// Nearest obstacle distance (m) in a forward cone from the latest depth frame.
-    private(set) var latestDepthSafetySnapshot: DepthSafetySnapshot?
+    private(set) var latestDepthSafetySnapshot: DepthSafetySnapshot? {
+        didSet {
+            // Publication is synchronous with assignment, independent of pose
+            // delivery. Snapshot callbacks tolerate unsubscribe/revoke reentrancy.
+            let published = latestDepthSafetySnapshot
+            for observer in Array(depthSafetyObservers.values) { observer(published) }
+        }
+    }
+    @ObservationIgnored private var depthSafetyObservers: [UUID: (DepthSafetySnapshot?) -> Void] = [:]
+    private struct WeakSearchClearance { weak var value: FollowSearchClearanceGrant? }
+    @ObservationIgnored private var followSearchClearances: [WeakSearchClearance] = []
+
+    func registerFollowSearchClearance(_ grant: FollowSearchClearanceGrant) {
+        followSearchClearances.removeAll { $0.value == nil || $0.value?.revoked == true }
+        followSearchClearances.append(.init(value: grant))
+    }
+
+    private func revokeFollowSearchClearances() {
+        let grants = followSearchClearances.compactMap(\.value)
+        followSearchClearances.removeAll()
+        for grant in grants { grant.revoke(cause: .searchClearanceSourceInvalid, detail: "producer_invalidated") }
+    }
+
     @ObservationIgnored private let depthProjection: @Sendable (DepthSafetyProcessor.Input) -> DepthSafetySnapshot
     @ObservationIgnored private lazy var depthProcessor = DepthSafetyProcessor(evaluate: depthProjection) { [weak self] snapshot in
         guard let self, self.acceptsObservations else { return }
@@ -129,6 +151,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     public var observationHandler: ((PoseObservation) -> Void)?
     public var onReset: ((UInt64) -> Void)?
     private var acceptsObservations = false
+    var acceptsFollowSearchClearance: Bool { acceptsObservations }
     private var lastObservationTimestamp: TimeInterval?
     nonisolated private let relativeHeadingStore = RelativeHeadingTrackerStore()
     private var loggedRelativeHeadingReliability: RelativeHeadingReliability = .unreliable(.notStarted)
@@ -309,6 +332,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     }
 
     func resetTracking(generation: UInt64, runSession: Bool) {
+        revokeFollowSearchClearances()
         depthProcessor.invalidate()
         hasResetTracking = true
         acceptsObservations = false
@@ -366,7 +390,10 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     }
 
     public func pause() {
+        acceptsObservations = false
+        revokeFollowSearchClearances()
         depthProcessor.invalidate()
+        latestDepthSafetySnapshot = nil
         session.pause()
         motionManager.stopDeviceMotionUpdates()
     }
@@ -453,6 +480,12 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
             imageResolution: intrinsicsImageSize, cameraTransform: cameraTransform, timestamp: timestamp))
     }
 
+    func observeDepthSafety(_ observer: @escaping (DepthSafetySnapshot?) -> Void) -> () -> Void {
+        let id = UUID()
+        depthSafetyObservers[id] = observer
+        return { [weak self] in self?.depthSafetyObservers.removeValue(forKey: id) }
+    }
+
     func depthSafetyObservation(
         for command: WheelCommand,
         at timestamp: TimeInterval = ProcessInfo.processInfo.systemUptime
@@ -467,7 +500,8 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         return DepthSafetyEvaluator.evaluate(
             latestDepthSafetySnapshot,
             command: command,
-            now: timestamp
+            now: timestamp,
+            operatorClearedRotation: FollowSearchRotationScope.authorized
         )
     }
 
@@ -526,6 +560,9 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
               lastObservationTimestamp.map({ observation.timestamp > $0 }) ?? true else {
             return false
         }
+        let observedAt = ProcessInfo.processInfo.systemUptime
+        for grant in followSearchClearances.compactMap(\.value) { grant.observeIngress(observation, now: observedAt) }
+        followSearchClearances.removeAll { $0.value == nil || $0.value?.revoked == true }
         latestObservation = observation
         lastObservationTimestamp = observation.timestamp
         pose = observation.pose
@@ -536,6 +573,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     }
 
     private func suspendObservations() {
+        revokeFollowSearchClearances()
         depthProcessor.invalidate()
         turnEvidence.clear()
         acceptsObservations = false

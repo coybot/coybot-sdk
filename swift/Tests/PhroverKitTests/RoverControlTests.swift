@@ -110,7 +110,8 @@ final class RoverControlTests: XCTestCase {
                 return receipt
             }, poseSample: { snapshot }, sourceNow: { clock.now }, sourceStopSnapshot: { snapshot }, transportUptime: { clock.now })
         let task = Task { await NavigationFollowMeMotion(navigation: controller).perform(.scan(0.3), context:
-            .init(sessionGeneration: 1, requestToken: 1, purpose: .followScan, phase: "searching", isSearchSweep: true)) }
+            .init(sessionGeneration: 1, requestToken: 1, purpose: .followScan, phase: "searching", isSearchSweep: true,
+                allowsAcquisitionRotationWithoutDepth: true)) }
         for _ in 0..<2000 where stops < 1 { await Task.yield() }
         clock.set(10.301); snapshot = sample(2, 0); controller.ingestFollowTurnSource(snapshot)
         for _ in 0..<4000 where stops < 2 { await Task.yield() }

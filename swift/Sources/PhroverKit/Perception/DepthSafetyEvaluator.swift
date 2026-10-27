@@ -12,7 +12,7 @@ enum DepthSafetyEvaluator {
     private static let cautionLeadDistance = 0.35
     private static let cautionSpeedLimit = 0.12
     private static let minimumConnectedCells = 3
-    private static let minimumSweptVolumeCoverage = 0.90
+    static let minimumSweptVolumeCoverage = 0.90
     private static let maximumGroundOffset = 0.20
     private static let minimumGroundPlaneSamples = 40
     private static let minimumGroundPlaneSampleRatio = 0.05
@@ -220,8 +220,9 @@ enum DepthSafetyEvaluator {
 
     static func evaluate(_ snapshot: DepthSafetySnapshot,
                          command: WheelCommand,
-                         now: TimeInterval,
-                         operatorClearedRotation: Bool = false) -> DepthSafetyObservation {
+                          now: TimeInterval,
+                          operatorClearedRotation: Bool = false,
+                          boundedReadyMotion: Bool = false) -> DepthSafetyObservation {
         let motion = DepthSafetyMotionClass.classify(command)
         let age = max(0, now - snapshot.timestamp)
         guard now.isFinite, snapshot.timestamp.isFinite, now >= snapshot.timestamp,
@@ -253,6 +254,21 @@ enum DepthSafetyEvaluator {
         // Faster motion still requires the full latency and braking distance.
         let stoppingDistance = max(confirmedRotation ? FollowSearchClearancePolicy.retainedClearance : minimumStoppingDistance, latencyAndBrakingDistance)
         let cautionDistance = stoppingDistance + cautionLeadDistance
+        let boundedForward = boundedReadyMotion && motion == .forward && command.left == command.right &&
+            command.left > 0 && command.left <= RoverConfig.readySignalWheelMagnitude
+        // Keep the full collision/stopping margin. Only the cruise look-ahead
+        // beyond stopping distance is unnecessary for the bounded experiment.
+        let visibilityHorizon = boundedForward ? stoppingDistance : cautionDistance
+        func checkingCoverage(_ observation: DepthSafetyObservation, horizon: Double) -> DepthSafetyObservation {
+            let coverage = sweptVolumeCoverage(snapshot: snapshot, command: command, motion: motion, horizon: horizon)
+            var result = coverage.fraction >= minimumSweptVolumeCoverage ? observation : DepthSafetyObservation(
+                state: .unavailable(.blindSweptVolume), clearance: observation.clearance,
+                supportCount: observation.supportCount, sampleAge: age, requiredStoppingDistance: stoppingDistance,
+                motionClass: motion, speedLimit: nil)
+            result.coverage = coverage
+            result.coverageProvenance = boundedForward ? "bounded_ready_motion_stopping_corridor" : "depth"
+            return result
+        }
         var contactTravel: [DepthSafetyCell: Double] = [:]
         for occupiedCell in snapshot.cells {
             if confirmedRotation {
@@ -296,22 +312,14 @@ enum DepthSafetyEvaluator {
                 if confirmedRotation { observation.coverageProvenance = "operator_confirmed_rotation" }
                 return observation
             }
-            guard sweptVolumeCoverage(
-                snapshot: snapshot,
-                command: command,
-                motion: motion,
-                horizon: clearance
-            ) >= minimumSweptVolumeCoverage else {
-                return .unavailable(.blindSweptVolume, sampleAge: age, motionClass: motion)
-            }
-            return hazardObservation(
+            return checkingCoverage(hazardObservation(
                 state: state,
                 clearance: clearance,
                 supportCount: nearestCluster.count,
                 age: age,
                 stoppingDistance: stoppingDistance,
                 motion: motion
-            )
+            ), horizon: min(clearance, visibilityHorizon))
         }
 
         // Raw depth validity and all observed collision clusters were checked
@@ -322,15 +330,8 @@ enum DepthSafetyEvaluator {
             return observation
         }
 
-        guard sweptVolumeCoverage(
-            snapshot: snapshot,
-            command: command,
-            motion: motion,
-            horizon: cautionDistance
-        ) >= minimumSweptVolumeCoverage else {
-            return .unavailable(.blindSweptVolume, sampleAge: age, motionClass: motion)
-        }
-        return clearObservation(age: age, motion: motion, stoppingDistance: stoppingDistance)
+        return checkingCoverage(clearObservation(age: age, motion: motion, stoppingDistance: stoppingDistance),
+            horizon: visibilityHorizon)
     }
 
     private static func unavailableSnapshot(timestamp: TimeInterval,
@@ -396,19 +397,28 @@ enum DepthSafetyEvaluator {
     private static func sweptVolumeCoverage(snapshot: DepthSafetySnapshot,
                                             command: WheelCommand,
                                             motion: DepthSafetyMotionClass,
-                                            horizon: Double) -> Double {
-        guard let projection = snapshot.projection else { return 0 }
+                                            horizon: Double) -> DepthSafetyCoverage {
         let points = coveragePoints(
             command: command,
             motion: motion,
             geometry: snapshot.geometry,
             horizon: horizon
         )
-        guard !points.isEmpty else { return 0 }
-        let covered = points.reduce(into: 0) { result, point in
-            if hasDepthSupport(at: point, projection: projection) { result += 1 }
+        guard let projection = snapshot.projection else {
+            return .init(horizon: horizon, requiredPoints: points.count, coveredPoints: 0,
+                outsideViewPoints: 0, missingDepthPoints: points.count, occludedPoints: 0, projectionAvailable: false)
         }
-        return Double(covered) / Double(points.count)
+        var covered = 0, outside = 0, missing = 0, occluded = 0
+        for point in points {
+            switch depthSupport(at: point, projection: projection) {
+            case .covered: covered += 1
+            case .outsideView: outside += 1
+            case .missingDepth: missing += 1
+            case .occluded: occluded += 1
+            }
+        }
+        return .init(horizon: horizon, requiredPoints: points.count, coveredPoints: covered,
+            outsideViewPoints: outside, missingDepthPoints: missing, occludedPoints: occluded, projectionAvailable: true)
     }
 
     private static func coveragePoints(command: WheelCommand,
@@ -464,8 +474,10 @@ enum DepthSafetyEvaluator {
         return result
     }
 
-    private static func hasDepthSupport(at roverPoint: SIMD3<Double>,
-                                        projection: DepthSafetyProjection) -> Bool {
+    private enum DepthSupport { case covered, outsideView, missingDepth, occluded }
+
+    private static func depthSupport(at roverPoint: SIMD3<Double>,
+                                      projection: DepthSafetyProjection) -> DepthSupport {
         let world = projection.roverOrigin
             + projection.roverRight * roverPoint.x
             + SIMD3<Double>(0, roverPoint.y, 0)
@@ -474,15 +486,16 @@ enum DepthSafetyEvaluator {
             Float(world.x), Float(world.y), Float(world.z), 1
         )
         let targetDepth = -Double(camera.z)
-        guard targetDepth > 0.05, targetDepth.isFinite else { return false }
-        let pixelX = Int((projection.fx * Double(camera.x) / targetDepth + projection.cx).rounded())
-        let pixelY = Int((projection.cy - projection.fy * Double(camera.y) / targetDepth).rounded())
-        guard pixelX >= 0, pixelX < projection.width,
-              pixelY >= 0, pixelY < projection.height else { return false }
+        guard targetDepth > 0.05, targetDepth.isFinite else { return .outsideView }
+        let x = (projection.fx * Double(camera.x) / targetDepth + projection.cx).rounded()
+        let y = (projection.cy - projection.fy * Double(camera.y) / targetDepth).rounded()
+        guard x.isFinite, y.isFinite, x >= 0, x < Double(projection.width),
+              y >= 0, y < Double(projection.height) else { return .outsideView }
+        let pixelX = Int(x), pixelY = Int(y)
+        guard pixelY * projection.width + pixelX < projection.depthValues.count else { return .missingDepth }
         let measured = Double(projection.depthValues[pixelY * projection.width + pixelX])
-        return measured > 0.05
-            && measured.isFinite
-            && measured + cellResolution >= targetDepth
+        guard measured > 0.05, measured.isFinite else { return .missingDepth }
+        return measured + cellResolution >= targetDepth ? .covered : .occluded
     }
 
     private static func sweepStepCount(horizon: Double, curvature: Double) -> Int {

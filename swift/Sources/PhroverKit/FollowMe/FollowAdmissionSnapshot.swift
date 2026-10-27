@@ -3,6 +3,15 @@ import RoverNav
 
 /// Shared frame health gates. Diagnostics do not influence the decision.
 enum FollowFrameHealth {
+    /// Depth-only loss may be tolerated by initial acquisition; tracking, pose
+    /// and malformed-source faults must not be hidden behind it in a mailbox.
+    /// Ordinary capture-age expiry is handled by the independent freshness gate.
+    static func safetyTransitionPriority(_ batch: FollowFrameBatch) -> Int {
+        guard batch.timestamp.isFinite, batch.trackingQuality == .normal,
+              let pose = batch.pose, pose.position.x.isFinite, pose.position.y.isFinite, pose.yaw.isFinite else { return 2 }
+        return batch.depthAvailable ? 0 : 1
+    }
+
     static func issue(_ batch: FollowFrameBatch, now: TimeInterval,
                       configuration: FollowMeConfiguration) -> FollowPerceptionIssue? {
         let age = now - batch.timestamp
@@ -41,14 +50,16 @@ struct FollowAdmissionSnapshot {
 
     init(batch: FollowFrameBatch, previous: FollowPersonObservation?, pending: Bool,
           tracker: FollowTargetTracker, now: TimeInterval, configuration: FollowMeConfiguration,
-          acceptedAssociation: (decision: FollowTrackMatch, evaluation: FollowAssociationEvaluation)? = nil) {
+          acceptedAssociation: (decision: FollowTrackMatch, evaluation: FollowAssociationEvaluation)? = nil,
+          requiresDepth: Bool = true) {
         self.batch = batch
         self.pending = pending
         self.evaluatedAt = now
         var person: FollowPersonObservation?
         var association: (decision: FollowTrackMatch, evaluation: FollowAssociationEvaluation)?
         var rejection: String?
-        if let issue = FollowFrameHealth.issue(batch, now: now, configuration: configuration) {
+        if let issue = FollowFrameHealth.issue(batch, now: now, configuration: configuration),
+           requiresDepth || issue != .depthUnavailable {
             rejection = FollowFrameHealth.rejectionCondition(issue, batch: batch, now: now)
         } else if let previous {
             if batch.frameID.generation != previous.frameID.generation {

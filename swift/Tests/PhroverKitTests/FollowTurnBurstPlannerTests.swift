@@ -2,6 +2,38 @@ import XCTest
 import PhroverKit
 
 final class FollowTurnBurstPlannerTests: XCTestCase {
+    func testRecordedStopLatencySpikeAllowsOneShrunkenOppositeCorrection() throws {
+        // iPhone 15 Pro Max, 2026-10-24 17:54:25–26Z, alignment 14,
+        // pulse 6. Minimized to the immutable ingress endpoints plus their
+        // separate control reads; these reproduce the logged rate/overhead/cap.
+        let profile = Planner.Profile(purpose: .alignment)
+        let seed = initial(1.6160948671430133)
+        let first = sample(1.517722599984274, 2677, 1482627.672592041,
+            collected: 1482627.7102962919)
+        let last = sample(2.0431603854449154, 2719, 1482628.372649791,
+            collected: 1482628.411234125)
+        let captured = Planner.Response(operationID: 1, generation: 7, targetYaw: seed.targetYaw,
+            clockDomain: "test_uptime", requestedBudget: 0.08,
+            sendEntryUptime: 1482627.7154253335, sendResponseUptime: 1482627.7606583333,
+            stopObligationUptime: 1482627.7974909167, stopAcknowledgementUptime: 1482628.1124181252,
+            samples: [first, last],
+            planningEvaluation: sample(first.yaw, 2677, first.sourceTimestamp, collected: 1482627.7149122918),
+            stoppedEvaluation: sample(last.yaw, 2719, last.sourceTimestamp, collected: 1482628.41537775))
+        let measured = Planner.recording(captured, in: seed, profile: profile)
+        XCTAssertNil(measured.rejection)
+        XCTAssertEqual(measured.calibration.responseOverhead, 0.3169927916768938, accuracy: 1e-9)
+        let ceiling = try XCTUnwrap(measured.calibration.overshootCeiling)
+        XCTAssertEqual(ceiling, 0.007364870741655125, accuracy: 1e-9)
+        let decision = Planner.plan(.init(actualYaw: 2.042520687077125, profile: profile,
+            calibration: measured.calibration, sendEntryUptime: 1482628.42, provisionalProbeIssued: true))
+        guard case .burst(let direction, let budget) = decision else {
+            return XCTFail("A complete confirmed overshoot must permit one smaller corrective probe, got \(decision)")
+        }
+        XCTAssertEqual(direction, -1)
+        XCTAssertGreaterThan(budget, 0)
+        XCTAssertLessThanOrEqual(budget, ceiling)
+    }
+
     func testCapturedAlignmentCanRepeatWithinSweptHeadingRangeDespiteSmallReversals() {
         // iPhone trace, 2026-10-23 17:45:53Z. Total yaw variation exceeds the
         // corridor, but every sampled heading remains inside a smaller range.
@@ -53,6 +85,49 @@ final class FollowTurnBurstPlannerTests: XCTestCase {
                     profile: profile, calibration: measured.calibration, sendEntryUptime: 9205,
                     provisionalProbeIssued: true)), .burst(direction: Int(direction), budget: 0.08))
             }
+        }
+    }
+
+    func testOvershootCorrectionRequiresImprovingMeasuredResponseBeforeRepeating() throws {
+        let profile = Planner.Profile(purpose: .alignment)
+        for sign in [-1.0, 1.0] {
+            let seed = initial(sign * 0.1)
+            let overshoot = Planner.recording(response(seed, samples: [sample(0), sample(sign * 0.6, 2, 100.8)],
+                stop: 0.3), in: seed, profile: profile)
+            XCTAssertNil(overshoot.rejection)
+            let calibration = overshoot.calibration
+            let ceiling = try XCTUnwrap(calibration.overshootCeiling)
+            for end in [0.6, 0.7, -0.6] { // zero progress, wrong direction, another overshoot
+                let reduced = Planner.recording(response(seed, budget: ceiling,
+                    samples: [sample(sign * 0.6, 3, 100.9), sample(sign * end, 4, 101.8)],
+                    stop: 0.3, entry: 101), in: calibration, profile: profile)
+                XCTAssertNil(reduced.rejection)
+                XCTAssertEqual(Planner.plan(.init(actualYaw: sign * end, profile: profile,
+                    calibration: reduced.calibration, sendEntryUptime: 102)),
+                    .resolutionFailure(.rotationResolutionInsufficient))
+            }
+
+            var current = calibration
+            var previous = sign * 0.6
+            for (index, end) in [0.45, 0.3, 0.14].enumerated() {
+                let entry = Double(101 + index)
+                let before = Planner.plan(.init(actualYaw: previous, profile: profile,
+                    calibration: current, sendEntryUptime: entry))
+                guard case .burst(let direction, let budget) = before else { return XCTFail("\(before)") }
+                XCTAssertEqual(direction, -Int(sign))
+                XCTAssertLessThanOrEqual(budget, ceiling)
+                let reduced = Planner.recording(response(seed, budget: budget,
+                    samples: [sample(previous, UInt64(3 + index * 2), entry - 0.1),
+                        sample(sign * end, UInt64(4 + index * 2), entry + 0.8)],
+                    stop: 0.3, entry: entry), in: current, profile: profile)
+                XCTAssertNil(reduced.rejection)
+                current = reduced.calibration
+                previous = sign * end
+            }
+            XCTAssertEqual(Planner.plan(.init(actualYaw: previous, profile: profile,
+                calibration: current, sendEntryUptime: 104)), .arrived)
+            XCTAssertGreaterThanOrEqual(current.responseOverhead, calibration.responseOverhead,
+                "Correction must not erase observed latency")
         }
     }
 

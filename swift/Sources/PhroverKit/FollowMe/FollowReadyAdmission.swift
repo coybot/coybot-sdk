@@ -3,6 +3,14 @@ import Foundation
 enum FollowMotionOutcome: Sendable, Equatable {
     case navigation(NavigationResult)
     case notStarted(FollowReadyDeferral)
+    case scanDeferred(FollowScanDeferral)
+}
+
+enum FollowScanDeferral: String, Sendable {
+    case newerFramePending = "newer_frame_pending"
+    case insufficientFreshness = "insufficient_freshness_headroom"
+    case perceptionUnavailable = "perception_unavailable"
+    case ownershipChanged = "ownership_changed"
 }
 
 enum FollowReadyDeferral: String, Sendable {
@@ -16,6 +24,7 @@ enum FollowReadyAdmissionDecision {
 
 enum FollowReadyAdmissionBoundary: String {
     case legacyCall = "legacy_signal_call", controllerFirstSend = "controller_first_send"
+    case recoveryProbe = "recovery_probe"
 }
 
 struct FollowReadyAdmissionToken: Equatable {
@@ -26,6 +35,7 @@ struct FollowReadyAdmissionToken: Equatable {
 /// Synchronous MainActor authorization; the controller invokes it at first send.
 @MainActor
 final class FollowReadyAdmission {
+    let allowsPathRecovery: Bool
     let authorize: @MainActor (NavigationPoseSample?, Double?) -> FollowReadyAdmissionDecision
     private(set) var deferred: FollowReadyDeferral?
     private(set) var boundary: FollowReadyAdmissionBoundary?
@@ -34,9 +44,12 @@ final class FollowReadyAdmission {
     var observationSnapshot: FollowAdmissionSnapshot?
     var rejectionCondition: String?
     init(_ authorize: @escaping @MainActor () -> FollowReadyAdmissionDecision) {
+        allowsPathRecovery = false
         self.authorize = { _, _ in authorize() }
     }
-    init(validating authorize: @escaping @MainActor (NavigationPoseSample?, Double?) -> FollowReadyAdmissionDecision) {
+    init(allowsPathRecovery: Bool = false,
+         validating authorize: @escaping @MainActor (NavigationPoseSample?, Double?) -> FollowReadyAdmissionDecision) {
+        self.allowsPathRecovery = allowsPathRecovery
         self.authorize = authorize
     }
     func admit(boundary: FollowReadyAdmissionBoundary = .legacyCall,

@@ -38,7 +38,7 @@ final class FollowTurnBurstDiagnosticTrace {
         fields["planning_uptime_s"] = .number(uptime)
         fields["controller_phase"] = .string("stopped_planning")
         fields["budget_formula"] = .string(searchSweepAngle == nil
-            ? "min(maximum,max(E/R-H,repeatableObservedBudget),overshootCeiling)" : "maximum_host_burst_budget")
+            ? "min(maximum,max(E/R-H,repeatableObservedBudget,oneOvershootCorrection),overshootCeiling)" : "maximum_host_burst_budget")
         fields["budget_units"] = .string("angles_rad;rates_rad/s;durations_s;wheels_m/s")
         fields["allowance_policy"] = .string(searchSweepAngle == nil
             ? "command_stop_window_overhead_once;coast_in_response" : "diagnostic_only_for_initial_search")
@@ -65,7 +65,9 @@ final class FollowTurnBurstDiagnosticTrace {
             ? Self.number(excess.map { $0 / calibration.responseRate - calibration.responseOverhead })
             : .number(profile.maximumHostBurstBudget)
         let observedBudget = error.flatMap { FollowTurnBurstPlanner.repeatableBudget(calibration, error: $0, profile: profile) }
+        let correctionBudget = error.flatMap { FollowTurnBurstPlanner.overshootCorrectionBudget(calibration, error: $0, profile: profile) }
         fields["repeatable_observed_budget_s"] = Self.number(observedBudget)
+        fields["overshoot_correction_budget_s"] = Self.number(correctionBudget)
         fields["planning_source"] = .object(Self.source(sample, uptime: uptime))
         fields["budget_selection_reason"] = .null
         switch decision {
@@ -75,8 +77,9 @@ final class FollowTurnBurstDiagnosticTrace {
             fields["direction"] = .number(Double(direction))
             fields["planning_decision"] = .string("burst")
             fields["budget_selection_reason"] = .string(searchSweepAngle != nil ? "bounded_search_pulse" :
-                (observedBudget == budget && budget > (excess.map { $0 / calibration.responseRate - calibration.responseOverhead } ?? .infinity)
-                    ? "repeat_small_valid_response" : "precision_model"))
+                (correctionBudget == budget ? "bounded_overshoot_correction" :
+                    (observedBudget == budget && budget > (excess.map { $0 / calibration.responseRate - calibration.responseOverhead } ?? .infinity)
+                        ? "repeat_small_valid_response" : "precision_model")))
         case .arrived:
             fields["planning_decision"] = .string("arrived")
             fields["selected_budget_s"] = .null
@@ -184,6 +187,7 @@ final class FollowTurnBurstDiagnosticTrace {
         fields["post_ack_travel_confidence"] = .string(calibration.observedPostAckTravel == nil ? "unknown" : "partial_sampled")
         fields["unsampled_coast_confidence"] = .string("unknown")
         fields["overshoot_ceiling_s"] = Self.number(calibration.overshootCeiling)
+        fields["responses_after_overshoot"] = .number(Double(calibration.responsesAfterOvershoot))
         fields["completed_responses"] = .number(Double(calibration.completedResponses))
         fields["measured_responses"] = .number(Double(calibration.measuredResponses))
     }

@@ -418,8 +418,13 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
                     XCTAssertEqual(rejection["rejection_condition"] as? String, expected)
                 } else {
                     XCTAssertEqual(rejection["pending_frame_evaluation"] as? String, "not_pending")
-                    XCTAssertEqual(rejection["rejection_condition"] as? String, "operation_replaced",
-                        "A frame already stopped this request; late admission cannot reuse its old authority")
+                    if condition == "depthUnavailable" {
+                        XCTAssertEqual(rejection["rejection_condition"] as? String, "depth_unavailable",
+                            "Pre-ready acquisition can consume depthless frames, but ready translation must reject them")
+                    } else {
+                        XCTAssertEqual(rejection["rejection_condition"] as? String, "operation_replaced",
+                            "A frame already stopped this request; late admission cannot reuse its old authority")
+                    }
                 }
                 if let candidateReason = ["confidence": "confidence_below_minimum", "world_distance": "world_distance_exceeded",
                                           "screen_association": "screen_association_rejected", "locked_frame_mismatch": "candidate_frame_mismatch"][condition] {

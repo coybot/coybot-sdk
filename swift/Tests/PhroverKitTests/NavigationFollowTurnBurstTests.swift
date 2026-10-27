@@ -71,7 +71,8 @@ final class NavigationFollowTurnBurstTests: XCTestCase {
             sleep: { try? await Task.sleep(for: $0) }, poseSample: { snapshot }, sourceNow: { uptime }, sourceStopSnapshot: { snapshot })
         let task = Task {
             let result = await NavigationFollowMeMotion(navigation: controller).perform(.scan(.pi / 18), context:
-                .init(sessionGeneration: 1, requestToken: 1, purpose: .followScan, phase: "searching", isSearchSweep: true))
+                .init(sessionGeneration: 1, requestToken: 1, purpose: .followScan, phase: "searching", isSearchSweep: true,
+                    allowsAcquisitionRotationWithoutDepth: true))
             completed = true
             return result
         }
@@ -161,7 +162,8 @@ final class NavigationFollowTurnBurstTests: XCTestCase {
                 }, stopRover: { stops += 1 }, sleep: { try? await Task.sleep(for: $0) },
                 poseSample: { snapshot }, sourceNow: { uptime }, sourceStopSnapshot: { snapshot })
             let task = Task { await NavigationFollowMeMotion(navigation: controller).perform(.scan(direction * .pi), context:
-                .init(sessionGeneration: 1, requestToken: 1, purpose: .followScan, phase: "searching", isSearchSweep: true)) }
+                .init(sessionGeneration: 1, requestToken: 1, purpose: .followScan, phase: "searching", isSearchSweep: true,
+                    allowsAcquisitionRotationWithoutDepth: true)) }
             for _ in 0..<1000 where stops == 0 { await Task.yield() }
             uptime = 10.301; snapshot = sample(2, 10.3); controller.ingestFollowTurnSource(snapshot)
             let result = await task.value
@@ -190,7 +192,8 @@ final class NavigationFollowTurnBurstTests: XCTestCase {
             }, stopRover: { stops += 1 }, sleep: { try? await Task.sleep(for: $0) }, now: { date },
             poseSample: { snapshot }, sourceNow: { uptime }, sourceEvents: { events.stream }, sourceStopSnapshot: { snapshot })
         let task = Task { await NavigationFollowMeMotion(navigation: controller).perform(.scan(.pi / 18), context:
-            .init(sessionGeneration: 1, requestToken: 1, purpose: .followScan, phase: "searching", isSearchSweep: true)) }
+            .init(sessionGeneration: 1, requestToken: 1, purpose: .followScan, phase: "searching", isSearchSweep: true,
+                allowsAcquisitionRotationWithoutDepth: true)) }
         for _ in 0..<1000 where stops == 0 { await Task.yield() }
         uptime = 10.301; snapshot = sample(2, uptime - 0.001); controller.ingestFollowTurnSource(snapshot)
         for _ in 0..<1000 where stops < 2 { await Task.yield() }
@@ -243,7 +246,8 @@ final class NavigationFollowTurnBurstTests: XCTestCase {
                 sourceEvents: { events.stream }, sourceStopSnapshot: { snapshot })
             let task = Task {
                 let result = await NavigationFollowMeMotion(navigation: controller).perform(.scan(.pi / 18), context:
-                    .init(sessionGeneration: 1, requestToken: 1, purpose: .followScan, phase: "searching", isSearchSweep: true))
+                    .init(sessionGeneration: 1, requestToken: 1, purpose: .followScan, phase: "searching", isSearchSweep: true,
+                        allowsAcquisitionRotationWithoutDepth: true))
                 completed = true
                 return result
             }
@@ -340,7 +344,8 @@ final class NavigationFollowTurnBurstTests: XCTestCase {
         let task = Task {
             let result = await NavigationFollowMeMotion(navigation: controller).perform(.scan(direction * .pi / 18),
                 context: .init(sessionGeneration: 1, requestToken: 2, purpose: .followScan, phase: "searching",
-                    scanResponseSeed: .init(sourceGeneration: 1, responseRate: 3.9459105709998488), isSearchSweep: true))
+                    scanResponseSeed: .init(sourceGeneration: 1, responseRate: 3.9459105709998488), isSearchSweep: true,
+                    allowsAcquisitionRotationWithoutDepth: true))
             completed = true
             return result
         }

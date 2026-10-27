@@ -24,7 +24,7 @@ public final class NavigationFollowMeMotion: FollowMeContextualMotion, FollowMeA
     private let navigation: any FollowNavigationRuntime
 
     public init(navigation: NavigationController) { self.navigation = navigation }
-    init(navigation: FollowNavigationController) { self.navigation = navigation }
+    init(navigation: any FollowNavigationRuntime) { self.navigation = navigation }
 
     public func rotateForScan(by angle: Double) async -> NavigationResult {
         await navigation.performFollowMotion(.scan(angle), context: nil).result

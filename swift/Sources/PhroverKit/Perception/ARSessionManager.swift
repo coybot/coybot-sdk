@@ -501,7 +501,8 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
             latestDepthSafetySnapshot,
             command: command,
             now: timestamp,
-            operatorClearedRotation: FollowSearchRotationScope.authorized
+            operatorClearedRotation: FollowSearchRotationScope.authorized,
+            boundedReadyMotion: ReadyMotionDepthScope.active
         )
     }
 

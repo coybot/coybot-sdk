@@ -77,6 +77,7 @@ final class ConversationViewModel {
         case .signalingReady: return "Signaling ready — moving 10 cm…"
         case .waitingForMovement: return "Ready — walk away to begin following"
         case .searching: return "Searching for you…"
+        case .recoveringReadyPath: return "Checking floor — probing, backing up, or finding clear space…"
         case .following: return "Following — 1.5 m"
         case .holdingDistance: return "Holding distance"
         case .reacquiring: return "Person lost — searching…"

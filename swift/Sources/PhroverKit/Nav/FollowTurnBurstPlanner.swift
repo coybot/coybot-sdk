@@ -4,8 +4,9 @@ import Foundation
 /// durations are seconds. Neither observed rates nor sampled travel certify
 /// physical speed, total coast, or motor-on duration. No motor or stop authority.
 public enum FollowTurnBurstPlanner {
-    public enum Purpose: Sendable { case alignment, scan }
+    public enum Purpose: Sendable, Equatable { case alignment, scan }
     public struct Profile: Sendable, Equatable {
+        public let purpose: Purpose
         public let maximumHostBurstBudget: Double = 0.080
         public let initialReferenceRate: Double = 2 * .pi / 3
         public let settleWait: Double
@@ -13,6 +14,7 @@ public enum FollowTurnBurstPlanner {
         public let tolerance: Double
         public init(purpose: Purpose) { self.init(purpose: purpose, fastSearch: false) }
         init(purpose: Purpose, fastSearch: Bool) {
+            self.purpose = purpose
             tolerance = purpose == .alignment ? 0.05 : 7 * .pi / 180
             settleWait = fastSearch ? 0.100 : 0.300
         }
@@ -43,6 +45,9 @@ public enum FollowTurnBurstPlanner {
         /// Partial sampled travel after acknowledgement, not total physical coast.
         public let observedPostAckTravel: Double?
         public let overshootCeiling: Double?
+        /// Completed responses since the first directed overshoot. A latency-
+        /// dominated model permits only one unproven, smaller correction probe.
+        public let responsesAfterOvershoot: Int
         public let completedResponses: Int
         public let measuredResponses: Int
         public let terminalResolutionFailure: Bool
@@ -63,6 +68,7 @@ public enum FollowTurnBurstPlanner {
             maximumStopDuration = nil
             observedPostAckTravel = nil
             overshootCeiling = nil
+            responsesAfterOvershoot = 0
             completedResponses = 0
             measuredResponses = 0
             terminalResolutionFailure = false
@@ -85,6 +91,7 @@ public enum FollowTurnBurstPlanner {
             maximumStopDuration = stop
             observedPostAckTravel = travel
             overshootCeiling = ceiling
+            responsesAfterOvershoot = previous.responsesAfterOvershoot + (previous.overshootCeiling == nil ? 0 : 1)
             completedResponses = previous.completedResponses + 1
             measuredResponses = previous.measuredResponses + (measured ? 1 : 0)
             terminalResolutionFailure = previous.terminalResolutionFailure || terminal
@@ -372,7 +379,8 @@ public enum FollowTurnBurstPlanner {
         // A complete small response may justify repeating its proven host budget.
         let candidate = excess / calibration.responseRate - calibration.responseOverhead
         let observed = repeatableBudget(calibration, error: error, profile: input.profile)
-        let budget = min(input.profile.maximumHostBurstBudget, max(candidate, observed ?? -.infinity),
+        let correction = overshootCorrectionBudget(calibration, error: error, profile: input.profile)
+        let budget = min(input.profile.maximumHostBurstBudget, max(candidate, observed ?? -.infinity, correction ?? -.infinity),
             calibration.overshootCeiling ?? .infinity)
         let deadline = input.sendEntryUptime + budget
         guard budget.isFinite, budget > 0, deadline.isFinite, deadline > input.sendEntryUptime else {
@@ -386,12 +394,36 @@ public enum FollowTurnBurstPlanner {
     /// remaining heading corridor. Total path length still calibrates rate; it
     /// must not count repeated visits to a heading as a larger swept interval. Never enlarge it or override an overshoot cap.
     static func repeatableBudget(_ calibration: Calibration, error: Double, profile: Profile) -> Double? {
-        guard !calibration.terminalResolutionFailure, calibration.overshootCeiling == nil,
+        guard !calibration.terminalResolutionFailure,
               let observed = calibration.lastObservedBurst,
               observed.signedTravel * error > 0,
               observed.absoluteTravel > 0,
-              observed.headingSpan <= abs(error) + profile.tolerance else { return nil }
+               observed.headingSpan <= abs(error) + profile.tolerance else { return nil }
+        if let ceiling = calibration.overshootCeiling {
+            guard profile.purpose == .alignment, calibration.responsesAfterOvershoot > 0,
+                  observed.budget <= ceiling else { return nil }
+        }
         return observed.budget
+    }
+
+    /// HTTP/stop acknowledgement delay is not a measured minimum motor-on time.
+    /// After a complete directed overshoot, try its strictly shrunken budget once
+    /// rather than interpreting a negative inverse-model budget as physical proof
+    /// that correction is impossible. Subsequent retries need an observed small
+    /// response in the correct direction; missing/no-progress/re-overshoot evidence
+    /// cannot authorize another such probe. The executor still owns all stop,
+    /// source, cancellation, deadline and original progress-watchdog boundaries.
+    static func overshootCorrectionBudget(_ calibration: Calibration, error: Double, profile: Profile) -> Double? {
+        let excess = abs(error) - profile.tolerance
+        guard profile.purpose == .alignment, !calibration.terminalResolutionFailure, calibration.responsesAfterOvershoot == 0,
+              let ceiling = calibration.overshootCeiling, let observed = calibration.lastObservedBurst,
+              let settled = calibration.lastSourceSample,
+              observed.signedTravel * error < 0,
+              abs(error) <= abs(wrap(calibration.targetYaw - settled.yaw)) + profile.tolerance,
+              excess > 0, excess / calibration.responseRate - calibration.responseOverhead <= 0 else { return nil }
+        let budget = min(ceiling, excess / calibration.responseRate, profile.maximumHostBurstBudget)
+        guard budget.isFinite, budget > 0, budget < observed.budget else { return nil }
+        return budget
     }
 
     /// Initial search covers an arc rather than converging on an exact heading.

@@ -133,6 +133,7 @@ struct DepthSafetyObservation: Equatable, Sendable {
     let motionClass: DepthSafetyMotionClass
     let speedLimit: Double?
     var coverageProvenance: String = "depth"
+    var coverage: DepthSafetyCoverage?
 
     static func unavailable(_ reason: DepthSafetyUnavailableReason,
                             sampleAge: TimeInterval,
@@ -147,6 +148,23 @@ struct DepthSafetyObservation: Equatable, Sendable {
             speedLimit: nil
         )
     }
+}
+
+struct DepthSafetyCoverage: Equatable, Sendable {
+    let horizon: Double
+    let requiredPoints: Int
+    let coveredPoints: Int
+    let outsideViewPoints: Int
+    let missingDepthPoints: Int
+    let occludedPoints: Int
+    let projectionAvailable: Bool
+    var fraction: Double { requiredPoints > 0 ? Double(coveredPoints) / Double(requiredPoints) : 0 }
+}
+
+/// Set only for controller-owned bounded readiness or its recovery probe.
+/// Ordinary navigation and pursuit never inherit a reduced visibility horizon.
+enum ReadyMotionDepthScope {
+    @TaskLocal static var active = false
 }
 
 

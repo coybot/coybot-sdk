@@ -42,6 +42,8 @@ final class FollowNavigationController {
     private var followTurnSourceObservers: [UUID: (NavigationPoseSample) -> Void] = [:]
     private(set) var followTurnStopFence: FollowTurnStopFence?
     private var pendingFollowTurnBurst: FollowTurnBurstFence?
+    private var readyRecoveryPulse: ReadyPathRecovery.PulseAuthority?
+    private var boundedReadyGeneration: UInt?
     private var pendingFollowTurnBurstDrain: FollowTurnBurstDrain?
     var followTurnBurstPendingStatus: FollowTurnBurstPendingStatus? { pendingFollowTurnBurst?.status }
     private let depthSafetyObservation: (WheelCommand) -> DepthSafetyObservation
@@ -441,6 +443,7 @@ final class FollowNavigationController {
         guard !stopUnconfirmed else { return .failed(.commandFailed) }
         operationGeneration &+= 1
         let reservation = operationGeneration
+        defer { if boundedReadyGeneration == reservation { boundedReadyGeneration = nil } }
         FollowMotionTaskScope.evidence?.ownedGeneration = reservation
         do { try await confirmStop() } catch { return .failed(.commandFailed) }
         guard operationGeneration == reservation, !Task.isCancelled, recoveryAuthorized else { return .cancelled }
@@ -500,9 +503,14 @@ final class FollowNavigationController {
             let corridorClear = map.isSegmentClear(from: start.position,
                 to: start.position + direction * 0.12, margin: 0.02 + poseUncertainty)
             let rejection: String?
+            let mappedObstruction: Bool
             switch assessment {
-            case .path(let points): rejection = points.isEmpty ? "empty_path" : (corridorClear ? nil : "corridor_blocked")
-            case .rejected(let failure): rejection = failure.rawValue
+            case .path(let points):
+                rejection = points.isEmpty ? "empty_path" : (corridorClear ? nil : "corridor_blocked")
+                mappedObstruction = !points.isEmpty && !corridorClear
+            case .rejected(let failure):
+                rejection = failure.rawValue
+                mappedObstruction = failure == .startBlocked || failure == .goalBlocked
             }
             let startCell = map.worldToCell(start.position)
             let goalCell = map.worldToCell(goal)
@@ -522,8 +530,28 @@ final class FollowNavigationController {
                 operationID: evidence?.context.controllerOperationID, purpose: "followReady",
                 outcome: rejection == nil ? "accepted" : "rejected", reason: rejection), payload: fields))
             if rejection != nil {
-                evidence?.recordFailure(.noPath, cause: .readyPathBlocked)
-                return .failed(.noPath)
+                if let admission = FollowReadyAdmissionScope.current, admission.allowsPathRecovery, mappedObstruction {
+                    guard admission.admit(boundary: .recoveryProbe, sample: startSample, readUptime: sourceNow()) else {
+                        return .cancelled
+                    }
+                    let recovered = await recoverReadyPath(start: startSample, ownedGeneration: reservation)
+                    guard operationGeneration == reservation, !Task.isCancelled, recoveryAuthorized else { return .cancelled }
+                    switch recovered {
+                    case .clear:
+                        // Complete the original 10 cm ready motion, including
+                        // probe displacement; never rebase an extra 10 cm here.
+                        await sleep(.milliseconds(500))
+                        guard operationGeneration == reservation, !Task.isCancelled, recoveryAuthorized else { return .cancelled }
+                    case .turned: return .reobservationRequired
+                    case .cancelled: return .cancelled
+                    case .failed(let failure):
+                        evidence?.recordFailure(failure)
+                        return .failed(failure)
+                    }
+                } else {
+                    evidence?.recordFailure(.noPath, cause: .readyPathBlocked)
+                    return .failed(.noPath)
+                }
             }
         } else {
             let goal = start.position + direction * 0.10
@@ -536,6 +564,9 @@ final class FollowNavigationController {
                   return along.isFinite && lateral.isFinite && along >= -0.02 && along <= 0.12 && lateral <= 0.02
                }) else { return .failed(.noPath) }
         }
+        // Every ready signal is the same bounded 10 cm motion. Its visibility
+        // policy must not depend on whether map recovery happened beforehand.
+        boundedReadyGeneration = reservation
         state = .driving
         publishSafetyState(.moving)
         let task = Task { await driveReadySignal(from: start, direction: direction,
@@ -722,6 +753,55 @@ final class FollowNavigationController {
             await sleep(.seconds(RoverConfig.readySignalStoppedObservation))
         }
         return .cancelled
+    }
+
+    private func recoverReadyPath(start: NavigationPoseSample, ownedGeneration: UInt) async -> ReadyPathRecovery.Outcome {
+        let evidence = FollowMotionTaskScope.evidence
+        func owned() -> Bool {
+            !Task.isCancelled && operationGeneration == ownedGeneration && activeFollowEvidence === evidence &&
+                evidence?.fenced != true && !stopUnconfirmed && recoveryAuthorized
+        }
+        let outcome = await ReadyPathRecovery.run(start: start, environment: .init(
+            uptime: sourceNow, pose: readFollowPose, depth: { command in
+                let observation = self.boundedReadyDepthObservation(command)
+                self.recordDepthObservation(observation, disposition: "ready_recovery_assessment")
+                return observation
+            }, authorized: owned,
+            pulse: { authority in
+                let ack = await self.currentLastAck()
+                guard owned() else { return .cancelled }
+                let date = self.now()
+                guard let ack, date.timeIntervalSince(ack) >= 0,
+                      date.timeIntervalSince(ack) <= RoverConfig.commsWatchdogTimeout else { return .failed(.commsLost) }
+                guard authority.permits(authority.command, sample: self.readFollowPose(), now: self.sourceNow()) else {
+                    return .failed(.trackingLost)
+                }
+                self.readyRecoveryPulse = authority
+                defer { if self.readyRecoveryPulse?.id == authority.id { self.readyRecoveryPulse = nil } }
+                do {
+                    let result = try await self.executeFollowTurnBurst(authority.command, requestedBudget: authority.budget,
+                        purpose: .followReady, sendValidUntil: min(authority.expiresAt,
+                            self.sourceNow() + RoverConfig.commsWatchdogTimeout - date.timeIntervalSince(ack)))
+                    guard owned() else { return .cancelled }
+                    guard result.confirmedStopFence != nil else { return .failed(.commandFailed) }
+                    if let denial = result.send.result.failure as? DepthSafetyStop {
+                        if authority.stage == .probe, denial.failure == .obstacle { return .reobservationRequired }
+                        return .failed(denial.failure)
+                    }
+                    return result.send.result.failure == nil ? .arrived : .failed(.commandFailed)
+                } catch { return owned() ? .failed(.commandFailed) : .cancelled }
+            }, wait: sleep, emit: { stage, fields in
+                self.diagnosticEmitter?.emit(.init(event: "follow_ready.path_recovery", context: .init(
+                    sessionGeneration: evidence?.context.request?.sessionGeneration,
+                    operationID: evidence?.context.controllerOperationID, purpose: "followReady",
+                    phase: "recoveringReadyPath", reason: stage), payload: fields))
+            }))
+        if operationGeneration == ownedGeneration, activeFollowEvidence === evidence, stopUnconfirmed {
+            return .failed(.commandFailed)
+        }
+        guard owned() else { return .cancelled }
+        do { try await confirmStop() } catch { return .failed(.commandFailed) }
+        return owned() ? outcome : .cancelled
     }
 
     @discardableResult
@@ -1581,7 +1661,8 @@ final class FollowNavigationController {
                               plannedYaw: Double? = nil, sendValidUntil: Double? = nil) async -> FollowTurnBurstSendReceipt {
         let owner = operationGeneration
         let evidence = FollowMotionTaskScope.evidence
-        let bypassInitialSearchDepth = permitsInitialSearchDepthBypass(command, purpose: purpose, evidence: evidence)
+        let readyRecovery = purpose == .followReady ? readyRecoveryPulse : nil
+        let bypassAcquisitionDepth = permitsAcquisitionDepthBypass(command, purpose: purpose, evidence: evidence)
         let isRecoveryArc = (purpose == .followScan || purpose == .followAlignment) &&
             command.left > 0 && command.right > 0
         if isRecoveryArc { runtime?.requiresKnownAck = true }
@@ -1619,7 +1700,7 @@ final class FollowNavigationController {
         // Raw projection completes independently of pose callbacks. Subscribe
         // before arming; new hazards may only revoke this immutable fence, never
         // refresh the original depth/clearance expiry or reauthorize a veto.
-        let removeDepthObserver: (() -> Void)? = (grant == nil || bypassInitialSearchDepth) ? nil : observeDepthSafety? { snapshot in
+        let removeDepthObserver: (() -> Void)? = (grant == nil || bypassAcquisitionDepth) ? nil : observeDepthSafety? { snapshot in
             guard self.operationGeneration == owner, evidence?.fenced != true else { return }
             let observation = snapshot.map { DepthSafetyEvaluator.evaluate($0, command: command,
                 now: self.sourceNow(), operatorClearedRotation: true) }
@@ -1675,8 +1756,14 @@ final class FollowNavigationController {
                 requireFreshAck: requireFreshAckForSend) { return false }
             let time = self.sourceNow()
             let date = self.now()
+            if let readyRecovery {
+                guard self.readyRecoveryPulse?.id == readyRecovery.id,
+                      readyRecovery.permits(command, sample: self.readFollowPose(), now: time),
+                      self.operationGeneration == owner, evidence?.fenced != true else { return false }
+            }
             guard self.validateSearchClearance(evidence?.context.request, evidence: evidence) else { return false }
             var expiry = min(sendValidUntil ?? .infinity, depthValidUntil)
+            if let readyRecovery { expiry = min(expiry, readyRecovery.expiresAt) }
             if let grant { expiry = min(expiry, grant.expiresAt) }
             if let runtime {
                 guard let timestamp = self.followTurnSourceGate.latest?.sourceTimestamp else { return false }
@@ -1702,6 +1789,19 @@ final class FollowNavigationController {
             }
         }
         let observerID = UUID()
+        let readyObserverID = UUID()
+        if let readyRecovery {
+            if followTurnSourceTask == nil {
+                startFollowTurnSourceEvents()
+                ownedSubscription = followTurnSourceSubscriptionID
+            }
+            followTurnSourceObservers[readyObserverID] = { sample in
+                if !readyRecovery.permits(command, sample: sample, now: self.sourceNow()) {
+                    fence.inhibit(at: self.sourceNow())
+                }
+            }
+        }
+        defer { followTurnSourceObservers.removeValue(forKey: readyObserverID) }
         if observation != nil {
             followTurnSourceObservers[observerID] = { sample in
                 if let grant, let request = evidence?.context.request {
@@ -1710,7 +1810,7 @@ final class FollowNavigationController {
                     }
                 }
                 guard arming.epoch != nil else { return }
-                if grant != nil && !bypassInitialSearchDepth {
+                if grant != nil && !bypassAcquisitionDepth {
                     let freshDepth = FollowSearchRotationScope.$authorized.withValue(true) { self.depthSafetyObservation(command) }
                     guard case .allow(let accepted, _) = self.guardLayer.evaluate(command: command, depthSafety: freshDepth),
                           accepted == command else {
@@ -1901,12 +2001,36 @@ final class FollowNavigationController {
                 }
                 let safeCommand: WheelCommand
                 let depthReadStarted = sourceNow()
-                if permitsInitialSearchDepthBypass(command, purpose: purpose, evidence: evidence) {
+                if let readyRecovery, readyRecovery.stage != .probe {
+                    guard self.readyRecoveryPulse?.id == readyRecovery.id,
+                          readyRecovery.permits(command, sample: readFollowPose(), now: sourceNow()) else {
+                        return .init(receipt: .unknown, failure: FollowTurnBurstTransportDenial.fenced)
+                    }
+                    // Fresh forward sensing is required even for the narrow
+                    // retained-path return / pre-ready in-place search policy.
+                    // It is never represented as measured rear coverage.
+                    let live = boundedReadyDepthObservation(.init(left: 0.25, right: 0.25))
+                    recordDepthObservation(live, disposition: "ready_recovery_return_or_scan")
+                    if case .unavailable = live.state {
+                        return .init(receipt: .unknown, failure: DepthSafetyStop(failure: recordDepthRejection(live)))
+                    }
+                    depthValidUntil = depthReadStarted + DepthSafetyEvaluator.maximumRawDepthAge - live.sampleAge
+                    guard live.sampleAge.isFinite, live.sampleAge >= 0, sourceNow() < depthValidUntil else {
+                        return .init(receipt: .unknown, failure: DepthSafetyStop(failure: .depthUnavailable(.staleRawDepth)))
+                    }
+                    deadline = min(deadline, depthValidUntil, readyRecovery.expiresAt)
                     safeCommand = command
-                    recordInitialSearchDepthBypass(evidence, disposition: "sender")
+                } else if permitsAcquisitionDepthBypass(command, purpose: purpose, evidence: evidence) {
+                    safeCommand = command
+                    recordAcquisitionDepthBypass(evidence, disposition: "sender")
                     if let grant { deadline = min(deadline, grant.expiresAt) }
                 } else {
-                    switch exactDepthDecision(command, disposition: "sender") {
+                    let boundedReady = purpose == .followReady &&
+                        (readyRecovery != nil || boundedReadyGeneration == owner)
+                    let decision = ReadyMotionDepthScope.$active.withValue(boundedReady) {
+                        exactDepthDecision(command, disposition: "sender")
+                    }
+                    switch decision {
                     case .allow(let limited, let observation):
                         safeCommand = limited
                         // Freeze the original evidence expiry. New pose callbacks
@@ -1926,7 +2050,9 @@ final class FollowNavigationController {
                         deadline = min(deadline, depthValidUntil)
                         if let grant { deadline = min(deadline, grant.expiresAt) }
                     case .stopDepth(let observation):
-                        let failure = recordDepthRejection(observation)
+                        let recoverableProbeObstacle = readyRecovery?.stage == .probe &&
+                            (observation.state == .stop || observation.state == .caution)
+                        let failure: NavigationFailure = recoverableProbeObstacle ? .obstacle : recordDepthRejection(observation)
                         runtime?.fail(failure)
                         fence.inhibit(at: entry)
                         return RoverCommandDiagnosticResult(receipt: .init(httpStatus: nil, acknowledged: false,
@@ -2736,8 +2862,8 @@ final class FollowNavigationController {
                 !stopUnconfirmed && recoveryAuthorized
         }
         guard owned() else { throw CancellationError() }
-        if permitsInitialSearchDepthBypass(command, purpose: evidence?.context.purpose, evidence: evidence) {
-            recordInitialSearchDepthBypass(evidence, disposition: "turn")
+        if permitsAcquisitionDepthBypass(command, purpose: evidence?.context.purpose, evidence: evidence) {
+            recordAcquisitionDepthBypass(evidence, disposition: "turn")
             guard owned() else { throw CancellationError() }
             return (command, false)
         }
@@ -2817,30 +2943,31 @@ final class FollowNavigationController {
     /// Controller-owned initial acquisition only. This is a motion policy, never
     /// camera evidence or an implicit operator clearance grant. Existing source,
     /// transport, stop, sweep and ownership fences remain authoritative.
-    private func permitsInitialSearchDepthBypass(_ command: WheelCommand, purpose: FollowMotionPurpose?,
+    private func permitsAcquisitionDepthBypass(_ command: WheelCommand, purpose: FollowMotionPurpose?,
                                                  evidence: FollowMotionOperationEvidence?) -> Bool {
-        guard purpose == .followScan, let evidence, activeFollowEvidence === evidence,
+        guard purpose == .followScan || purpose == .followAlignment,
+              let evidence, activeFollowEvidence === evidence,
               evidence.ownedGeneration == operationGeneration, !evidence.fenced,
-              evidence.context.purpose == .followScan,
-              let request = evidence.context.request, request.purpose == .followScan,
-              request.isSearchSweep, request.phase == "searching",
+              evidence.context.purpose == purpose,
+              let request = evidence.context.request, request.purpose == purpose,
+              request.allowsAcquisitionRotationWithoutDepth,
               let angle = evidence.context.requestedRotation, angle.isFinite, angle != 0, abs(angle) <= .pi,
-              FollowRecoveryScope.heading == nil, FollowRecoveryScope.authorization == nil,
+              recoveryAuthorized,
               command.left.isFinite, command.right.isFinite, command.left != 0,
               command.left == -command.right,
               abs(command.left) <= FollowTurnBurstPlanner.Profile(purpose: .scan).fixedWheelMagnitude else { return false }
         return true
     }
 
-    private func recordInitialSearchDepthBypass(_ evidence: FollowMotionOperationEvidence?, disposition: String) {
+    private func recordAcquisitionDepthBypass(_ evidence: FollowMotionOperationEvidence?, disposition: String) {
         let fields: [String: FollowDiagnosticValue] = [
-            "depth_policy": .string("initial_search_pure_rotation_bypass"),
+            "depth_policy": .string("pre_ready_acquisition_pure_rotation_bypass"),
             "depth_candidate_disposition": .string(disposition)]
         evidence?.depthDiagnosticFields = fields
-        diagnosticEmitter?.emit(.init(event: "follow_depth.initial_search_bypassed", context: .init(
+        diagnosticEmitter?.emit(.init(event: "follow_depth.acquisition_rotation_bypassed", context: .init(
             sessionGeneration: evidence?.context.request?.sessionGeneration,
             operationID: evidence?.context.controllerOperationID, purpose: evidence?.context.purpose?.rawValue,
-            phase: evidence?.context.request?.phase, reason: "initial_person_acquisition"), payload: fields))
+            phase: evidence?.context.request?.phase, reason: "ready_signal_not_completed"), payload: fields))
     }
 
     private func recordSearchClearanceRejection(_ grant: FollowSearchClearanceGrant,
@@ -2898,11 +3025,25 @@ final class FollowNavigationController {
 
     private func recordDepthObservation(_ observation: DepthSafetyObservation, disposition: String) {
         func finite(_ value: Double) -> FollowDiagnosticValue { value.isFinite ? .number(value) : .null }
-        let fields: [String: FollowDiagnosticValue] = [
+        var fields: [String: FollowDiagnosticValue] = [
             "depth_state": .string(observation.state.telemetryReason), "depth_age_s": finite(observation.sampleAge),
             "depth_coverage_provenance": .string(observation.coverageProvenance),
             "depth_clearance_m": finite(observation.clearance), "depth_support_count": .number(Double(observation.supportCount)),
-            "depth_motion_class": .string(observation.motionClass.rawValue), "depth_candidate_disposition": .string(disposition)]
+            "depth_motion_class": .string(observation.motionClass.rawValue), "depth_candidate_disposition": .string(disposition),
+            "depth_required_stopping_distance_m": finite(observation.requiredStoppingDistance)]
+        let coverage = observation.coverage
+        let coverageFields: [String: FollowDiagnosticValue] = [
+            "depth_coverage_horizon_m": coverage.map { finite($0.horizon) } ?? .null,
+            "depth_coverage_fraction": coverage.map { finite($0.fraction) } ?? .null,
+            "depth_required_coverage_fraction": .number(DepthSafetyEvaluator.minimumSweptVolumeCoverage),
+            "depth_required_points": coverage.map { .number(Double($0.requiredPoints)) } ?? .null,
+            "depth_covered_points": coverage.map { .number(Double($0.coveredPoints)) } ?? .null,
+            "depth_outside_view_points": coverage.map { .number(Double($0.outsideViewPoints)) } ?? .null,
+            "depth_missing_sample_points": coverage.map { .number(Double($0.missingDepthPoints)) } ?? .null,
+            "depth_occluded_points": coverage.map { .number(Double($0.occludedPoints)) } ?? .null,
+            "depth_projection_available": coverage.map { .bool($0.projectionAvailable) } ?? .null
+        ]
+        fields.merge(coverageFields) { _, new in new }
         let evidence = FollowMotionTaskScope.evidence
         evidence?.depthDiagnosticFields = fields
         diagnosticEmitter?.emit(.init(event: "follow_depth.candidate", context: .init(
@@ -2921,6 +3062,10 @@ final class FollowNavigationController {
         }
         FollowMotionTaskScope.evidence?.recordFailure(failure)
         return failure
+    }
+
+    private func boundedReadyDepthObservation(_ command: WheelCommand) -> DepthSafetyObservation {
+        ReadyMotionDepthScope.$active.withValue(true) { depthSafetyObservation(command) }
     }
 
     private func finish(_ result: NavigationResult) {

@@ -19,48 +19,72 @@ public final class ARFollowMePerceptionSource: FollowMePerception {
     public func events() -> AsyncStream<FollowPerceptionEvent> {
         let frames = ar.snapshots()
         let lifecycle = ar.lifecycleEvents()
-        // Never discard a safety event when a newer camera frame arrives. The upstream
-        // AR snapshot stream already bounds frame production to its newest sample.
-        return AsyncStream(bufferingPolicy: .unbounded) { continuation in
-            let consumer = detector.beginFollowConsumer()
-            let frameTask = Task { [detector, ar] in
-                for await snapshot in frames {
-                    guard !Task.isCancelled else { break }
-                    // The live frame may differ from the snapshot. This reason is diagnostic
-                    // only; all perception eligibility and projection use the snapshot.
-                    let reason = ar.session.currentFrame.map { Self.trackingReason(from: $0.camera.trackingState) } ?? nil
-                    if snapshot.trackingQuality != .normal {
-                        continuation.yield(.frame(Self.batch(from: snapshot, detections: [],
-                                                            trackingReason: reason)))
-                        continue
-                    }
-                    let started = ProcessInfo.processInfo.systemUptime
-                    guard let receipt = await detector.evaluateForFollowAsync(snapshot), !Task.isCancelled else { continue }
-                    guard ar.sessionGeneration == snapshot.id.generation else { continue }
-                    let duration = ProcessInfo.processInfo.systemUptime - started
-                    continuation.yield(.frame(Self.batch(from: snapshot, detections: receipt.frame.detections,
-                                                        trackingReason: reason, inferenceDuration: duration,
-                                                        inferenceStatus: receipt.status == .executed ? .executed : .failed,
-                                                        inferenceFailureReason: receipt.failureReason,
-                                                        personVerification: receipt.personVerification ?? [])))
+        let mailbox = FollowPerceptionMailbox()
+        let consumer = detector.beginFollowConsumer()
+        let frameTask = Task { [detector, ar] in
+            var lastLatencySummary = -Double.infinity
+            var lastRequestedFrame: ARFrameID?
+            for await queued in frames {
+                guard !Task.isCancelled else { break }
+                // Select before inference, then retain that exact image/depth/
+                // pose pairing through completion. Never re-age old detections.
+                let snapshot = Self.inferenceSnapshot(queued: queued, latest: ar.latestSnapshot)
+                guard snapshot.id.generation == ar.sessionGeneration, snapshot.id != lastRequestedFrame else { continue }
+                lastRequestedFrame = snapshot.id
+                // Diagnostic reason is live; eligibility uses the chosen snapshot.
+                let reason = ar.session.currentFrame.map { Self.trackingReason(from: $0.camera.trackingState) } ?? nil
+                if snapshot.trackingQuality != .normal {
+                    mailbox.publish(Self.batch(from: snapshot, detections: [], trackingReason: reason))
+                    continue
                 }
-            }
-            let lifecycleTask = Task {
-                for await event in lifecycle {
-                    guard !Task.isCancelled else { break }
-                    switch event {
-                    case .reset, .interrupted: continuation.yield(.interrupted)
-                    case .failed(_, let description): continuation.yield(.failed(description))
-                    case .interruptionEnded: break
-                    }
+                let started = ProcessInfo.processInfo.systemUptime
+                guard let receipt = await detector.evaluateForFollowAsync(snapshot), !Task.isCancelled else { continue }
+                guard ar.sessionGeneration == snapshot.id.generation else { continue }
+                let duration = ProcessInfo.processInfo.systemUptime - started
+                mailbox.publish(Self.batch(from: snapshot, detections: receipt.frame.detections,
+                    trackingReason: reason, inferenceDuration: duration,
+                    inferenceStatus: receipt.status == .executed ? .executed : .failed,
+                    inferenceFailureReason: receipt.failureReason,
+                    personVerification: receipt.personVerification ?? []))
+                let published = ProcessInfo.processInfo.systemUptime
+                if published - lastLatencySummary >= 1 {
+                    lastLatencySummary = published
+                    RuntimeFileLog.append("follow_perception_latency", fields: [
+                        "frame_id": "\(snapshot.id.generation):\(snapshot.id.sequence)",
+                        "capture_to_inference_start_s": String(started - snapshot.timestamp),
+                        "inference_s": String(duration),
+                        "capture_to_publish_s": String(published - snapshot.timestamp),
+                        "coalesced_completed_frames": String(mailbox.coalescedFrames)])
                 }
-            }
-            continuation.onTermination = { @Sendable [detector] _ in
-                frameTask.cancel()
-                lifecycleTask.cancel()
-                detector.endFollowConsumer(consumer)
             }
         }
+        let lifecycleTask = Task {
+            for await event in lifecycle {
+                guard !Task.isCancelled else { break }
+                switch event {
+                case .reset, .interrupted: mailbox.finish(with: .interrupted)
+                case .failed(_, let description): mailbox.finish(with: .failed(description))
+                case .interruptionEnded: continue
+                }
+                frameTask.cancel()
+                detector.endFollowConsumer(consumer)
+                return
+            }
+        }
+        return mailbox.stream { @Sendable [detector] in
+            frameTask.cancel()
+            lifecycleTask.cancel()
+            detector.endFollowConsumer(consumer)
+        }
+    }
+
+    static func inferenceSnapshot(queued: ARFrameSnapshot, latest: ARFrameSnapshot?) -> ARFrameSnapshot {
+        guard queued.trackingQuality == .normal, queued.timestamp.isFinite,
+              queued.pose.position.x.isFinite, queued.pose.position.y.isFinite, queued.pose.yaw.isFinite,
+              let latest, latest.id.generation == queued.id.generation,
+              latest.id.sequence >= queued.id.sequence,
+              queued.depthMap != nil || latest.depthMap == nil else { return queued }
+        return latest
     }
 
     public static func batch(from snapshot: ARFrameSnapshot,

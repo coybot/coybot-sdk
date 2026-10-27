@@ -116,6 +116,15 @@ struct FollowMotionFailureResolution {
             if context.failureCause == .depthRecoveryExcursion {
                 return "Depth recovery exceeded its measured movement limit. Motion stopped; reposition the rover."
             }
+            if context.purpose == .followReady, reason == .blindSweptVolume,
+               case .number(let visible)? = turnDiagnosticFields["depth_coverage_fraction"],
+               case .number(let required)? = turnDiagnosticFields["depth_required_coverage_fraction"],
+               case .number(let outside)? = turnDiagnosticFields["depth_outside_view_points"],
+               visible.isFinite, required.isFinite, outside.isFinite,
+               visible >= 0, visible < required, required <= 1, outside > 0 {
+                return "Ready signal blocked: only \(String(format: "%.0f", visible * 100))% of the checked motion space is visible " +
+                    "(\(String(format: "%.0f", required * 100))% required). Adjust the camera framing or mounting and restart following."
+            }
             return reason.followMotionMessage
         case .obstacle: return "Obstacle detected. Motion stopped."
         case .commsLost: return "Rover communication lost. Motion stopped."

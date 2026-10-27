@@ -72,10 +72,15 @@ struct FollowMotionRequestContext: Sendable, Equatable {
     /// Initial person search is a directed sweep, not an absolute heading task.
     /// Recovery and alignment leave this false.
     let isSearchSweep: Bool
+    /// Explicit pre-ready acquisition policy. Only bounded in-place turns may
+    /// use it; forward readiness/pursuit requests never inherit this exception.
+    let allowsAcquisitionRotationWithoutDepth: Bool
     let searchClearance: FollowSearchClearanceGrant?
     init(sessionGeneration: UInt64, requestToken: UInt64, purpose: FollowMotionPurpose, phase: String,
           scanUsed: Double? = nil, scanRemaining: Double? = nil, scanResponseSeed: FollowScanResponseSeed? = nil,
-          isSearchSweep: Bool = false, searchClearance: FollowSearchClearanceGrant? = nil) {
+          isSearchSweep: Bool = false, searchClearance: FollowSearchClearanceGrant? = nil,
+          allowsAcquisitionRotationWithoutDepth: Bool = false) {
+        self.allowsAcquisitionRotationWithoutDepth = allowsAcquisitionRotationWithoutDepth
         self.searchClearance = searchClearance
         self.isSearchSweep = isSearchSweep
         self.scanResponseSeed = scanResponseSeed
@@ -145,6 +150,10 @@ struct FollowMotionFailureDelivery: Sendable {
 }
 
 struct FollowMotionResult: Sendable {
+    static func deferredScan(_ reason: FollowScanDeferral, request: FollowMotionRequestContext) -> Self {
+        .init(result: .cancelled, context: .init(request: request, controllerOperationID: nil,
+            purpose: nil, profile: nil), failure: nil, scanDeferral: reason)
+    }
     /// Validated sampled travel for an explicitly requested initial search sweep.
     /// Generation and operation attribution travel with measuredScanResponse/context.
     let searchSweepTravel: Double?
@@ -152,11 +161,15 @@ struct FollowMotionResult: Sendable {
     let measuredScanResponse: FollowScanResponseSeed?
     let turnStopFence: FollowTurnStopFence?
     var outcome: FollowMotionOutcome {
+        if let scanDeferral, result == .cancelled, failure == nil, stopOutcome != .failed {
+            return .scanDeferred(scanDeferral)
+        }
         if let deferred, failure == nil, stopOutcome != .failed { return .notStarted(deferred) }
         return .navigation(result)
     }
     /// Explicit not-started outcome; the legacy NavigationResult remains compatible.
     let deferred: FollowReadyDeferral?
+    let scanDeferral: FollowScanDeferral?
     let result: NavigationResult
     let context: FollowMotionOperationContext
     let failure: FollowMotionFailureDelivery?
@@ -169,7 +182,8 @@ struct FollowMotionResult: Sendable {
          stopReceipt: RoverCommandDiagnosticReceipt? = nil, deferred: FollowReadyDeferral? = nil,
           recovery: FollowRecoverySegmentEvidence? = nil, turnStopFence: FollowTurnStopFence? = nil,
            measuredScanResponse: FollowScanResponseSeed? = nil, searchSweepTravel: Double? = nil,
-           searchSweepProgress: Double? = nil) {
+            searchSweepProgress: Double? = nil, scanDeferral: FollowScanDeferral? = nil) {
+        self.scanDeferral = scanDeferral
         self.searchSweepTravel = searchSweepTravel
         self.searchSweepProgress = searchSweepProgress
         self.measuredScanResponse = measuredScanResponse

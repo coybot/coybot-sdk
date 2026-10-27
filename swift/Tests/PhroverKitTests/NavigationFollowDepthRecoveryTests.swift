@@ -47,6 +47,48 @@ final class NavigationFollowDepthRecoveryTests: XCTestCase {
         XCTAssertEqual(fixture.depthReads, 0)
     }
 
+    func testPreReadyAcquisitionAlignmentAndRecoveryBypassDepth() async {
+        for request in [FollowMotionRequest.alignment(0.5), .scan(0.5)] {
+            for state in [DepthSafetyState.stop, .unavailable(.blindSweptVolume), .unavailable(.missingRawDepth)] {
+                let fixture = DepthRecoveryFixture()
+                fixture.depth = { command in .init(state: state, clearance: 0.1, supportCount: 0,
+                    sampleAge: 0, requiredStoppingDistance: 0.3, motionClass: .classify(command), speedLimit: nil) }
+                fixture.sendFailure = URLError(.timedOut)
+                let result = await fixture.run(request, acquiring: true)
+                XCTAssertEqual(fixture.commands, [.init(left: -0.25, right: 0.25)])
+                XCTAssertEqual(fixture.depthReads, 0)
+                XCTAssertEqual(result.result, .failed(.commandFailed))
+                XCTAssertEqual(result.stopOutcome, .confirmed)
+            }
+        }
+    }
+
+    func testAcquisitionFlagNeverBypassesDepthForTranslation() async {
+        for request in [FollowMotionRequest.ready, .following(.init(4, 0), 1.25)] {
+            let fixture = DepthRecoveryFixture()
+            fixture.depth = { command in .init(state: .stop, clearance: 0.1, supportCount: 5,
+                sampleAge: 0, requiredStoppingDistance: 0.3, motionClass: .classify(command), speedLimit: nil) }
+            let result = await fixture.run(request, acquiring: true)
+            XCTAssertTrue(fixture.commands.isEmpty)
+            XCTAssertNotEqual(result.result, .arrived)
+        }
+    }
+
+    func testPreReadyAbsoluteRecoveryBypassesBlindDepthButKeepsDeadline() async {
+        for expired in [false, true] {
+            let fixture = DepthRecoveryFixture()
+            fixture.sendFailure = URLError(.timedOut)
+            let authorization = FollowRecoveryAuthorization(episodeID: UUID(), expectedGeneration: 1,
+                deadline: expired ? 9 : 30, now: { fixture.uptime }, canContinue: { true })
+            let heading = FollowRecoveryHeadingRequest(stageHeading: 0.5, authorization: authorization,
+                stageIndex: 0, segmentIndex: 0, maximumSegment: .pi / 6)
+            _ = await fixture.run(.scan(0.5), acquiring: true, recovery: heading)
+            XCTAssertEqual(fixture.commands.count, expired ? 0 : 1)
+            XCTAssertTrue(fixture.commands.allSatisfy { $0.left == -$0.right })
+            XCTAssertEqual(fixture.depthReads, 0)
+        }
+    }
+
     func testQueuedInitialSearchStillRejectsTrackingStaleSourceAndOwnershipLoss() async {
         for cause in 0..<3 {
             let fixture = DepthRecoveryFixture()
@@ -798,14 +840,20 @@ private final class DepthRecoveryFixture {
         transportUptime: { transportClock.value })
     }
 
-    func run(_ request: FollowMotionRequest, token: UInt64 = 1, session: UInt64 = 1, initialSearch: Bool = false) async -> FollowMotionResult {
+    func run(_ request: FollowMotionRequest, token: UInt64 = 1, session: UInt64 = 1, initialSearch: Bool = false,
+             acquiring: Bool = false, recovery: FollowRecoveryHeadingRequest? = nil) async -> FollowMotionResult {
         var completed = false
         let previousStops = stops
         let task = Task {
-            let result = await self.controller.performFollowMotion(request, context:
-                .init(sessionGeneration: session, requestToken: token, purpose: request.purpose,
+            let context = FollowMotionRequestContext(sessionGeneration: session, requestToken: token, purpose: request.purpose,
                     phase: request.purpose == .followAlignment ? "aligning" : (initialSearch ? "searching" : "reacquiring"),
-                    isSearchSweep: initialSearch && request.purpose == .followScan, searchClearance: self.grant))
+                    isSearchSweep: initialSearch && request.purpose == .followScan, searchClearance: self.grant,
+                    allowsAcquisitionRotationWithoutDepth: initialSearch || acquiring)
+            let result = await FollowRecoveryScope.$authorization.withValue(recovery?.authorization) {
+                await FollowRecoveryScope.$heading.withValue(recovery) {
+                    await self.controller.performFollowMotion(request, context: context)
+                }
+            }
             completed = true
             return result
         }

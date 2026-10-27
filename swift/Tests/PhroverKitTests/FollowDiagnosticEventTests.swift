@@ -24,7 +24,7 @@ final class FollowDiagnosticEventTests: XCTestCase {
             calibration: reduction.calibration, sendEntryUptime: 11))
         trace.planning(reduction.calibration, sample: actual, profile: profile, decision: decision, uptime: 11)
         XCTAssertEqual(trace.fields["allowance_policy"], .string("command_stop_window_overhead_once;coast_in_response"))
-        XCTAssertEqual(trace.fields["budget_formula"], .string("min(maximum,max(E/R-H,repeatableObservedBudget),overshootCeiling)"))
+        XCTAssertEqual(trace.fields["budget_formula"], .string("min(maximum,max(E/R-H,repeatableObservedBudget,oneOvershootCorrection),overshootCeiling)"))
         guard case .number(let budget) = trace.fields["candidate_budget_s"] else { return XCTFail() }
         XCTAssertEqual(budget, -0.11284036747819653, accuracy: 1e-12)
         XCTAssertEqual(decision, .burst(direction: 1, budget: 0.080))

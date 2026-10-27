@@ -5,6 +5,81 @@ import RoverNav
 @testable import PhroverKit
 
 final class DepthSafetyEvaluatorTests: XCTestCase {
+    func testBoundedProbeUsesObservedStoppingCorridorWithoutCruiseLookahead() {
+        // Real projection/evaluator, deliberately incomplete depth outside the
+        // stopping corridor. This is a synthetic regression, not device imagery.
+        let map = stoppingCorridorDepth()
+        let snapshot = DepthSafetyEvaluator.ingest(rawDepthMap: map, intrinsics: wideIntrinsics,
+            cameraTransform: cameraTransform(height: 0.30), timestamp: 10,
+            calibration: RoverConfig.cameraMountCalibration, geometry: geometry)
+        let command = WheelCommand(left: 0.25, right: 0.25)
+        let normal = DepthSafetyEvaluator.evaluate(snapshot, command: command, now: 10.05)
+        XCTAssertEqual(normal.state, .unavailable(.blindSweptVolume))
+        XCTAssertEqual(normal.coverage?.horizon ?? 0, 0.65, accuracy: 1e-12)
+        XCTAssertGreaterThan(normal.coverage?.missingDepthPoints ?? 0, 0)
+        let probe = DepthSafetyEvaluator.evaluate(snapshot, command: command, now: 10.05, boundedReadyMotion: true)
+        XCTAssertEqual(probe.state, .clear)
+        XCTAssertEqual(probe.requiredStoppingDistance, 0.30)
+        XCTAssertEqual(probe.coverage?.horizon, 0.30)
+        XCTAssertGreaterThanOrEqual(probe.coverage?.fraction ?? 0, 0.90)
+        XCTAssertEqual(probe.coverageProvenance, "bounded_ready_motion_stopping_corridor")
+    }
+
+    @MainActor
+    func testARDepthProviderUsesProbeScopeOnlyDuringExplicitAssessment() {
+        let ar = ARSessionManager()
+        ar.ingestDepthSafety(rawDepthMap: stoppingCorridorDepth(), intrinsics: wideIntrinsics,
+            cameraTransform: cameraTransform(height: 0.30), timestamp: 10)
+        let command = WheelCommand(left: 0.25, right: 0.25)
+        let probe = ReadyMotionDepthScope.$active.withValue(true) {
+            ar.depthSafetyObservation(for: command, at: 10.05)
+        }
+        XCTAssertEqual(probe.state, .clear)
+        XCTAssertEqual(ar.depthSafetyObservation(for: command, at: 10.05).state, .unavailable(.blindSweptVolume))
+        let stale = ReadyMotionDepthScope.$active.withValue(true) {
+            ar.depthSafetyObservation(for: command, at: 10.251)
+        }
+        XCTAssertEqual(stale.state, .unavailable(.staleRawDepth))
+    }
+
+    func testProbeCannotClearNearBlindSpaceOrKnownStoppingCorridorObstacle() {
+        let nearBlind = DepthSafetyEvaluator.ingest(
+            rawDepthMap: makeDepthBuffer(width: 80, height: 60, constantDepth: 3), intrinsics: ordinaryIntrinsics,
+            cameraTransform: cameraTransform(height: 0.30), timestamp: 10,
+            calibration: RoverConfig.cameraMountCalibration, geometry: geometry)
+        let command = WheelCommand(left: 0.25, right: 0.25)
+        let blind = DepthSafetyEvaluator.evaluate(nearBlind, command: command, now: 10.05, boundedReadyMotion: true)
+        XCTAssertEqual(blind.state, .unavailable(.blindSweptVolume))
+        XCTAssertGreaterThan(blind.coverage?.outsideViewPoints ?? 0, 0)
+        XCTAssertEqual(blind.coverage?.missingDepthPoints, 0)
+        let cells = Set((1...3).map { DepthSafetyCell(lateralIndex: 0, heightIndex: $0, forwardIndex: 10) })
+        let obstacle = DepthSafetySnapshot(timestamp: 10, cells: cells, cellResolution: 0.04,
+            validSampleRatio: 1, geometry: geometry, projection: nearBlind.projection, failureReason: nil)
+        let blocked = DepthSafetyEvaluator.evaluate(obstacle, command: command, now: 10.05, boundedReadyMotion: true)
+        XCTAssertEqual(blocked.state, .stop)
+        XCTAssertEqual(blocked.requiredStoppingDistance, 0.30)
+        for other in [WheelCommand(left: 0.5, right: 0.5), .init(left: 0.2, right: 0.25),
+                      .init(left: -0.25, right: -0.25), .init(left: -0.25, right: 0.25)] {
+            let result = DepthSafetyEvaluator.evaluate(nearBlind, command: other, now: 10.05, boundedReadyMotion: true)
+            XCTAssertNotEqual(result.coverageProvenance, "bounded_ready_motion_stopping_corridor")
+        }
+    }
+
+    private func stoppingCorridorDepth() -> CVPixelBuffer {
+        let map = makeDepthBuffer(width: 80, height: 60, constantDepth: .nan)
+        for index in 0...8 {
+            let z = 0.15 + 0.30 * Double(index) / 8
+            for x in [-0.205, 0, 0.205] {
+                for height in [0.06, 0.27, 0.48] {
+                    let px = Int((40 + 20 * x / z).rounded())
+                    let py = Int((30 - 8 * (height - 0.30) / z).rounded())
+                    fill(depth: 3, x: px...px, y: py...py, in: map)
+                }
+            }
+        }
+        return map
+    }
+
     private let geometry = RoverCollisionGeometry(
         length: 0.30,
         width: 0.25,

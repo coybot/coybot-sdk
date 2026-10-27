@@ -81,6 +81,12 @@ public struct FollowMeConfiguration {
     public var maximumScanRotation: Double = 2 * .pi
     public var maximumScanAttempts: Int = 72
     public var maximumScanInterruptions: Int = 8
+    /// A turn is admitted only while its perception frame retains this much
+    /// freshness. Deferral never extends the normal maximum observation age.
+    public var scanAdmissionFreshnessReserve: TimeInterval = 0.15
+    /// Fixed stopped wait for a dispatchable frame; newer near-expiry frames do
+    /// not renew this deadline or consume the motor interruption allowance.
+    public var scanAdmissionTimeout: TimeInterval = 2
     public var minimumGoalChange: Double = 0.30
     public var maximumGoalUpdatesPerSecond: Double = 3
     public var perceptionRecoverySeconds: TimeInterval = 2

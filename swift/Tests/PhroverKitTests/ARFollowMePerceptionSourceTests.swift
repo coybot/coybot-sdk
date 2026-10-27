@@ -7,6 +7,74 @@ import ImageIO
 
 @MainActor
 final class ARFollowMePerceptionSourceTests: XCTestCase {
+    func testNewestInferenceSelectionCannotDiscardQueuedDepthOrTrackingLoss() throws {
+        var image: CVPixelBuffer?
+        var depth: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 20, 20, kCVPixelFormatType_32BGRA, nil, &image)
+        CVPixelBufferCreate(kCFAllocatorDefault, 20, 20, kCVPixelFormatType_DepthFloat32, nil, &depth)
+        let buffer = try XCTUnwrap(image)
+        let depthMap = try XCTUnwrap(depth)
+        func snapshot(_ sequence: UInt64, depth: Bool = true, tracking: ARTrackingQuality = .normal) -> ARFrameSnapshot {
+            .init(id: .init(generation: 1, sequence: sequence), timestamp: Double(sequence), image: buffer,
+                cameraTransform: matrix_identity_float4x4, cameraIntrinsics: matrix_identity_float3x3,
+                imageResolution: CGSize(width: 20, height: 20), depthMap: depth ? depthMap : nil,
+                pose: .init(position: .zero, yaw: 0), trackingQuality: tracking)
+        }
+        let latest = snapshot(3)
+        let depthLost = snapshot(2, depth: false)
+        XCTAssertEqual(ARFollowMePerceptionSource.inferenceSnapshot(queued: depthLost, latest: latest).id, depthLost.id)
+        let trackingLost = snapshot(2, tracking: .limited)
+        XCTAssertEqual(ARFollowMePerceptionSource.inferenceSnapshot(queued: trackingLost, latest: latest).id, trackingLost.id)
+        XCTAssertEqual(ARFollowMePerceptionSource.inferenceSnapshot(queued: snapshot(2), latest: latest).id, latest.id)
+    }
+
+    func testDroppingUnconsumedStreamReleasesFollowInferencePriority() async throws {
+        let ar = ARSessionManager()
+        let detector = Detector(supportedLabels: ["person"], detectionHandler: { _ in [] })
+        let source = ARFollowMePerceptionSource(ar: ar, detector: detector)
+        var stream: AsyncStream<FollowPerceptionEvent>? = source.events()
+        var image: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 20, 20, kCVPixelFormatType_32BGRA, nil, &image)
+        ar.ingestForTesting(image: try XCTUnwrap(image), timestamp: 1, cameraTransform: matrix_identity_float4x4,
+            intrinsics: matrix_identity_float3x3, imageResolution: CGSize(width: 20, height: 20),
+            depthMap: nil, trackingQuality: .normal)
+        let snapshot = try XCTUnwrap(ar.latestSnapshot)
+        let suppressed = await detector.evaluateForMissionAsync(snapshot)
+        XCTAssertNil(suppressed)
+        XCTAssertNotNil(stream)
+        stream = nil
+        for _ in 0..<30 { await Task.yield() }
+        let resumed = await detector.evaluateForMissionAsync(snapshot)
+        XCTAssertNotNil(resumed, "Abandoning the event stream must release its detector consumer token")
+    }
+
+    func testSlowConsumerReceivesNewestCompletedFrameInsteadOfInferenceBacklog() async throws {
+        let ar = ARSessionManager()
+        let detector = Detector(supportedLabels: ["person"], detectionHandler: { _ in [] })
+        let source = ARFollowMePerceptionSource(ar: ar, detector: detector)
+        var iterator = source.events().makeAsyncIterator()
+        var image: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 20, 20, kCVPixelFormatType_32BGRA, nil, &image)
+        let buffer = try XCTUnwrap(image)
+        func publish(_ sequence: Int) {
+            ar.ingestForTesting(image: buffer, timestamp: Double(sequence), cameraTransform: matrix_identity_float4x4,
+                intrinsics: matrix_identity_float3x3, imageResolution: CGSize(width: 20, height: 20),
+                depthMap: nil, trackingQuality: .normal)
+        }
+        publish(1)
+        guard case .frame? = await iterator.next() else { return XCTFail("Expected initial frame") }
+        for sequence in 2...4 {
+            publish(sequence)
+            for _ in 0..<1000 where detector.latestFollowEvaluation?.snapshot.timestamp != Double(sequence) {
+                try await Task.sleep(for: .milliseconds(1))
+            }
+            XCTAssertEqual(detector.latestFollowEvaluation?.snapshot.timestamp, Double(sequence))
+            for _ in 0..<30 { await Task.yield() }
+        }
+        guard case .frame(let latest)? = await iterator.next() else { return XCTFail("Expected newest completed frame") }
+        XCTAssertEqual(latest.timestamp, 4)
+    }
+
     func testMissionReceiptSurvivesSkippedInferenceAndLimitedTrackingWithoutSpatialGrounding() async throws {
         var image: CVPixelBuffer?
         CVPixelBufferCreate(kCFAllocatorDefault, 20, 20, kCVPixelFormatType_32BGRA, nil, &image)

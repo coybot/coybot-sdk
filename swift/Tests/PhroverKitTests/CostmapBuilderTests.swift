@@ -36,4 +36,35 @@ final class CostmapBuilderTests: XCTestCase {
         XCTAssertFalse(CostmapBuilder.isObstacleHeight(0.02, floorY: floor))
         XCTAssertFalse(CostmapBuilder.isObstacleHeight(2.40, floorY: floor))
     }
+
+    func testGeometryFloorCanBlockReadyCorridorThatAstralHeuristicMissed() {
+        // Differential fixture, not a replay of the device mesh (not logged).
+        // Astral a326011 estimates floor from anchor translation minus 2 m;
+        // Coybot retains its geometry-derived floor from 4a885f6.
+        let vertices = Array(repeating: SIMD3<Float>(-0.75, 0.02, -0.75), count: 20)
+            + [SIMD3<Float>(-0.35, 0.18, 0.15)]
+        let params = CostmapBuilder.Params(size: 2)
+        let current = CostmapBuilder.buildWithObserved(from: .init(worldVertices: vertices),
+            center: .zero, params: params).map
+        var astral = Costmap(width: current.width, height: current.height,
+            resolution: current.resolution, origin: current.origin)
+        let legacyFloorY: Float = 0 - 2.0 // identity mesh-anchor transform
+        for point in vertices {
+            let height = point.y - legacyFloorY
+            if height > Float(params.floorBand), height < Float(params.ceilingBand) {
+                astral.markObstacle(at: .init(Double(point.x), Double(point.z)))
+            }
+        }
+        astral.inflate(radius: params.inflationRadius)
+        let direction = Vec2(cos(1.446), sin(1.446))
+        let goal = direction * 0.10
+        let goalCell = current.worldToCell(goal)
+        let startCell = current.worldToCell(.zero)
+        XCTAssertEqual(current.cost(startCell.cx, startCell.cy), 0)
+        XCTAssertEqual(current.cost(goalCell.cx, goalCell.cy), 0)
+        // Keep Astral's exact corridor margin on both sides of the comparison:
+        // the floor policy alone is enough to change admission.
+        XCTAssertTrue(astral.isSegmentClear(from: .zero, to: direction * 0.12, margin: 0.02))
+        XCTAssertFalse(current.isSegmentClear(from: .zero, to: direction * 0.12, margin: 0.02))
+    }
 }

@@ -2,6 +2,20 @@ import XCTest
 @testable import PhroverKit
 
 final class FollowMotionFailureResolutionTests: XCTestCase {
+    func testReadyOutsideViewFailureReportsMeasuredCoverageAndPreservesFailedStopPriority() {
+        let request = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 13, purpose: .followReady, phase: "aligning")
+        let context = FollowMotionOperationContext(request: request, controllerOperationID: 12, purpose: .followReady, profile: nil)
+        var resolution = FollowMotionFailureResolution(.init(context: context,
+            reason: .depthUnavailable(.blindSweptVolume), stopOutcome: .confirmed, source: .result,
+            turnDiagnosticFields: ["depth_coverage_fraction": .number(104.0 / 162),
+                "depth_required_coverage_fraction": .number(0.9), "depth_outside_view_points": .number(58)]))
+        XCTAssertTrue(resolution.message.contains("64%"))
+        XCTAssertTrue(resolution.message.contains("90% required"))
+        XCTAssertTrue(resolution.message.contains("camera framing or mounting"))
+        resolution.consume(.init(context: context, reason: .commandFailed, stopOutcome: .failed, source: .confirmation))
+        XCTAssertEqual(resolution.message, "Motor stop could not be confirmed. Motion is blocked.")
+    }
+
     @MainActor
     func testEarlierHazardAndFailureSurviveLaterClearanceRevocation() throws {
         for earlier in [NavigationFailure.obstacle, .commsLost, .rotationResolutionInsufficient] {

@@ -140,6 +140,53 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         XCTAssertTrue(events.contains { $0["event"] as? String == "follow_scan.failure" })
     }
 
+    func testRecordedAlignmentSequenceCorrectsAfterStopLatencySpike() async throws {
+        let source = FollowRecoveryDiagnosticSourceFixture()
+        let sink = FollowDiagnosticRecordingSink()
+        let emitter = FollowDiagnosticEmitter(streamID: "alignment-latency", monotonic: { source.uptime },
+            utc: { Date() }, sink: sink.append)
+        let initialYaw = 1.2934638440161939
+        let target = 1.6160948671430133 - initialYaw
+        let measuredYaws = [1.3571727525186204, 1.3919495786239806, 1.438210875207493,
+            1.4594608838320653, 1.517722599984274, 2.0431603854449154]
+        var commands: [WheelCommand] = []
+        var budgets: [Double] = []
+        let controller = FollowNavigationController(currentPose: { XCTFail("No legacy reads"); return nil },
+            forwardClearance: { 2 }, plan: { _, _ in nil }, lastAckAt: { Date() },
+            sendCommand: { command in
+                commands.append(command)
+                let authorization = try XCTUnwrap(FollowTurnBurstTransportScope.authorization)
+                budgets.append(authorization.deadline - authorization.sendEntryUptime)
+                guard commands.count <= 7 else { throw URLError(.timedOut) }
+                source.uptime += 0.031
+            }, stopRover: {
+                if !commands.isEmpty { source.uptime += commands.count == 6 ? 0.314495 : 0.020 }
+            }, sleep: { duration in
+                if !commands.isEmpty {
+                    source.pose = .init(position: .zero, yaw: commands.count <= measuredYaws.count
+                        ? measuredYaws[commands.count - 1] - initialYaw : target)
+                }
+                await source.advance(duration)
+            }, diagnosticEmitter: emitter, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+            sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
+        let result = await NavigationFollowMeMotion(navigation: controller).perform(.alignment(target), context:
+            .init(sessionGeneration: 1, requestToken: 1, purpose: .followAlignment, phase: "aligning"))
+        XCTAssertEqual(result.result, .arrived)
+        XCTAssertEqual(result.stopOutcome, .confirmed)
+        XCTAssertEqual(commands.count, 7)
+        XCTAssertTrue(commands.prefix(6).allSatisfy { $0.left < 0 && $0.right > 0 })
+        XCTAssertGreaterThan(commands.last?.left ?? 0, 0)
+        XCTAssertLessThan(budgets.last ?? 1, 0.008)
+        let correction = try XCTUnwrap(try records(sink).first {
+            $0["budget_selection_reason"] as? String == "bounded_overshoot_correction"
+        })
+        XCTAssertEqual(correction["stop_outcome"] as? String, "confirmed")
+        XCTAssertEqual(correction["responses_after_overshoot"] as? Int, 0)
+        XCTAssertEqual(correction["tolerance_rad"] as? Double, 0.05)
+        XCTAssertGreaterThan(try XCTUnwrap(correction["retained_response_overhead_s"] as? Double), 0.3)
+    }
+
     func testRuntimeBurstTraceCapturesLateAckAndOnlyActuallyEnteredWaits() async throws {
         for purpose in [FollowMotionPurpose.followScan, .followAlignment] {
             let source = FollowRecoveryDiagnosticSourceFixture()

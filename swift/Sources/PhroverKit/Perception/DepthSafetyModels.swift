@@ -174,6 +174,8 @@ struct DepthSafetyObservation: Equatable, Sendable {
     let speedLimit: Double?
     var coverageProvenance: String = "depth"
     var coverage: DepthSafetyCoverage?
+    /// Occupied cells contributed by retained frames where the live camera is blind.
+    var rememberedHazardCellCount = 0
 
     static func unavailable(_ reason: DepthSafetyUnavailableReason,
                             sampleAge: TimeInterval,
@@ -192,7 +194,11 @@ struct DepthSafetyObservation: Equatable, Sendable {
 
 struct DepthSafetyCoverage: Equatable, Sendable {
     struct Point: Equatable, Sendable {
-        enum Support: String, Sendable { case covered, outsideView = "outside_view", missingDepth = "missing_depth", occluded }
+        enum Support: String, Sendable {
+            case covered, rememberedCovered = "remembered_covered"
+            case outsideView = "outside_view", missingDepth = "missing_depth", occluded
+            var isCovered: Bool { self == .covered || self == .rememberedCovered }
+        }
         let section: String
         let boundary: String
         let travel: Double
@@ -203,6 +209,8 @@ struct DepthSafetyCoverage: Equatable, Sendable {
         let pixelY: Double?
         let cameraDepth: Double?
         let measuredDepth: Double?
+        /// Age of the retained frame that decided an out-of-view point; nil when live.
+        var rememberedAge: Double? = nil
     }
     struct Component: Equatable, Sendable {
         let name: String
@@ -218,6 +226,10 @@ struct DepthSafetyCoverage: Equatable, Sendable {
     let missingDepthPoints: Int
     let occludedPoints: Int
     let projectionAvailable: Bool
+    /// Included in `coveredPoints`: out of live view, seen free by a retained frame.
+    var rememberedPoints = 0
+    var historyFrames = 0
+    var oldestHistoryAge: Double?
     var points: [Point] = []
     var components: [Component] = []
     var boundaries: [Component] = []
@@ -248,6 +260,9 @@ struct DepthSafetyCoverage: Equatable, Sendable {
             "depth_limiting_component": limiting.map { .string($0.name + ($0.boundary.map { ": " + $0 } ?? "")) } ?? .null,
             "depth_limiting_component_fraction": number(limitingFraction),
             "depth_boundary_coverage_enforced": .bool(enforceBoundaryCoverage),
+            "depth_remembered_points": .number(Double(rememberedPoints)),
+            "depth_history_frames": .number(Double(historyFrames)),
+            "depth_history_oldest_age_s": number(oldestHistoryAge),
             "depth_coverage_components": .array(components.map(componentFields)),
             "depth_coverage_boundaries": .array(boundaries.map(componentFields))]
         guard includePoints else { return fields }
@@ -263,7 +278,8 @@ struct DepthSafetyCoverage: Equatable, Sendable {
                 "height_m": number(point.roverPosition.y), "forward_m": number(point.roverPosition.z),
                 "support": .string(point.support.rawValue), "outside_edges": .array(point.outsideEdges.map { .string($0) }),
                 "pixel_x": number(point.pixelX), "pixel_y": number(point.pixelY),
-                "camera_depth_m": number(point.cameraDepth), "measured_depth_m": number(point.measuredDepth)])
+                "camera_depth_m": number(point.cameraDepth), "measured_depth_m": number(point.measuredDepth),
+                "remembered_age_s": number(point.rememberedAge)])
         })
         if let geometry {
             fields["depth_geometry_model"] = .string(geometry.sections.isEmpty ? "conservative_bounding_box" : "height_sections")
@@ -313,6 +329,47 @@ struct DepthSafetySnapshot: Sendable {
     let geometry: RoverCollisionGeometry
     let projection: DepthSafetyProjection?
     let failureReason: DepthSafetyUnavailableReason?
+    /// Retained earlier frames of the same tracked session, newest first.
+    var history: [DepthVisibilityMemory.Frame] = []
 
     var occupiedCellCount: Int { cells.count }
+}
+
+/// Recent depth frames from one continuously tracked AR session. The live frame
+/// stays authoritative wherever it can see; retained frames only answer for
+/// space the live camera cannot see at all. See docs/remembered-depth-visibility.md.
+struct DepthVisibilityMemory: Sendable {
+    struct Frame: Sendable {
+        let timestamp: TimeInterval
+        let projection: DepthSafetyProjection
+        let cells: Set<DepthSafetyCell>
+        let cellResolution: Double
+    }
+
+    /// Space no live sensor can see is trusted for at most this long.
+    static let maximumAge: TimeInterval = 2.0
+    static let minimumSpacing: TimeInterval = 0.10
+    static let maximumFrames = 20
+
+    /// Oldest first.
+    private(set) var frames: [Frame] = []
+
+    mutating func clear() { frames.removeAll() }
+
+    /// Hands `snapshot` the retained frames older than it, then retains it if
+    /// its own evaluation succeeded and it is far enough from the newest frame.
+    mutating func attach(to snapshot: inout DepthSafetySnapshot) {
+        let now = snapshot.timestamp
+        guard now.isFinite else { clear(); return }
+        frames.removeAll { frame in
+            let age = now - frame.timestamp
+            return !(age > 0 && age <= Self.maximumAge)
+        }
+        snapshot.history = frames.reversed()
+        guard snapshot.failureReason == nil, let projection = snapshot.projection else { return }
+        if let newest = frames.last, now - newest.timestamp < Self.minimumSpacing { return }
+        frames.append(.init(timestamp: now, projection: projection, cells: snapshot.cells,
+                            cellResolution: snapshot.cellResolution))
+        if frames.count > Self.maximumFrames { frames.removeFirst(frames.count - Self.maximumFrames) }
+    }
 }

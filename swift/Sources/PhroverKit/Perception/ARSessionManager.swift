@@ -475,9 +475,11 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
                             intrinsics: simd_float3x3,
                             intrinsicsImageSize: CGSize? = nil,
                             cameraTransform: simd_float4x4,
-                            timestamp: TimeInterval) {
+                            timestamp: TimeInterval,
+                            trackingNormal: Bool = true) {
         depthProcessor.submit(.init(rawDepthMap: rawDepthMap, intrinsics: intrinsics,
-            imageResolution: intrinsicsImageSize, cameraTransform: cameraTransform, timestamp: timestamp))
+            imageResolution: intrinsicsImageSize, cameraTransform: cameraTransform, timestamp: timestamp,
+            trackingNormal: trackingNormal))
     }
 
     func observeDepthSafety(_ observer: @escaping (DepthSafetySnapshot?) -> Void) -> () -> Void {
@@ -530,7 +532,8 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
                 intrinsics: frame.camera.intrinsics,
                 intrinsicsImageSize: frame.camera.imageResolution,
                 cameraTransform: frame.camera.transform,
-                timestamp: frame.timestamp
+                timestamp: frame.timestamp,
+                trackingNormal: Self.arTrackingQuality(trackingQuality) == .normal
             )
         } else {
             depthProcessor.invalidate()

@@ -259,6 +259,17 @@ enum DepthSafetyEvaluator {
         // Keep the full collision/stopping margin. Only the cruise look-ahead
         // beyond stopping distance is unnecessary for the bounded experiment.
         let visibilityHorizon = boundedForward ? stoppingDistance : cautionDistance
+        let collisionSections = snapshot.geometry.collisionSections
+        let reach = (collisionSections.map {
+            hypot(abs($0.forwardOffset) + $0.length / 2, abs($0.lateralOffset) + $0.width / 2 + snapshot.geometry.lateralSafetyMargin)
+        }.max() ?? 0) + cautionDistance + snapshot.cellResolution
+        // Obstacles seen moments ago stay hazards wherever the live camera is now blind.
+        let rememberedHazards = rememberedHazardCells(snapshot: snapshot, reach: reach)
+        func finalized(_ observation: DepthSafetyObservation) -> DepthSafetyObservation {
+            var result = observation
+            result.rememberedHazardCellCount = rememberedHazards.count
+            return result
+        }
         func checkingCoverage(_ observation: DepthSafetyObservation, horizon: Double) -> DepthSafetyObservation {
             let coverage = sweptVolumeCoverage(snapshot: snapshot, command: command, motion: motion, horizon: horizon)
             var result = coverage.isSufficient(minimumSweptVolumeCoverage) ? observation : DepthSafetyObservation(
@@ -267,11 +278,10 @@ enum DepthSafetyEvaluator {
                 motionClass: motion, speedLimit: nil)
             result.coverage = coverage
             result.coverageProvenance = boundedForward ? "bounded_ready_motion_stopping_corridor" : "depth"
-            return result
+            return finalized(result)
         }
         var contactTravel: [DepthSafetyCell: Double] = [:]
-        let collisionSections = snapshot.geometry.collisionSections
-        for occupiedCell in snapshot.cells {
+        for occupiedCell in snapshot.cells.union(rememberedHazards) {
             if confirmedRotation {
                 let lateral = (Double(occupiedCell.lateralIndex) + 0.5) * snapshot.cellResolution
                 let forward = (Double(occupiedCell.forwardIndex) + 0.5) * snapshot.cellResolution
@@ -322,7 +332,7 @@ enum DepthSafetyEvaluator {
                     motion: motion
                 )
                 if confirmedRotation { observation.coverageProvenance = "operator_confirmed_rotation" }
-                return observation
+                return finalized(observation)
             }
             return checkingCoverage(hazardObservation(
                 state: state,
@@ -339,7 +349,7 @@ enum DepthSafetyEvaluator {
         if confirmedRotation {
             var observation = clearObservation(age: age, motion: motion, stoppingDistance: stoppingDistance)
             observation.coverageProvenance = "operator_confirmed_rotation"
-            return observation
+            return finalized(observation)
         }
 
         return checkingCoverage(clearObservation(age: age, motion: motion, stoppingDistance: stoppingDistance),
@@ -428,27 +438,28 @@ enum DepthSafetyEvaluator {
             geometry: snapshot.geometry,
             horizon: horizon
         )
-        var covered = 0, outside = 0, missing = 0, occluded = 0
+        var covered = 0, remembered = 0, outside = 0, missing = 0, occluded = 0
         var details: [DepthSafetyCoverage.Point] = []
         var componentCounts: [String: (required: Int, covered: Int)] = [:]
         var boundaryCounts: [CoverageGroup: (required: Int, covered: Int)] = [:]
         for point in points {
-            let detail = depthSupport(at: point, projection: snapshot.projection)
+            let detail = depthSupport(at: point, snapshot: snapshot)
             var counts = componentCounts[point.section] ?? (0, 0)
             counts.required += 1
-            if detail.support == .covered { counts.covered += 1 }
+            if detail.support.isCovered { counts.covered += 1 }
             componentCounts[point.section] = counts
             let group = CoverageGroup(section: point.section, boundary: point.boundary)
             var edgeCounts = boundaryCounts[group] ?? (0, 0)
             edgeCounts.required += 1
-            if detail.support == .covered { edgeCounts.covered += 1 }
+            if detail.support.isCovered { edgeCounts.covered += 1 }
             boundaryCounts[group] = edgeCounts
             if details.count < 256 { details.append(detail) }
-            else if detail.support != .covered, let replace = details.firstIndex(where: { $0.support == .covered }) {
+            else if !detail.support.isCovered, let replace = details.firstIndex(where: { $0.support.isCovered }) {
                 details[replace] = detail // Retain failing points preferentially; decisions still count every sample.
             }
             switch detail.support {
             case .covered: covered += 1
+            case .rememberedCovered: covered += 1; remembered += 1
             case .outsideView: outside += 1
             case .missingDepth: missing += 1
             case .occluded: occluded += 1
@@ -456,6 +467,9 @@ enum DepthSafetyEvaluator {
         }
         var result = DepthSafetyCoverage(horizon: horizon, requiredPoints: points.count, coveredPoints: covered,
             outsideViewPoints: outside, missingDepthPoints: missing, occludedPoints: occluded, projectionAvailable: snapshot.projection != nil)
+        result.rememberedPoints = remembered
+        result.historyFrames = snapshot.history.count
+        result.oldestHistoryAge = snapshot.history.last.map { snapshot.timestamp - $0.timestamp }
         result.points = details
         result.components = snapshot.geometry.collisionSections.compactMap { section in
             componentCounts[section.name].map { .init(name: section.name, required: $0.required, covered: $0.covered) }
@@ -582,42 +596,110 @@ enum DepthSafetyEvaluator {
     }
 
     private static func depthSupport(at location: CoverageLocation,
-                                     projection: DepthSafetyProjection?) -> DepthSafetyCoverage.Point {
-        var x: Double?, y: Double?, cameraDepth: Double?, measuredDepth: Double?
-        func detail(_ support: DepthSafetyCoverage.Point.Support, edges: [String] = []) -> DepthSafetyCoverage.Point {
+                                     snapshot: DepthSafetySnapshot) -> DepthSafetyCoverage.Point {
+        func detail(_ sight: Sight, support: DepthSafetyCoverage.Point.Support? = nil,
+                    rememberedAge: Double? = nil) -> DepthSafetyCoverage.Point {
             .init(section: location.section, boundary: location.boundary, travel: location.travel,
-                roverPosition: location.position, support: support, outsideEdges: edges,
-                pixelX: x, pixelY: y, cameraDepth: cameraDepth, measuredDepth: measuredDepth)
+                roverPosition: location.position, support: support ?? sight.support, outsideEdges: sight.edges,
+                pixelX: sight.pixelX, pixelY: sight.pixelY, cameraDepth: sight.cameraDepth,
+                measuredDepth: sight.measuredDepth, rememberedAge: rememberedAge)
         }
-        guard let projection else { return detail(.missingDepth) }
-        let roverPoint = location.position
-        let world = projection.roverOrigin
+        guard let projection = snapshot.projection else { return detail(Sight(support: .missingDepth)) }
+        let world = worldPoint(location.position, in: projection)
+        let live = sight(of: world, in: projection)
+        guard live.support == .outsideView else { return detail(live) }
+        // Only space the live camera cannot see at all is answered from memory,
+        // newest viewpoint first. A remembered occlusion stays a failure.
+        for frame in snapshot.history {
+            let age = snapshot.timestamp - frame.timestamp
+            guard age > 0, age <= DepthVisibilityMemory.maximumAge else { continue }
+            switch sight(of: world, in: frame.projection).support {
+            case .covered: return detail(live, support: .rememberedCovered, rememberedAge: age)
+            case .occluded: return detail(live, support: .occluded, rememberedAge: age)
+            case .outsideView, .missingDepth, .rememberedCovered: continue
+            }
+        }
+        return detail(live)
+    }
+
+    /// One projection of a world point into one captured depth frame.
+    private struct Sight {
+        var support: DepthSafetyCoverage.Point.Support
+        var edges: [String] = []
+        var pixelX: Double?
+        var pixelY: Double?
+        var cameraDepth: Double?
+        var measuredDepth: Double?
+    }
+
+    private static func worldPoint(_ roverPoint: SIMD3<Double>, in projection: DepthSafetyProjection) -> SIMD3<Double> {
+        projection.roverOrigin
             + projection.roverRight * roverPoint.x
             + SIMD3<Double>(0, roverPoint.y, 0)
             + projection.roverForward * roverPoint.z
+    }
+
+    private static func sight(of world: SIMD3<Double>, in projection: DepthSafetyProjection) -> Sight {
         let camera = projection.cameraFromWorld * SIMD4<Float>(
             Float(world.x), Float(world.y), Float(world.z), 1
         )
         let targetDepth = -Double(camera.z)
-        cameraDepth = targetDepth.isFinite ? targetDepth : nil
-        guard targetDepth > 0.05, targetDepth.isFinite else { return detail(.outsideView, edges: ["behind_or_near_camera"]) }
+        var result = Sight(support: .outsideView, cameraDepth: targetDepth.isFinite ? targetDepth : nil)
+        guard targetDepth > 0.05, targetDepth.isFinite else {
+            result.edges = ["behind_or_near_camera"]
+            return result
+        }
         let px = (projection.fx * Double(camera.x) / targetDepth + projection.cx).rounded()
         let py = (projection.cy - projection.fy * Double(camera.y) / targetDepth).rounded()
-        x = px.isFinite ? px : nil
-        y = py.isFinite ? py : nil
-        guard px.isFinite, py.isFinite else { return detail(.outsideView, edges: ["invalid_projection"]) }
-        var edges: [String] = []
-        if px < 0 { edges.append("left") }
-        if px >= Double(projection.width) { edges.append("right") }
-        if py < 0 { edges.append("top") }
-        if py >= Double(projection.height) { edges.append("bottom") }
-        guard edges.isEmpty else { return detail(.outsideView, edges: edges) }
+        result.pixelX = px.isFinite ? px : nil
+        result.pixelY = py.isFinite ? py : nil
+        guard px.isFinite, py.isFinite else {
+            result.edges = ["invalid_projection"]
+            return result
+        }
+        if px < 0 { result.edges.append("left") }
+        if px >= Double(projection.width) { result.edges.append("right") }
+        if py < 0 { result.edges.append("top") }
+        if py >= Double(projection.height) { result.edges.append("bottom") }
+        guard result.edges.isEmpty else { return result }
         let pixelX = Int(px), pixelY = Int(py)
-        guard pixelY * projection.width + pixelX < projection.depthValues.count else { return detail(.missingDepth) }
+        result.support = .missingDepth
+        guard pixelY * projection.width + pixelX < projection.depthValues.count else { return result }
         let measured = Double(projection.depthValues[pixelY * projection.width + pixelX])
-        measuredDepth = measured.isFinite ? measured : nil
-        guard measured > 0.05, measured.isFinite else { return detail(.missingDepth) }
-        return detail(measured + cellResolution >= targetDepth ? .covered : .occluded)
+        result.measuredDepth = measured.isFinite ? measured : nil
+        guard measured > 0.05, measured.isFinite else { return result }
+        result.support = measured + cellResolution >= targetDepth ? .covered : .occluded
+        return result
+    }
+
+    /// Occupied cells from retained frames, re-expressed in the live rover frame,
+    /// that the live camera cannot currently see. Where live depth reaches the
+    /// spot, live cells already describe it, including an obstacle that has left.
+    private static func rememberedHazardCells(snapshot: DepthSafetySnapshot, reach: Double) -> Set<DepthSafetyCell> {
+        guard let live = snapshot.projection, !snapshot.history.isEmpty, reach.isFinite else { return [] }
+        let geometry = snapshot.geometry
+        var result = Set<DepthSafetyCell>()
+        for frame in snapshot.history {
+            let age = snapshot.timestamp - frame.timestamp
+            guard age > 0, age <= DepthVisibilityMemory.maximumAge else { continue }
+            for cell in frame.cells {
+                let local = SIMD3<Double>(
+                    (Double(cell.lateralIndex) + 0.5) * frame.cellResolution,
+                    (Double(cell.heightIndex) + 0.5) * frame.cellResolution,
+                    (Double(cell.forwardIndex) + 0.5) * frame.cellResolution)
+                let world = worldPoint(local, in: frame.projection)
+                let relative = world - live.roverOrigin
+                let lateral = simd_dot(relative, live.roverRight)
+                let forward = simd_dot(relative, live.roverForward)
+                let height = relative.y
+                guard hypot(lateral, forward) <= reach,
+                      height >= geometry.minimumCollisionHeight,
+                      height <= geometry.maximumCollisionHeight,
+                      !sight(of: world, in: live).support.isCovered else { continue }
+                result.insert(self.cell(lateral: lateral, height: height, forward: forward))
+            }
+        }
+        return result
     }
 
     private static func sweepStepCount(horizon: Double, curvature: Double) -> Int {

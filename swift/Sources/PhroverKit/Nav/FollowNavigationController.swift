@@ -3048,7 +3048,8 @@ final class FollowNavigationController {
             "depth_coverage_provenance": .string(observation.coverageProvenance),
             "depth_clearance_m": finite(observation.clearance), "depth_support_count": .number(Double(observation.supportCount)),
             "depth_motion_class": .string(observation.motionClass.rawValue), "depth_candidate_disposition": .string(disposition),
-            "depth_required_stopping_distance_m": finite(observation.requiredStoppingDistance)]
+            "depth_required_stopping_distance_m": finite(observation.requiredStoppingDistance),
+            "depth_remembered_hazard_cells": .number(Double(observation.rememberedHazardCellCount))]
         let coverage = observation.coverage
         let coverageFields: [String: FollowDiagnosticValue] = [
             "depth_coverage_horizon_m": coverage.map { finite($0.horizon) } ?? .null,

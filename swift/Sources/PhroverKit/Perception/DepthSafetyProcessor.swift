@@ -11,6 +11,8 @@ final class DepthSafetyProcessor {
         let imageResolution: CGSize?
         let cameraTransform: simd_float4x4
         let timestamp: TimeInterval
+        /// Earlier frames are comparable only while world tracking stays normal.
+        var trackingNormal = true
     }
 
     private let evaluate: @Sendable (Input) -> DepthSafetySnapshot
@@ -18,6 +20,7 @@ final class DepthSafetyProcessor {
     private var pending: (input: Input, generation: UInt64)?
     private var task: Task<Void, Never>?
     private var generation: UInt64 = 0
+    private var memory = DepthVisibilityMemory()
 
     nonisolated static func project(_ input: Input) -> DepthSafetySnapshot {
         DepthSafetyEvaluator.ingest(rawDepthMap: input.rawDepthMap, intrinsics: input.intrinsics,
@@ -46,7 +49,10 @@ final class DepthSafetyProcessor {
                 }.value
                 // Resets, interruptions and missing raw depth revoke old results, even
                 // if their native computation could not be cancelled mid-frame.
-                if job.generation == generation { didProcess(snapshot) }
+                guard job.generation == generation else { continue }
+                var delivered = snapshot
+                if job.input.trackingNormal { memory.attach(to: &delivered) } else { memory.clear() }
+                didProcess(delivered)
             }
         }
     }
@@ -54,5 +60,6 @@ final class DepthSafetyProcessor {
     func invalidate() {
         generation &+= 1
         pending = nil
+        memory.clear()
     }
 }

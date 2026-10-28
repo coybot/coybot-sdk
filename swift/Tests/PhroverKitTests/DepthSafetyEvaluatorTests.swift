@@ -703,6 +703,122 @@ final class DepthSafetyEvaluatorTests: XCTestCase {
         ))
     }
 
+    // MARK: - Remembered visibility (docs/remembered-depth-visibility.md)
+
+    /// The identity camera looks along world -Z; `back` moves it away from the
+    /// space ahead of the live rover, as on the approach before a stop.
+    private func rememberedFrame(back: Float, age: TimeInterval, depth: Float = 3,
+                                 cells: Set<DepthSafetyCell>? = nil) throws -> DepthVisibilityMemory.Frame {
+        var transform = cameraTransform(height: 0.30)
+        transform.columns.3.z = back
+        let snapshot = DepthSafetyEvaluator.ingest(
+            rawDepthMap: makeDepthBuffer(width: 80, height: 60, constantDepth: depth), intrinsics: ordinaryIntrinsics,
+            cameraTransform: transform, timestamp: 10 - age,
+            calibration: RoverConfig.cameraMountCalibration, geometry: geometry)
+        return .init(timestamp: snapshot.timestamp, projection: try XCTUnwrap(snapshot.projection),
+                     cells: cells ?? snapshot.cells, cellResolution: snapshot.cellResolution)
+    }
+
+    private func liveNearBlindSnapshot(history: [DepthVisibilityMemory.Frame] = [],
+                                       depth: CVPixelBuffer? = nil) -> DepthSafetySnapshot {
+        var snapshot = DepthSafetyEvaluator.ingest(
+            rawDepthMap: depth ?? makeDepthBuffer(width: 80, height: 60, constantDepth: 3), intrinsics: ordinaryIntrinsics,
+            cameraTransform: cameraTransform(height: 0.30), timestamp: 10,
+            calibration: RoverConfig.cameraMountCalibration, geometry: geometry)
+        snapshot.history = history
+        return snapshot
+    }
+
+    func testOutOfViewSamplesAreAnsweredByARecentFrameThatSawThem() throws {
+        let command = WheelCommand(left: 0.25, right: 0.25)
+        let live = DepthSafetyEvaluator.evaluate(liveNearBlindSnapshot(), command: command,
+            now: 10.05, boundedReadyMotion: true)
+        XCTAssertEqual(live.state, .unavailable(.blindSweptVolume))
+        XCTAssertGreaterThan(live.coverage?.outsideViewPoints ?? 0, 0)
+
+        let remembered = DepthSafetyEvaluator.evaluate(
+            liveNearBlindSnapshot(history: [try rememberedFrame(back: 0.8, age: 0.5)]),
+            command: command, now: 10.05, boundedReadyMotion: true)
+        let coverage = try XCTUnwrap(remembered.coverage)
+        XCTAssertEqual(remembered.state, .clear)
+        XCTAssertEqual(coverage.rememberedPoints, live.coverage?.outsideViewPoints)
+        XCTAssertEqual(coverage.outsideViewPoints, 0)
+        XCTAssertEqual(coverage.historyFrames, 1)
+        XCTAssertEqual(coverage.oldestHistoryAge ?? 0, 0.5, accuracy: 1e-9)
+        let rememberedPoints = coverage.points.filter { $0.support == .rememberedCovered }
+        XCTAssertEqual(rememberedPoints.count, coverage.rememberedPoints)
+        XCTAssertTrue(rememberedPoints.allSatisfy { ($0.rememberedAge ?? 0) == 0.5 && !$0.outsideEdges.isEmpty },
+            "Remembered points keep their live out-of-view edges for diagnosis")
+        let fields = coverage.diagnosticFields(includePoints: false)
+        XCTAssertEqual(fields["depth_remembered_points"], .number(Double(coverage.rememberedPoints)))
+        XCTAssertEqual(fields["depth_history_frames"], .number(1))
+    }
+
+    func testMemoryOlderThanTheMaximumAgeIsIgnored() throws {
+        let stale = try rememberedFrame(back: 0.8, age: DepthVisibilityMemory.maximumAge + 0.01)
+        let result = DepthSafetyEvaluator.evaluate(liveNearBlindSnapshot(history: [stale]),
+            command: .init(left: 0.25, right: 0.25), now: 10.05, boundedReadyMotion: true)
+        XCTAssertEqual(result.state, .unavailable(.blindSweptVolume))
+        XCTAssertEqual(result.coverage?.rememberedPoints, 0)
+    }
+
+    func testLiveViewStaysAuthoritativeWhereverItCanSee() throws {
+        // Live depth is missing in the lower image half; those samples are in view.
+        let map = makeDepthBuffer(width: 80, height: 60, constantDepth: 3)
+        fill(depth: .nan, x: 0...79, y: 40...59, in: map)
+        let command = WheelCommand(left: 0.25, right: 0.25)
+        let liveOnly = try XCTUnwrap(DepthSafetyEvaluator.evaluate(liveNearBlindSnapshot(depth: map),
+            command: command, now: 10.05, boundedReadyMotion: true).coverage)
+        XCTAssertGreaterThan(liveOnly.missingDepthPoints, 0)
+        let withMemory = try XCTUnwrap(DepthSafetyEvaluator.evaluate(
+            liveNearBlindSnapshot(history: [try rememberedFrame(back: 0.8, age: 0.5)], depth: map),
+            command: command, now: 10.05, boundedReadyMotion: true).coverage)
+        XCTAssertEqual(withMemory.missingDepthPoints, liveOnly.missingDepthPoints)
+        for (before, after) in zip(liveOnly.points, withMemory.points) where before.support != .outsideView {
+            XCTAssertEqual(after.support, before.support)
+            XCTAssertNil(after.rememberedAge)
+        }
+    }
+
+    func testRememberedOcclusionIsNotCoverageAndNewestViewpointDecides() throws {
+        let command = WheelCommand(left: 0.25, right: 0.25)
+        // Newest retained frame saw a surface in front of the samples; an older
+        // frame saw past them. The newer observation wins.
+        let blocked = try rememberedFrame(back: 0.8, age: 0.3, depth: 0.4)
+        let olderClear = try rememberedFrame(back: 0.8, age: 1.0)
+        let result = DepthSafetyEvaluator.evaluate(liveNearBlindSnapshot(history: [blocked, olderClear]),
+            command: command, now: 10.05, boundedReadyMotion: true)
+        let coverage = try XCTUnwrap(result.coverage)
+        XCTAssertEqual(result.state, .unavailable(.blindSweptVolume))
+        XCTAssertEqual(coverage.rememberedPoints, 0)
+        XCTAssertGreaterThan(coverage.occludedPoints, 0)
+        XCTAssertTrue(coverage.points.filter { $0.support == .occluded }.allSatisfy {
+            abs(($0.rememberedAge ?? 0) - 0.3) < 1e-9
+        })
+    }
+
+    func testRememberedObstacleTheLiveCameraCannotSeeStillStops() throws {
+        // A low box just past the bumper, seen from 0.8 m back, now below the live view.
+        let box = Set((-1...1).map { DepthSafetyCell(lateralIndex: $0, heightIndex: 1, forwardIndex: 25) })
+        let frame = try rememberedFrame(back: 0.8, age: 0.5, cells: box)
+        let command = WheelCommand(left: 0.25, right: 0.25)
+        let result = DepthSafetyEvaluator.evaluate(liveNearBlindSnapshot(history: [frame]),
+            command: command, now: 10.05, boundedReadyMotion: true)
+        XCTAssertEqual(result.state, .stop)
+        XCTAssertEqual(result.rememberedHazardCellCount, 3)
+        XCTAssertLessThanOrEqual(result.clearance, 0.30)
+    }
+
+    func testRememberedObstacleIsDroppedWhereLiveDepthNowSeesPastIt() throws {
+        // Same box higher up, where the live camera sees through to the 3 m wall.
+        let moved = Set((-1...1).map { DepthSafetyCell(lateralIndex: $0, heightIndex: 6, forwardIndex: 25) })
+        let frame = try rememberedFrame(back: 0.8, age: 0.5, cells: moved)
+        let result = DepthSafetyEvaluator.evaluate(liveNearBlindSnapshot(history: [frame]),
+            command: .init(left: 0.25, right: 0.25), now: 10.05, boundedReadyMotion: true)
+        XCTAssertEqual(result.rememberedHazardCellCount, 0)
+        XCTAssertNotEqual(result.state, .stop)
+    }
+
     private func offsetSectionGeometry(lateralOffset: Double = 0.03) -> RoverCollisionGeometry {
         .init(length: 0.30, width: 0.25, minimumCollisionHeight: 0.04, maximumCollisionHeight: 0.34, sections: [
             .init(name: "chassis", length: 0.30, width: 0.25, minimumHeight: 0.04, maximumHeight: 0.14),

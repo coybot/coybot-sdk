@@ -1057,7 +1057,11 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         harness.safety.send(.trackingLimited(generation: 7))
         harness.safety.send(.trackingNormal(generation: 7))
         harness.safety.send(.reactiveSafetyFailed)
-        await eventually { coordinator.phase == .terminal(.safetyFailure(.reactiveSafety)) }
+        // 103 events drain through the async listener; the shared 100-yield
+        // `eventually` budget can expire first and read a partial log.
+        let terminal = SilentSearchPhase.terminal(.safetyFailure(.reactiveSafety))
+        for _ in 0..<5_000 where coordinator.phase != terminal { await Task.yield() }
+        XCTAssertEqual(coordinator.phase, terminal)
         let reasons = harness.events.entries.filter { $0.event == "silent_search_safety" }.compactMap { $0.fields["reason"] }
         XCTAssertEqual(reasons, ["tracking_normal", "tracking_limited", "tracking_normal", "reactive_safety_failed"])
     }

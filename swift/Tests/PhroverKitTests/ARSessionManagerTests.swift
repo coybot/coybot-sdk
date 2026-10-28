@@ -112,22 +112,38 @@ final class ARSessionManagerTests: XCTestCase {
         remove = nil
     }
 
-    func testRetiredMeshAnchorsAreRemovedEvenWhenTrackingIsLimited() throws {
+    func testMeshStoreRetiresAnchorsByIdentityWithoutATrustGate() {
+        // The manager's removal path calls this unconditionally, including
+        // during interruption; ARKit retiring an anchor is not a new observation.
+        var store = MeshAnchorStore<ARAnchor>()
+        let retired = ARAnchor(transform: matrix_identity_float4x4)
+        let retained = ARAnchor(transform: matrix_identity_float4x4)
+        store.upsert([retired, retained])
+        XCTAssertEqual(store.anchors.map(\.identifier), [retired.identifier, retained.identifier])
+        XCTAssertEqual(store.remove(identifiers: [retired.identifier]), 1)
+        XCTAssertEqual(store.anchors.map(\.identifier), [retained.identifier])
+        XCTAssertEqual(store.remove(identifiers: [UUID()]), 0)
+        XCTAssertEqual(store.remove(identifiers: [retained.identifier]), 1)
+        XCTAssertTrue(store.anchors.isEmpty)
+    }
+
+    func testMeshStoreUpdatesReplaceInPlaceAndKeepFirstSeenOrder() {
+        var store = MeshAnchorStore<ARAnchor>()
+        let first = ARAnchor(transform: matrix_identity_float4x4)
+        let second = ARAnchor(transform: matrix_identity_float4x4)
+        store.upsert([first, second])
+        let moved = first.copy() as! ARAnchor
+        store.upsert([moved, ARAnchor(transform: matrix_identity_float4x4)])
+        XCTAssertEqual(store.anchors.count, 3)
+        XCTAssertTrue(store.anchors[0] === moved)
+        XCTAssertEqual(store.anchors[1].identifier, second.identifier)
+    }
+
+    func testRemovingUnknownAnchorsDuringInterruptionIsHarmless() {
         let ar = ARSessionManager()
         ar.resetTracking(generation: 1, runSession: false)
-        for sequence in 1...3 {
-            XCTAssertTrue(ar.ingest(.init(pose: Pose2D(position: .zero, yaw: 0),
-                frameSequence: UInt64(sequence), timestamp: Double(sequence),
-                trackingQuality: .normal, sessionGeneration: 1)))
-        }
-        let retired = try meshIdentity()
-        let retained = try meshIdentity()
-        ar.session(ar.session, didAdd: [retired, retained])
-        XCTAssertEqual(ar.meshAnchors.count, 2)
         ar.sessionWasInterrupted(ar.session)
-        (ar as ARSessionDelegate).session?(ar.session, didRemove: [retired])
-        XCTAssertEqual(ar.meshAnchors.map(\.identifier), [retained.identifier])
-        (ar as ARSessionDelegate).session?(ar.session, didRemove: [retained])
+        (ar as ARSessionDelegate).session?(ar.session, didRemove: [ARAnchor(transform: matrix_identity_float4x4)])
         XCTAssertTrue(ar.meshAnchors.isEmpty)
     }
 
@@ -653,15 +669,4 @@ final class ARSessionManagerTests: XCTestCase {
         value.columns.3 = SIMD4<Float>(x, 0, z, 1)
         return value
     }
-}
-
-// Decode an identity-only mesh anchor through ARKit's public NSSecureCoding
-// interface. These lifecycle tests never inspect the absent geometry.
-private func meshIdentity() throws -> ARMeshAnchor {
-    let data = try NSKeyedArchiver.archivedData(withRootObject: ARAnchor(transform: matrix_identity_float4x4),
-        requiringSecureCoding: true)
-    let decoder = try NSKeyedUnarchiver(forReadingFrom: data)
-    decoder.setClass(ARMeshAnchor.self, forClassName: "ARAnchor")
-    defer { decoder.finishDecoding() }
-    return try XCTUnwrap(decoder.decodeObject(of: ARMeshAnchor.self, forKey: NSKeyedArchiveRootObjectKey))
 }

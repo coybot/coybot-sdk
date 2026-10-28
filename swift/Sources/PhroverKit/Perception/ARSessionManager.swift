@@ -96,7 +96,8 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     }()
 
     public private(set) var pose: Pose2D?
-    public private(set) var meshAnchors: [ARMeshAnchor] = []
+    public var meshAnchors: [ARMeshAnchor] { meshStore.anchors }
+    private var meshStore = MeshAnchorStore<ARMeshAnchor>()
     /// Nearest obstacle distance (m) in a forward cone from the latest depth frame.
     private(set) var latestDepthSafetySnapshot: DepthSafetySnapshot? {
         didSet {
@@ -339,7 +340,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         sessionGeneration = generation
         planningReadinessTracker.reset(sessionGeneration: generation)
         pose = nil
-        meshAnchors.removeAll()
+        meshStore.removeAll()
         latestDepthSafetySnapshot = nil
         trackingState = .notAvailable
         latestPixelBuffer = nil
@@ -678,14 +679,12 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     }
 
     public func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
-        let retired = Set(anchors.map(\.identifier))
-        let previousCount = meshAnchors.count
-        meshAnchors.removeAll { retired.contains($0.identifier) }
-        if meshAnchors.count != previousCount {
-            // Removal is valid even during tracking loss. It is not a new trusted
-            // geometry observation and must not satisfy a recovery refresh gate.
+        // Removal is valid even during tracking loss. It is not a new trusted
+        // geometry observation and must not satisfy a recovery refresh gate.
+        let removed = meshStore.remove(identifiers: Set(anchors.map(\.identifier)))
+        if removed > 0 {
             RuntimeFileLog.append("nav_mesh_removed", fields: [
-                "removed_count": String(previousCount - meshAnchors.count),
+                "removed_count": String(removed),
                 "remaining_count": String(meshAnchors.count),
                 "session_generation": String(sessionGeneration)
             ])
@@ -719,9 +718,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
             }
             return
         }
-        var map = Dictionary(meshAnchors.map { ($0.identifier, $0) }, uniquingKeysWith: { a, _ in a })
-        for m in mesh { map[m.identifier] = m }
-        meshAnchors = Array(map.values)
+        meshStore.upsert(mesh)
         planningReadinessTracker.recordTrustedMeshUpdate()
     }
 

@@ -50,6 +50,7 @@ struct FollowTurnResponseBracket {
     private(set) var unambiguous = true
     private(set) var ingressRejection: String?
     private var invalidCollection = false
+    private var lastCollectionUptime: Double
     let planningEvaluation: FollowTurnBurstPlanner.Sample
     private(set) var stoppedEvaluation: FollowTurnBurstPlanner.Sample?
     let generation: UInt64
@@ -59,6 +60,7 @@ struct FollowTurnResponseBracket {
         self.generation = generation
         let captured = Self.capture(start, at: uptime, generation: generation, healthy: true)
         planningEvaluation = captured
+        lastCollectionUptime = uptime
         invalidCollection = !captured.healthy
         if let boundary, Self.sameSource(boundary, captured), boundary.healthy {
             samples = [boundary] // Exact immutable boundary shared by adjacent bursts.
@@ -70,6 +72,10 @@ struct FollowTurnResponseBracket {
         let captured = Self.capture(source, at: uptime, generation: generation, healthy: healthy)
         if settled { stoppedEvaluation = captured }
         if !captured.healthy { invalidCollection = true }
+        if captured.collectedUptime < lastCollectionUptime {
+            invalidCollection = true // A regressing collection clock is not delivery reordering.
+        }
+        if captured.collectedUptime.isFinite { lastCollectionUptime = max(lastCollectionUptime, captured.collectedUptime) }
         if let previous = samples.last, Self.sameSource(previous, captured) {
             if !captured.healthy { unambiguous = false }
             // A strict stopped evaluation is a real collection, not a fabricated
@@ -80,7 +86,10 @@ struct FollowTurnResponseBracket {
         if let previous = samples.last {
             if captured.sequence == nil || captured.sequence! <= (previous.sequence ?? 0) ||
                 (captured.sourceTimestamp ?? -.infinity) <= (previous.sourceTimestamp ?? -.infinity) {
-                invalidCollection = true
+                // A synchronous stop snapshot can overtake an older queued
+                // source event. The control sequence alone is unlearnable; only
+                // a complete matching ingress archive may establish its order.
+                unambiguous = false
             }
             if previous.sequence == UInt64.max || captured.sequence != previous.sequence.map({ $0 + 1 }) {
                 unambiguous = false // Coalesced/dropped, reordered or replayed source.
@@ -90,8 +99,9 @@ struct FollowTurnResponseBracket {
         samples.append(captured)
     }
 
-    /// Replace only coalesced delivery evidence with complete ingress witnesses.
-    /// Both control boundaries must match exactly; missing/evicted ranges stay
+    /// Replace coalesced/reordered delivery with complete ingress witnesses.
+    /// Every control sample must match its immutable ingress witness, not just
+    /// the boundaries. Invalid health/clocks and missing/evicted ranges stay
     /// unlearnable. Control reads are separate facts, not ingress timestamps.
     func usingIngressEvidence(_ ingress: [FollowTurnBurstPlanner.Sample]?) -> Self {
         var result = self
@@ -112,6 +122,12 @@ struct FollowTurnResponseBracket {
                   sample.generation == generation && sample.sequence == firstSequence + UInt64(index)
               }) else {
             result.unambiguous = false; result.ingressRejection = "ingress_range_or_boundary_mismatch"; return result
+        }
+        guard samples.allSatisfy({ control in
+            guard let sequence = control.sequence, sequence >= firstSequence, sequence <= lastSequence else { return false }
+            return Self.sameSource(control, ingress[Int(sequence - firstSequence)])
+        }) else {
+            result.unambiguous = false; result.ingressRejection = "control_ingress_mismatch"; return result
         }
         result.samples = ingress
         result.unambiguous = true

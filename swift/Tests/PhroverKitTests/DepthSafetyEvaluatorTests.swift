@@ -5,6 +5,246 @@ import RoverNav
 @testable import PhroverKit
 
 final class DepthSafetyEvaluatorTests: XCTestCase {
+    func testEnteringSideInteriorIsCheckedEvenWhenItsCornerAlsoBelongsToFront() throws {
+        for mirrored in [false, true] {
+            let shape = RoverCollisionGeometry(length: 0.30, width: 0.25, minimumCollisionHeight: 0.04,
+                maximumCollisionHeight: 0.34, sections: [
+                    .init(name: "body", length: 0.30, width: 0.25, minimumHeight: 0.04, maximumHeight: 0.34)])
+            let snapshot = DepthSafetyEvaluator.ingest(
+                rawDepthMap: makeDepthBuffer(width: 80, height: 60, constantDepth: 3), intrinsics: ordinaryIntrinsics,
+                cameraTransform: cameraTransform(height: 0.30), timestamp: 10,
+                calibration: RoverConfig.cameraMountCalibration, geometry: shape)
+            let command = WheelCommand(left: mirrored ? 0.25 : 0.20, right: mirrored ? 0.20 : 0.25)
+            let observation = DepthSafetyEvaluator.evaluate(snapshot, command: command, now: 10.05)
+            let coverage = try XCTUnwrap(observation.coverage)
+            let side = mirrored ? "right_side" : "left_side"
+            let interior = try XCTUnwrap(coverage.points.first {
+                $0.boundary == side && $0.travel == 0 && abs($0.roverPosition.z - 0.075) < 1e-12
+            })
+            XCTAssertEqual(interior.support, .outsideView)
+            XCTAssertTrue(coverage.boundaries.contains { $0.boundary == side && $0.required > 0 })
+            XCTAssertEqual(observation.state, .unavailable(.blindSweptVolume))
+        }
+    }
+
+    func testTightMirroredArcsCheckEnteringRearSubsegment() throws {
+        let shape = RoverCollisionGeometry(length: 0.30, width: 0.25, minimumCollisionHeight: 0.04,
+            maximumCollisionHeight: 0.34, sections: [
+                .init(name: "body", length: 0.30, width: 0.25, minimumHeight: 0.04, maximumHeight: 0.34)])
+        let snapshot = DepthSafetyEvaluator.ingest(
+            rawDepthMap: makeDepthBuffer(width: 80, height: 60, constantDepth: 3), intrinsics: ordinaryIntrinsics,
+            cameraTransform: cameraTransform(height: 0.30), timestamp: 10,
+            calibration: RoverConfig.cameraMountCalibration, geometry: shape)
+        for mirrored in [false, true] {
+            let result = DepthSafetyEvaluator.evaluate(snapshot,
+                command: .init(left: mirrored ? 0.25 : 0, right: mirrored ? 0 : 0.25), now: 10.05)
+            let coverage = try XCTUnwrap(result.coverage)
+            // Instantaneous center is +/-6.5cm; the entering rear subsegment
+            // spans that point to the +/-20.5cm safety edge, midpoint +/-13.5cm.
+            XCTAssertTrue(coverage.points.contains {
+                $0.boundary == "rear" && $0.travel == 0 &&
+                    abs($0.roverPosition.x - (mirrored ? 0.135 : -0.135)) < 1e-12
+            })
+            XCTAssertEqual(result.state, .unavailable(.blindSweptVolume))
+        }
+    }
+
+    func testOffsetUpperSectionCannotAuthorizeArcWithUnseenEnteringSide() throws {
+        let intrinsics = simd_float3x3(columns: (SIMD3<Float>(25, 0, 0), SIMD3<Float>(0, 8, 0), SIMD3<Float>(40, 30, 1)))
+        let snapshot = DepthSafetyEvaluator.ingest(
+            rawDepthMap: makeDepthBuffer(width: 80, height: 60, constantDepth: 3), intrinsics: intrinsics,
+            cameraTransform: cameraTransform(height: 0.30), timestamp: 10,
+            calibration: RoverConfig.cameraMountCalibration, geometry: offsetSectionGeometry())
+        let observation = DepthSafetyEvaluator.evaluate(snapshot, command: .init(left: 0.20, right: 0.25), now: 10.05)
+        // Front-edge-only coverage was 100% chassis and 98.1% upper. Yet the
+        // upper rear-right boundary enters space outside the image during the arc.
+        XCTAssertEqual(observation.state, .unavailable(.blindSweptVolume))
+        let coverage = try XCTUnwrap(observation.coverage)
+        XCTAssertTrue(coverage.points.contains {
+            $0.section == "upper" && $0.boundary == "right_side" && $0.support == .outsideView
+        })
+    }
+
+    func testConfirmedRotationUsesHeightSectionEnvelopeAndVoxelMargin() {
+        func observation(height: Int) -> DepthSafetyObservation {
+            let cells = Set((0...2).map { DepthSafetyCell(lateralIndex: $0, heightIndex: height, forwardIndex: 13) })
+            return DepthSafetyEvaluator.evaluate(.init(timestamp: 10, cells: cells, cellResolution: 0.04,
+                validSampleRatio: 1, geometry: offsetSectionGeometry(), projection: nil, failureReason: nil),
+                command: .init(left: -0.25, right: 0.25), now: 10.05, operatorClearedRotation: true)
+        }
+        XCTAssertEqual(observation(height: 2).state, .stop)
+        XCTAssertEqual(observation(height: 5).state, .caution)
+        XCTAssertGreaterThan(observation(height: 5).clearance, 0.30)
+        XCTAssertEqual(observation(height: 5).coverageProvenance, "operator_confirmed_rotation")
+    }
+
+    func testMirroredCurvesReachInitiallySeparatedOffsetUpperObstacle() {
+        for mirrored in [false, true] {
+            let command = WheelCommand(left: mirrored ? 0.25 : 0.20, right: mirrored ? 0.20 : 0.25)
+            let shape = offsetSectionGeometry(lateralOffset: mirrored ? -0.03 : 0.03)
+            func observation(lateral: Int, forward: Int) -> DepthSafetyObservation {
+                let cells = Set((5...7).map { DepthSafetyCell(lateralIndex: lateral, heightIndex: $0, forwardIndex: forward) })
+                return DepthSafetyEvaluator.evaluate(.init(timestamp: 10, cells: cells, cellResolution: 0.04,
+                    validSampleRatio: 1, geometry: shape, projection: nil, failureReason: nil), command: command, now: 10.05)
+            }
+            let hit = observation(lateral: mirrored ? 3 : -4, forward: 5)
+            XCTAssertEqual(hit.state, .stop)
+            XCTAssertEqual(hit.supportCount, 3)
+            // Independently worked first contact: continuous travel .256813m;
+            // the 33-interval sweep first intersects at step14 (.275758m).
+            XCTAssertEqual(hit.clearance, 14 * 0.65 / 33, accuracy: 1e-10)
+            let miss = observation(lateral: mirrored ? 5 : -6, forward: 6)
+            XCTAssertEqual(miss.supportCount, 0)
+            XCTAssertEqual(miss.clearance, .infinity)
+        }
+    }
+
+    @MainActor
+    func testRealSenderLogsCoveragePointsWithoutSendingBlindMotion() async throws {
+        let snapshot = DepthSafetyEvaluator.ingest(
+            rawDepthMap: makeDepthBuffer(width: 80, height: 60, constantDepth: 3), intrinsics: ordinaryIntrinsics,
+            cameraTransform: cameraTransform(height: 0.30), timestamp: 10,
+            calibration: RoverConfig.cameraMountCalibration, geometry: geometry)
+        let sink = FollowDiagnosticRecordingSink()
+        var sends = 0
+        let pose = NavigationPoseSample(pose: .init(position: .zero, yaw: 0),
+            frameID: .init(generation: 1, sequence: 1), sourceTimestamp: 10, trackingQuality: .normal)
+        let controller = FollowNavigationController(currentPose: { pose.pose }, forwardClearance: { 2 },
+            depthSafetyObservation: { DepthSafetyEvaluator.evaluate(snapshot, command: $0, now: 10.05, boundedReadyMotion: true) },
+            plan: { _, goal in [goal] }, lastAckAt: { Date() }, sendCommand: { _ in sends += 1 }, stopRover: {}, sleep: { _ in },
+            diagnosticEmitter: .init(streamID: "coverage-projection", monotonic: { 10.05 }, utc: { Date() }, sink: sink.append),
+            poseSample: { pose }, sourceNow: { 10.05 }, sourceStopSnapshot: { pose })
+        _ = await controller.sendFollowTurnBurst(.init(left: 0.25, right: 0.25), requestedBudget: 0.02, purpose: .followReady)
+        XCTAssertEqual(sends, 0)
+        let payload = try XCTUnwrap(sink.records.first { $0.event == "follow_depth.candidate" }?.fields["payload"])
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any])
+        let points = try XCTUnwrap(json["depth_coverage_points"] as? [[String: Any]])
+        XCTAssertEqual(points.count, 81)
+        XCTAssertEqual(json["depth_coverage_points_truncated"] as? Bool, false)
+        XCTAssertEqual(json["depth_geometry_model"] as? String, "conservative_bounding_box")
+        XCTAssertEqual((json["depth_projection_camera_from_world_column_major"] as? [Double])?.count, 16)
+        XCTAssertTrue(points.contains { ($0["outside_edges"] as? [String])?.isEmpty == false })
+        let projection = try XCTUnwrap(json["depth_projection"] as? [String: Any])
+        XCTAssertEqual(projection["camera_forward_offset_m"] as? Double ?? 0, -0.085, accuracy: 1e-6)
+    }
+
+    func testUnseenThinComponentCannotBeAveragedAwayOrHiddenByDiagnosticCap() throws {
+        var sections: [RoverCollisionGeometry.Section] = []
+        for index in 0..<7 {
+            sections.append(.init(name: "lower_\(index)", length: 0.30, width: 0.25,
+                minimumHeight: index == 0 ? 0.04 : 0.04 + 0.44 * Double(index) / 7,
+                maximumHeight: index == 6 ? 0.48 : 0.04 + 0.44 * Double(index + 1) / 7))
+        }
+        sections.append(.init(name: "top", length: 0.30, width: 0.25, minimumHeight: 0.48, maximumHeight: 0.50))
+        let shape = RoverCollisionGeometry(length: 0.30, width: 0.25, minimumCollisionHeight: 0.04,
+            maximumCollisionHeight: 0.50, sections: sections)
+        XCTAssertEqual(shape.validation, .valid)
+        // Deliberately synthetic camera sees everything below its own height,
+        // but none of the thin top section. This is not an iPhone FOV claim.
+        let intrinsics = simd_float3x3(columns: (SIMD3<Float>(10, 0, 0), SIMD3<Float>(0, 100, 0), SIMD3<Float>(40, 0, 1)))
+        let snapshot = DepthSafetyEvaluator.ingest(
+            rawDepthMap: makeDepthBuffer(width: 80, height: 200, constantDepth: 3), intrinsics: intrinsics,
+            cameraTransform: cameraTransform(height: 0.48), timestamp: 10,
+            calibration: .init(cameraHeight: 0.48, forwardOffset: -0.085), geometry: shape)
+        let observation = DepthSafetyEvaluator.evaluate(snapshot, command: .init(left: 0.25, right: 0.25), now: 10.05, boundedReadyMotion: true)
+        let coverage = try XCTUnwrap(observation.coverage)
+        XCTAssertGreaterThan(coverage.fraction, 0.90)
+        XCTAssertEqual(coverage.limitingFraction, 0)
+        XCTAssertEqual(observation.state, .unavailable(.blindSweptVolume))
+        XCTAssertEqual(coverage.points.count, 256)
+        XCTAssertGreaterThan(coverage.requiredPoints, coverage.points.count)
+        XCTAssertEqual(coverage.components.last?.name, "top")
+        XCTAssertEqual(coverage.components.last?.covered, 0)
+        XCTAssertTrue(coverage.points.contains { $0.section == "top" && $0.support == .outsideView })
+        let fields = coverage.diagnosticFields(includePoints: true)
+        XCTAssertEqual(fields["depth_coverage_points_truncated"], .bool(true))
+        XCTAssertEqual(fields["depth_limiting_component_fraction"], .number(0))
+        XCTAssertNil(coverage.diagnosticFields(includePoints: false)["depth_coverage_points"])
+    }
+
+    func testHeightDependentFootprintsKeepChassisAndUpperAssemblyHazards() {
+        let shape = RoverCollisionGeometry(length: 0.30, width: 0.25, minimumCollisionHeight: 0.04,
+            maximumCollisionHeight: 0.34, sections: [
+                .init(name: "chassis", length: 0.30, width: 0.25, minimumHeight: 0.04, maximumHeight: 0.14),
+                .init(name: "upper", length: 0.08, width: 0.10, minimumHeight: 0.14, maximumHeight: 0.34, forwardOffset: -0.085)])
+        let projection = DepthSafetyEvaluator.ingest(
+            rawDepthMap: makeDepthBuffer(width: 80, height: 60, constantDepth: 3), intrinsics: wideIntrinsics,
+            cameraTransform: cameraTransform(height: 0.30), timestamp: 10,
+            calibration: RoverConfig.cameraMountCalibration, geometry: shape).projection
+        func observation(height: Int, lateral: Int, command: WheelCommand = .init(left: 0.25, right: 0.25)) -> DepthSafetyObservation {
+            let cells = Set((2...4).map { DepthSafetyCell(lateralIndex: lateral, heightIndex: height, forwardIndex: $0) })
+            let snapshot = DepthSafetySnapshot(timestamp: 10, cells: cells, cellResolution: 0.04,
+                validSampleRatio: 1, geometry: shape, projection: projection, failureReason: nil)
+            return DepthSafetyEvaluator.evaluate(snapshot, command: command, now: 10.05, boundedReadyMotion: true)
+        }
+        XCTAssertEqual(observation(height: 2, lateral: 4).state, .stop, "Wide chassis edge must still stop")
+        XCTAssertEqual(observation(height: 5, lateral: 0).state, .stop, "Narrow upper assembly still collides head-on")
+        XCTAssertEqual(observation(height: 3, lateral: 4).state, .stop, "Boundary voxel must check both sections")
+        XCTAssertNotEqual(observation(height: 5, lateral: 4).state, .stop, "Empty upper corner is not a chassis-height obstacle")
+        XCTAssertEqual(observation(height: 2, lateral: 4, command: .init(left: 0.20, right: 0.25)).state, .stop)
+        XCTAssertEqual(observation(height: 5, lateral: 0, command: .init(left: -0.25, right: 0.25)).state, .stop)
+    }
+
+    func testCoverageReportsExactSamplePositionsAndOutOfViewEdges() throws {
+        let snapshot = DepthSafetyEvaluator.ingest(
+            rawDepthMap: makeDepthBuffer(width: 80, height: 60, constantDepth: 3), intrinsics: ordinaryIntrinsics,
+            cameraTransform: cameraTransform(height: 0.30), timestamp: 10,
+            calibration: RoverConfig.cameraMountCalibration, geometry: geometry)
+        let result = DepthSafetyEvaluator.evaluate(snapshot, command: .init(left: 0.25, right: 0.25),
+            now: 10.05, boundedReadyMotion: true)
+        let coverage = try XCTUnwrap(result.coverage)
+        XCTAssertEqual(coverage.points.count, 81)
+        XCTAssertEqual(coverage.points.filter { $0.support == .covered }.count, coverage.coveredPoints)
+        XCTAssertEqual(coverage.points.filter { $0.support == .outsideView }.count, coverage.outsideViewPoints)
+        XCTAssertEqual(Set(coverage.points.map(\.boundary)), ["left", "center", "right"])
+        XCTAssertEqual(Set(coverage.points.map { $0.roverPosition.y }), [0.06, 0.27, 0.48])
+        XCTAssertEqual(coverage.points.first?.roverPosition.z, 0.15)
+        XCTAssertTrue(coverage.points.filter { $0.support == .outsideView }.allSatisfy { !$0.outsideEdges.isEmpty })
+        XCTAssertEqual(coverage.projectionSummary["image_width_px"], 80)
+        XCTAssertEqual(coverage.projectionSummary["camera_forward_offset_m"] ?? 0, -0.085, accuracy: 1e-6)
+        XCTAssertEqual(coverage.cameraFromWorldColumnMajor.count, 16)
+        XCTAssertEqual(coverage.components.first?.required, 81)
+    }
+
+    func testRearwardMeasuredMountProjectsChassisAheadOfCameraAndKeepsObstacleStop() throws {
+        let command = WheelCommand(left: 0.25, right: 0.25)
+        func snapshot(offset: Double, wallDepth: Float = 3) -> DepthSafetySnapshot {
+            DepthSafetyEvaluator.ingest(rawDepthMap: makeDepthBuffer(width: 80, height: 60, constantDepth: wallDepth),
+                intrinsics: ordinaryIntrinsics, cameraTransform: cameraTransform(height: 0.30), timestamp: 10,
+                calibration: CameraMountCalibration(cameraHeight: 0.30, forwardOffset: offset), geometry: geometry)
+        }
+        let centered = DepthSafetyEvaluator.evaluate(snapshot(offset: 0), command: command,
+            now: 10.05, boundedReadyMotion: true)
+        for offset in [-0.07, -0.085, -0.10] {
+            let captured = snapshot(offset: offset)
+            let projection = try XCTUnwrap(captured.projection)
+            // Identity camera looks toward world -Z. A camera behind the chassis
+            // puts the chassis origin and leading boundary farther down -Z.
+            XCTAssertEqual(projection.roverOrigin.z, offset, accuracy: 1e-9)
+            let front = projection.roverOrigin + projection.roverForward * 0.15
+            XCTAssertEqual(-front.z, 0.15 - offset, accuracy: 1e-9)
+            let measured = DepthSafetyEvaluator.evaluate(captured, command: command, now: 10.05, boundedReadyMotion: true)
+            XCTAssertGreaterThan(measured.coverage?.fraction ?? 0, centered.coverage?.fraction ?? 0)
+            XCTAssertEqual(measured.state, .unavailable(.blindSweptVolume),
+                "Synthetic ordinary-FOV visibility still cannot prove 90% coverage merely by correcting the mount")
+            let obstacle = DepthSafetyEvaluator.evaluate(snapshot(offset: offset, wallDepth: 0.35),
+                command: command, now: 10.05, boundedReadyMotion: true)
+            XCTAssertEqual(obstacle.state, .stop)
+            XCTAssertGreaterThanOrEqual(obstacle.supportCount, 3)
+            XCTAssertLessThanOrEqual(obstacle.clearance, 0.30)
+        }
+    }
+
+    func testProductionDepthProjectionUsesMeasuredRearwardLensPosition() throws {
+        let snapshot = DepthSafetyEvaluator.ingest(
+            rawDepthMap: makeDepthBuffer(width: 80, height: 60, constantDepth: 3), intrinsics: ordinaryIntrinsics,
+            cameraTransform: cameraTransform(height: 0.30), timestamp: 10,
+            calibration: RoverConfig.cameraMountCalibration, geometry: RoverConfig.collisionGeometry)
+        let projection = try XCTUnwrap(snapshot.projection)
+        XCTAssertEqual(projection.roverOrigin.z, -0.085, accuracy: 1e-9)
+        XCTAssertEqual(projection.roverOrigin.y, 0, accuracy: 1e-6)
+    }
+
     func testBoundedProbeUsesObservedStoppingCorridorWithoutCruiseLookahead() {
         // Real projection/evaluator, deliberately incomplete depth outside the
         // stopping corridor. This is a synthetic regression, not device imagery.
@@ -68,7 +308,7 @@ final class DepthSafetyEvaluatorTests: XCTestCase {
     private func stoppingCorridorDepth() -> CVPixelBuffer {
         let map = makeDepthBuffer(width: 80, height: 60, constantDepth: .nan)
         for index in 0...8 {
-            let z = 0.15 + 0.30 * Double(index) / 8
+            let z = 0.15 + 0.30 * Double(index) / 8 - RoverConfig.cameraMountCalibration.forwardOffset
             for x in [-0.205, 0, 0.205] {
                 for height in [0.06, 0.27, 0.48] {
                     let px = Int((40 + 20 * x / z).rounded())
@@ -461,6 +701,13 @@ final class DepthSafetyEvaluatorTests: XCTestCase {
             SIMD3<Float>(0, 40, 0),
             SIMD3<Float>(40, 30, 1)
         ))
+    }
+
+    private func offsetSectionGeometry(lateralOffset: Double = 0.03) -> RoverCollisionGeometry {
+        .init(length: 0.30, width: 0.25, minimumCollisionHeight: 0.04, maximumCollisionHeight: 0.34, sections: [
+            .init(name: "chassis", length: 0.30, width: 0.25, minimumHeight: 0.04, maximumHeight: 0.14),
+            .init(name: "upper", length: 0.08, width: 0.10, minimumHeight: 0.14, maximumHeight: 0.34,
+                forwardOffset: -0.05, lateralOffset: lateralOffset)])
     }
 
     private var wideIntrinsics: simd_float3x3 {

@@ -40,19 +40,23 @@ public final class ARFollowMePerceptionSource: FollowMePerception {
                 let started = ProcessInfo.processInfo.systemUptime
                 guard let receipt = await detector.evaluateForFollowAsync(snapshot), !Task.isCancelled else { continue }
                 guard ar.sessionGeneration == snapshot.id.generation else { continue }
-                let duration = ProcessInfo.processInfo.systemUptime - started
-                mailbox.publish(Self.batch(from: snapshot, detections: receipt.frame.detections,
+                let inferenceFinished = ProcessInfo.processInfo.systemUptime
+                let duration = inferenceFinished - started
+                var batch = Self.batch(from: snapshot, detections: receipt.frame.detections,
                     trackingReason: reason, inferenceDuration: duration,
                     inferenceStatus: receipt.status == .executed ? .executed : .failed,
                     inferenceFailureReason: receipt.failureReason,
-                    personVerification: receipt.personVerification ?? []))
+                    personVerification: receipt.personVerification ?? [])
                 let published = ProcessInfo.processInfo.systemUptime
+                batch.publishedUptime = published
+                mailbox.publish(batch)
                 if published - lastLatencySummary >= 1 {
                     lastLatencySummary = published
                     RuntimeFileLog.append("follow_perception_latency", fields: [
                         "frame_id": "\(snapshot.id.generation):\(snapshot.id.sequence)",
                         "capture_to_inference_start_s": String(started - snapshot.timestamp),
                         "inference_s": String(duration),
+                        "projection_and_publish_s": String(published - inferenceFinished),
                         "capture_to_publish_s": String(published - snapshot.timestamp),
                         "coalesced_completed_frames": String(mailbox.coalescedFrames)])
                 }

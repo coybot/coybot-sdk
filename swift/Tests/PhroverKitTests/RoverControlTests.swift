@@ -783,11 +783,12 @@ final class RoverControlTests: XCTestCase {
         if holdStop { StubURLProtocol.suspendRequestNumber = 2 }
         let request = FollowMotionRequestContext(sessionGeneration: 7, requestToken: 2,
             purpose: .followAlignment, phase: "aligning")
-        // This independently worked angle yields a 2.374ms provisional budget.
+        // With the five-degree window, this worked angle preserves the original
+        // 2.374ms provisional budget and still exercises transport admission.
         let completion = expectation(description: "Classified turn and confirmed safety stop completed")
         let task = Task {
             defer { completion.fulfill() }
-            let result = await motion.perform(.alignment(0.05497266452410665), context: request)
+            let result = await motion.perform(.alignment(0.09223912712382312), context: request)
             completed = true
             return result
         }

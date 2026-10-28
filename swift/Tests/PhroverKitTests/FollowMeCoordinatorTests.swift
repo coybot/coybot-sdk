@@ -140,6 +140,32 @@ final class FollowMeCoordinatorTests: XCTestCase {
         _ = await coordinator.stop(); motion.legacy.releaseRotation()
     }
 
+    func testStoppedReadyRefreshSurvivesRecordedFrameExpiryAndRevalidatesBeforeProbe() async {
+        let perception = FollowPerceptionFake()
+        let clock = ManualFollowClock()
+        let runtime = ReadyRecoveryRuntimeFake(clock: clock)
+        runtime.refreshBeforeProbe = true
+        runtime.completeReady = true
+        let coordinator = FollowMeCoordinator(perception: perception,
+            motion: NavigationFollowMeMotion(navigation: runtime), clock: clock, eventSink: { _, _ in })
+        _ = await coordinator.start(); await drain()
+        clock.advance(to: 5)
+        perception.send(frame(1, at: 5, people: [person(1, at: 5)])); await drain()
+        for sequence in UInt64(2)...8 where coordinator.state != .recoveringReadyPath {
+            await matchedBoundaryFrame(sequence, perception, clock)
+        }
+        XCTAssertEqual(coordinator.state, .recoveringReadyPath)
+        // The logged failure: a valid observation expires during a stopped
+        // depth wait, before any probe has been authorized at the sender.
+        clock.advance(to: clock.now + 0.559); await drain()
+        XCTAssertEqual(coordinator.state, .recoveringReadyPath)
+        await matchedBoundaryFrame(20, perception, clock, at: clock.now)
+        runtime.gate.release(); await drain()
+        XCTAssertTrue(runtime.signalAdmitted)
+        XCTAssertEqual(coordinator.state, .signalingReady)
+        _ = await coordinator.stop()
+    }
+
     func testReadyPathProbeDoesNotConsumeSignalAndClearResultContinuesReadiness() async {
         let perception = FollowPerceptionFake()
         let clock = ManualFollowClock()
@@ -165,6 +191,72 @@ final class FollowMeCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.state, .waitingForMovement)
         XCTAssertEqual(states.last?["ready_signal_succeeded"], "true")
         _ = await coordinator.stop()
+    }
+
+    func testStoppedReadyRefreshCannotHideHardFaultsDeadlineOrPostMotionOutage() async {
+        enum Fault: CaseIterable {
+            case tracking, pose, depth, future, nonfinite, deadline, stopped, postMotion, staleTrackingThenHealthy, staleDepthThenHealthy, admissionRace, admissionDeferral
+        }
+        for fault in Fault.allCases {
+            let perception = FollowPerceptionFake()
+            let clock = ManualFollowClock()
+            let runtime = ReadyRecoveryRuntimeFake(clock: clock)
+            runtime.refreshBeforeProbe = true
+            runtime.completeReady = true
+            let coordinator = FollowMeCoordinator(perception: perception,
+                motion: NavigationFollowMeMotion(navigation: runtime), clock: clock, eventSink: { _, _ in })
+            var admissionRejectedBeforeTermination = false
+            _ = await coordinator.start(); await drain()
+            clock.advance(to: 5)
+            perception.send(frame(1, at: 5, people: [person(1, at: 5)])); await drain()
+            for sequence in UInt64(2)...8 where coordinator.state != .recoveringReadyPath {
+                await matchedBoundaryFrame(sequence, perception, clock)
+            }
+            XCTAssertEqual(coordinator.state, .recoveringReadyPath)
+            switch fault {
+            case .tracking: perception.send(frame(20, at: clock.now, quality: .limited))
+            case .pose: perception.send(frame(20, at: clock.now, pose: nil))
+            case .depth: perception.send(frame(20, at: clock.now, depth: false))
+            case .future: perception.send(frame(20, at: clock.now + 1))
+            case .nonfinite: perception.send(frame(20, at: .nan))
+            case .deadline: clock.advance(to: clock.now + 0.601)
+            case .stopped: _ = await coordinator.stop()
+            case .postMotion:
+                runtime.admission?.endRecoveryRefresh()
+                clock.advance(to: clock.now + 0.559)
+            case .staleTrackingThenHealthy:
+                perception.send(frame(20, at: clock.now - 0.6, quality: .limited))
+                perception.send(frame(21, at: clock.now, people: [person(21, at: clock.now)]))
+            case .staleDepthThenHealthy:
+                perception.send(frame(20, at: clock.now - 0.6, depth: false))
+                perception.send(frame(21, at: clock.now, people: [person(21, at: clock.now)]))
+            case .admissionRace:
+                // Either the health processor or admission may win. Both must
+                // terminate, and a subsequent healthy frame must not revive it.
+                perception.send(frame(20, at: clock.now, depth: false))
+                clock.onNextRead = { runtime.gate.release() }
+            case .admissionDeferral:
+                // Deterministically exercise .notStarted(.observation) while
+                // recovery is active, without depending on task scheduling.
+                clock.advance(to: clock.now + 0.559)
+                await drain()
+                runtime.onProbeAdmission = {
+                    XCTAssertEqual(coordinator.state, .recoveringReadyPath)
+                    XCTAssertEqual(runtime.admission?.deferred, .observation)
+                    admissionRejectedBeforeTermination = true
+                }
+                runtime.gate.release()
+            }
+            await drain()
+            XCTAssertFalse(coordinator.isActive, "\(fault)")
+            runtime.gate.release(); await drain()
+            XCTAssertFalse(runtime.signalAdmitted, "\(fault)")
+            if fault == .admissionDeferral { XCTAssertTrue(admissionRejectedBeforeTermination) }
+            perception.send(frame(30, at: clock.now, people: [person(30, at: clock.now)]))
+            await drain()
+            XCTAssertFalse(coordinator.isActive, "A healthy frame cannot revive \(fault)")
+            _ = await coordinator.stop()
+        }
     }
 
     func testReadyPathPerceptionOutageCannotStrandRecoveryAfterHealthyFrameReturns() async {
@@ -1145,7 +1237,7 @@ final class FollowMeCoordinatorTests: XCTestCase {
         }
     }
 
-    func testRecoveryAlignmentInclusivePointZeroFiveGateNeedsNewFrameAndRejectsOutsideGate() async {
+    func testRecoveryAlignmentInclusiveFiveDegreeGateNeedsNewFrameAndRejectsOutsideGate() async {
         let perception = FollowPerceptionFake()
         let motion = AbsoluteRecoveryMotionFake()
         let clock = ManualFollowClock()
@@ -1162,10 +1254,10 @@ final class FollowMeCoordinatorTests: XCTestCase {
         await drain()
         XCTAssertEqual(coordinator.state, .aligning)
         await matchedBoundaryFrame(4, perception, clock, yaw: 0, x: 0.6, y: 0)
-        await matchedBoundaryFrame(5, perception, clock, yaw: -0.050001, x: 0.6, y: 0)
+        await matchedBoundaryFrame(5, perception, clock, yaw: -5.1 * .pi / 180, x: 0.6, y: 0)
         XCTAssertEqual(coordinator.state, .aligning)
-        await matchedBoundaryFrame(6, perception, clock, yaw: -0.050001, x: 0.6, y: 0)
-        await matchedBoundaryFrame(7, perception, clock, yaw: -0.05, x: 0.6, y: 0)
+        await matchedBoundaryFrame(6, perception, clock, yaw: -5.1 * .pi / 180, x: 0.6, y: 0)
+        await matchedBoundaryFrame(7, perception, clock, yaw: -5 * .pi / 180, x: 0.6, y: 0)
         XCTAssertEqual(coordinator.state, .waitingForClearance)
         XCTAssertEqual(motion.legacy.readySignals, 0)
         _ = await coordinator.stop()
@@ -2137,10 +2229,10 @@ final class FollowMeCoordinatorTests: XCTestCase {
         await matchedBoundaryFrame(2, perception, clock, y: 1.3)
         XCTAssertEqual(coordinator.state, .waitingForClearance)
         motion.suspendAlignment = true
-        await matchedBoundaryFrame(3, perception, clock, yaw: .pi / 2 - 0.06, y: 1.4)
+        await matchedBoundaryFrame(3, perception, clock, yaw: .pi / 2 - 5.1 * .pi / 180, y: 1.4)
         XCTAssertEqual(coordinator.state, .aligning)
         XCTAssertEqual(motion.alignments.count, 1, "Drift detection must clear its new stop before turning")
-        await matchedBoundaryFrame(4, perception, clock, yaw: .pi / 2 - 0.06, y: 1.4)
+        await matchedBoundaryFrame(4, perception, clock, yaw: .pi / 2 - 5.1 * .pi / 180, y: 1.4)
         XCTAssertEqual(motion.alignments.count, 2)
         motion.releaseAlignment()
         await drain()
@@ -4038,16 +4130,31 @@ private final class ReadyRecoveryRuntimeFake: FollowNavigationRuntime {
     let clock: ManualFollowClock
     let gate = FollowDiagnosticSuspension()
     var probeAdmitted = false
+    var refreshBeforeProbe = false
     var completeReady = false
     var signalAdmitted = false
+    var admission: FollowReadyAdmission?
+    var onProbeAdmission: (() -> Void)?
     init(clock: ManualFollowClock) { self.clock = clock }
     var followSourceUptime: TimeInterval { clock.now }
     func performFollowMotion(_ request: FollowMotionRequest, context: FollowMotionRequestContext?) async -> FollowMotionResult {
         let operation = FollowMotionOperationContext(request: context, controllerOperationID: nil,
             purpose: request.purpose, profile: nil)
         if case .ready = request {
+            admission = FollowReadyAdmissionScope.current
             probeAdmitted = FollowReadyAdmissionScope.current?.admit(boundary: .recoveryProbe) == true
+            if refreshBeforeProbe { FollowReadyAdmissionScope.current?.beginRecoveryRefresh(at: clock.now) }
             await gate.suspend()
+            if refreshBeforeProbe {
+                let admission = FollowReadyAdmissionScope.current
+                probeAdmitted = admission?.admit(boundary: .recoveryProbeSend) == true
+                onProbeAdmission?()
+                admission?.endRecoveryRefresh()
+                if !probeAdmitted {
+                    return .init(result: .cancelled, context: operation, failure: nil,
+                        stopOutcome: .confirmed, deferred: admission?.deferred)
+                }
+            }
             if completeReady {
                 signalAdmitted = FollowReadyAdmissionScope.current?.admit(boundary: .controllerFirstSend) == true
                 return .init(result: signalAdmitted ? .arrived : .cancelled, context: operation,

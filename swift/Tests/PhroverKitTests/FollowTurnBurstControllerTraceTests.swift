@@ -4,6 +4,72 @@ import RoverNav
 
 @MainActor
 final class FollowTurnBurstControllerTraceTests: XCTestCase {
+    func testReorderedControlDeliveryRequiresExactCompleteIngressWitnesses() {
+        let start = sample(2, 10.2)
+        let delayed = sample(3, 10.24, yaw: 0.01)
+        let newer = sample(4, 10.39, yaw: 0.02)
+        let end = sample(5, 10.7, yaw: 0.03)
+        var archive = FollowTurnPoseEvidenceArchive()
+        archive.record(start, at: 10.205)
+        archive.record(delayed, at: 10.25)
+        archive.record(newer, at: 10.4)
+        archive.record(end, at: 10.8)
+        let ingress = archive.evidence(from: start.frameID!, through: end.frameID!)!
+        let calibration = FollowTurnBurstPlanner.Calibration(operationID: 1, generation: 4,
+            targetYaw: 0.5, clockDomain: "ar_system_uptime")
+        func response(_ bracket: FollowTurnResponseBracket) -> FollowTurnBurstPlanner.Response {
+            .init(operationID: 1, generation: 4, targetYaw: 0.5, clockDomain: "ar_system_uptime",
+                requestedBudget: 0.08, sendEntryUptime: 10.301, sendResponseUptime: 10.4,
+                stopObligationUptime: 10.381, stopAcknowledgementUptime: 10.4,
+                samples: bracket.samples, traversalUnambiguous: bracket.unambiguous,
+                planningEvaluation: bracket.planningEvaluation, stoppedEvaluation: bracket.stoppedEvaluation)
+        }
+        for fault in ["none", "conflicting_yaw", "unhealthy", "collection_clock_regression", "duplicate_then_clock_regression"] {
+            var bracket = FollowTurnResponseBracket(start: start, at: 10.301, generation: 4, boundary: nil)
+            bracket.collect(newer, at: 10.4, healthy: true)
+            if fault == "duplicate_then_clock_regression" { bracket.collect(newer, at: 10.42, healthy: true) }
+            bracket.collect(fault == "conflicting_yaw" ? sample(3, 10.24, yaw: 0.015) : delayed,
+                at: fault == "collection_clock_regression" ? 10.399 : 10.41, healthy: fault != "unhealthy")
+            bracket.collect(newer, at: 10.42, healthy: true)
+            bracket.collect(end, at: 10.801, healthy: true, settled: true)
+            XCTAssertFalse(bracket.unambiguous, "Unreconciled control order is never calibration authority")
+            XCTAssertNotNil(FollowTurnBurstPlanner.recording(response(bracket), in: calibration,
+                profile: .init(purpose: .alignment)).rejection)
+            XCTAssertFalse(bracket.usingIngressEvidence(nil).unambiguous)
+            XCTAssertFalse(bracket.usingIngressEvidence([ingress[0], ingress[2], ingress[3]]).unambiguous)
+            let reconciled = bracket.usingIngressEvidence(ingress)
+            if fault == "none" {
+                XCTAssertNil(reconciled.ingressRejection)
+                XCTAssertEqual(reconciled.samples.map(\.sequence), [2, 3, 4, 5])
+                XCTAssertEqual(reconciled.samples.map(\.collectedUptime), [10.205, 10.25, 10.4, 10.8])
+                let reduced = FollowTurnBurstPlanner.recording(response(reconciled), in: calibration,
+                    profile: .init(purpose: .alignment))
+                XCTAssertNil(reduced.rejection)
+                XCTAssertEqual(reduced.sampledAbsoluteTravel ?? -1, 0.03, accuracy: 1e-12,
+                    "A repeated queued frame must not invent extra travelled angle")
+            } else {
+                XCTAssertFalse(reconciled.unambiguous)
+                XCTAssertEqual(reconciled.ingressRejection, fault == "conflicting_yaw"
+                    ? "control_ingress_mismatch" : "control_collection_invalid")
+            }
+        }
+    }
+
+    func testSharedIngressBoundaryCannotHideRegressingControlCollectionClock() {
+        let start = sample(2, 10.2)
+        let middle = sample(3, 10.24, yaw: 0.01)
+        let end = sample(4, 10.72, yaw: 0.03)
+        var archive = FollowTurnPoseEvidenceArchive()
+        archive.record(start, at: 10.205)
+        archive.record(middle, at: 10.25)
+        archive.record(end, at: 10.725)
+        let ingress = archive.evidence(from: start.frameID!, through: end.frameID!)!
+        var bracket = FollowTurnResponseBracket(start: start, at: 10.301, generation: 4, boundary: ingress[0])
+        bracket.collect(middle, at: 10.29, healthy: true)
+        bracket.collect(end, at: 10.82, healthy: true, settled: true)
+        XCTAssertEqual(bracket.usingIngressEvidence(ingress).ingressRejection, "control_collection_invalid")
+    }
+
     func testSeparateReadTimesRejectInvalidEvaluationAndPreserveAdjacentIngressBoundary() throws {
         func point(_ sequence: UInt64, _ sourceTime: Double, _ collected: Double, _ yaw: Double) -> FollowTurnBurstPlanner.Sample {
             .init(yaw: yaw, sequence: sequence, generation: 4, sourceTimestamp: sourceTime,
@@ -138,11 +204,18 @@ final class FollowTurnBurstControllerTraceTests: XCTestCase {
         try await exerciseIngressEvidence(available: true, coalescedControl: true)
     }
 
+    func testStopSnapshotAheadOfQueuedPoseDoesNotPoisonCompleteIngressEvidence() async throws {
+        // Device trace: stop-boundary read 2508 overtook queued 2507, then
+        // 2508 arrived again. All were healthy; the ingress archive was ordered.
+        try await exerciseIngressEvidence(available: true, coalescedControl: false, delayedOlderAfterStop: true)
+    }
+
     func testMissingIngressArchiveCannotFallBackToOtherwiseCompleteControlEvidence() async throws {
         try await exerciseIngressEvidence(available: false, coalescedControl: false)
     }
 
-    private func exerciseIngressEvidence(available: Bool, coalescedControl: Bool) async throws {
+    private func exerciseIngressEvidence(available: Bool, coalescedControl: Bool,
+                                         delayedOlderAfterStop: Bool = false) async throws {
         var uptime = 10.0
         var snapshot = sample(1, 9.99)
         var archive = FollowTurnPoseEvidenceArchive()
@@ -151,9 +224,11 @@ final class FollowTurnBurstControllerTraceTests: XCTestCase {
         var stops = 0
         var sends = 0
         var learned = false
+        var enteredPostStopWait = false
         let holder = PreparationState(snapshot: snapshot)
         let emitter = FollowDiagnosticEmitter(streamID: "ingress-evidence", monotonic: { uptime }, utc: { Date() }) { event, fields in
             sink.append(event, fields: fields)
+            if event == "follow_scan.settle_begin", sends == 1 { enteredPostStopWait = true }
             if event == "follow_scan.burst_plan", let text = fields["payload"],
                let json = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
                json["completed_responses"] as? Int == 1 {
@@ -168,13 +243,13 @@ final class FollowTurnBurstControllerTraceTests: XCTestCase {
                 // to the newest-only control consumer.
                 let intermediate = self.sample(3, 10.24, yaw: 0.01)
                 archive.record(intermediate, at: 10.25)
-                if !coalescedControl {
+                if !coalescedControl && !delayedOlderAfterStop {
                     uptime = 10.33
                     holder.controller.ingestFollowTurnSource(intermediate)
                 }
                 uptime = 10.4; snapshot = self.sample(4, 10.39, yaw: 0.02)
                 archive.record(snapshot, at: uptime)
-                holder.controller.ingestFollowTurnSource(snapshot)
+                if !delayedOlderAfterStop { holder.controller.ingestFollowTurnSource(snapshot) }
             }, stopRover: { stops += 1 }, sleep: { try? await Task.sleep(for: $0) },
             diagnosticEmitter: emitter, poseSample: { snapshot }, sourceNow: { uptime },
             sourceStopSnapshot: { snapshot }, turnPoseEvidence: { available ? archive.evidence(from: $0, through: $1) : nil })
@@ -186,6 +261,16 @@ final class FollowTurnBurstControllerTraceTests: XCTestCase {
         archive.record(snapshot, at: 10.205); controller.ingestFollowTurnSource(snapshot)
         for _ in 0..<2000 where stops < 2 { await Task.yield() }
         XCTAssertEqual(stops, 2)
+        if delayedOlderAfterStop {
+            // Let the return-time snapshot read run before delivering its older
+            // queued predecessor, without modifying either capture's identity.
+            for _ in 0..<2000 where !enteredPostStopWait { await Task.yield() }
+            XCTAssertTrue(enteredPostStopWait, "Stop-return snapshot must be collected before queued predecessor delivery")
+            uptime = 10.41
+            controller.ingestFollowTurnSource(sample(3, 10.24, yaw: 0.01))
+            uptime = 10.42
+            controller.ingestFollowTurnSource(snapshot)
+        }
         uptime = 10.701; snapshot = sample(5, 10.70, yaw: 0.025)
         archive.record(snapshot, at: uptime); controller.ingestFollowTurnSource(snapshot)
         let result = await task.value

@@ -1103,9 +1103,13 @@ public final class SilentSearchCoordinator {
         guard safetyListenerTask == nil else { return }
         let events = dependencies.safety.events()
         safetyListenerTask = Task { [weak self] in
+            var lastLoggedEvent: SilentSearchSafetyEvent?
             for await event in events {
                 guard !Task.isCancelled, let self else { return }
-                self.record("silent_search_safety", fields: ["reason": Self.safetyName(event)])
+                if event != lastLoggedEvent {
+                    self.record("silent_search_safety", fields: ["reason": Self.safetyName(event)])
+                    lastLoggedEvent = event
+                }
                 switch event {
                 case .operatorStop:
                     await self.finish(with: .operatorStopped)

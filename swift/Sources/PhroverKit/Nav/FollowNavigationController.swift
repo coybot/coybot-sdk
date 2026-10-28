@@ -534,6 +534,8 @@ final class FollowNavigationController {
                     guard admission.admit(boundary: .recoveryProbe, sample: startSample, readUptime: sourceNow()) else {
                         return .cancelled
                     }
+                    admission.beginRecoveryRefresh(at: sourceNow())
+                    defer { admission.endRecoveryRefresh() }
                     let recovered = await recoverReadyPath(start: startSample, ownedGeneration: reservation)
                     guard operationGeneration == reservation, !Task.isCancelled, recoveryAuthorized else { return .cancelled }
                     switch recovered {
@@ -757,9 +759,11 @@ final class FollowNavigationController {
 
     private func recoverReadyPath(start: NavigationPoseSample, ownedGeneration: UInt) async -> ReadyPathRecovery.Outcome {
         let evidence = FollowMotionTaskScope.evidence
+        let admission = FollowReadyAdmissionScope.current
+        var firstPulse = true
         func owned() -> Bool {
             !Task.isCancelled && operationGeneration == ownedGeneration && activeFollowEvidence === evidence &&
-                evidence?.fenced != true && !stopUnconfirmed && recoveryAuthorized
+                evidence?.fenced != true && !stopUnconfirmed && recoveryAuthorized && admission?.deferred == nil
         }
         let outcome = await ReadyPathRecovery.run(start: start, environment: .init(
             uptime: sourceNow, pose: readFollowPose, depth: { command in
@@ -776,11 +780,21 @@ final class FollowNavigationController {
                 guard authority.permits(authority.command, sample: self.readFollowPose(), now: self.sourceNow()) else {
                     return .failed(.trackingLost)
                 }
+                var observationDeadline = Double.infinity
+                if firstPulse, let admission {
+                    guard admission.isRefreshingRecovery(at: self.sourceNow()) else { return .cancelled }
+                    guard admission.admit(boundary: .recoveryProbeSend, sample: self.readFollowPose(),
+                        readUptime: self.sourceNow()) else { return .cancelled }
+                    observationDeadline = min(admission.observationValidUntil ?? .infinity,
+                        admission.recoveryRefreshDeadline ?? .infinity)
+                    admission.endRecoveryRefresh()
+                }
+                firstPulse = false
                 self.readyRecoveryPulse = authority
                 defer { if self.readyRecoveryPulse?.id == authority.id { self.readyRecoveryPulse = nil } }
                 do {
                     let result = try await self.executeFollowTurnBurst(authority.command, requestedBudget: authority.budget,
-                        purpose: .followReady, sendValidUntil: min(authority.expiresAt,
+                        purpose: .followReady, sendValidUntil: min(authority.expiresAt, observationDeadline,
                             self.sourceNow() + RoverConfig.commsWatchdogTimeout - date.timeIntervalSince(ack)))
                     guard owned() else { return .cancelled }
                     guard result.confirmedStopFence != nil else { return .failed(.commandFailed) }
@@ -795,6 +809,10 @@ final class FollowNavigationController {
                     sessionGeneration: evidence?.context.request?.sessionGeneration,
                     operationID: evidence?.context.controllerOperationID, purpose: "followReady",
                     phase: "recoveringReadyPath", reason: stage), payload: fields))
+            }, prepareProbe: { sample in
+                guard let admission else { return true }
+                return admission.admit(boundary: .recoveryProbeSend, sample: sample,
+                    readUptime: self.sourceNow(), retryStaleObservation: true)
             }))
         if operationGeneration == ownedGeneration, activeFollowEvidence === evidence, stopUnconfirmed {
             return .failed(.commandFailed)
@@ -3044,6 +3062,9 @@ final class FollowNavigationController {
             "depth_projection_available": coverage.map { .bool($0.projectionAvailable) } ?? .null
         ]
         fields.merge(coverageFields) { _, new in new }
+        if let coverage {
+            fields.merge(coverage.diagnosticFields(includePoints: observation.state == .unavailable(.blindSweptVolume))) { _, new in new }
+        }
         let evidence = FollowMotionTaskScope.evidence
         evidence?.depthDiagnosticFields = fields
         diagnosticEmitter?.emit(.init(event: "follow_depth.candidate", context: .init(

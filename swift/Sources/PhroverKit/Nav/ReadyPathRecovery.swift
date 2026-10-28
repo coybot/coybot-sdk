@@ -18,6 +18,7 @@ enum ReadyPathRecovery {
         var pulse: (PulseAuthority) async -> NavigationResult
         var wait: (Duration) async -> Void
         var emit: (String, [String: FollowDiagnosticValue]) -> Void
+        var prepareProbe: (NavigationPoseSample) -> Bool = { _ in true }
     }
 
     /// Controller-owned, per-pulse permission. Reverse is confined to the fresh
@@ -89,11 +90,11 @@ enum ReadyPathRecovery {
             let value = environment.depth(forward)
             try active()
             guard !value.clearance.isNaN else { throw Abort.failed(.depthUnavailable(.malformedDepth)) }
+            if case .unavailable(let reason) = value.state { throw Abort.failed(.depthUnavailable(reason)) }
             guard value.sampleAge.isFinite, value.sampleAge >= 0,
                   value.sampleAge <= DepthSafetyEvaluator.maximumRawDepthAge else {
                 throw Abort.failed(.depthUnavailable(.staleRawDepth))
             }
-            if case .unavailable(let reason) = value.state { throw Abort.failed(.depthUnavailable(reason)) }
             return value
         }
         func geometry(_ pose: Pose2D) throws -> Double {
@@ -106,6 +107,76 @@ enum ReadyPathRecovery {
                 throw Abort.failed(.stalled)
             }
             return along
+        }
+        /// Entry is confirmed stopped. Transient startup depth/perception age
+        /// shares one fixed refresh window before any pulse. Original motion
+        /// and recovery deadlines are retained.
+        func awaitInitialProbeReadiness() async throws -> DepthSafetyObservation {
+            var waitStarted: Double?
+            let refreshDeadline = min(deadline, began + 3, began + FollowReadyAdmission.recoveryRefreshLimit)
+            var polls = 0
+            var lastReason = DepthSafetyUnavailableReason.staleRawDepth
+            var waitingForPerception = false
+            func emitWait(_ stage: String) {
+                environment.emit(stage, [
+                    "depth_wait_elapsed_s": .number(waitStarted.map { environment.uptime() - $0 } ?? 0),
+                    "depth_wait_deadline_s": .number(refreshDeadline),
+                    "depth_wait_limit_s": .number(FollowReadyAdmission.recoveryRefreshLimit), "depth_wait_poll_count": .number(Double(polls)),
+                    "waiting_for_perception": .bool(waitingForPerception),
+                    "depth_wait_reason": .string(lastReason.rawValue),
+                    "ready_probe_deadline_s": .number(min(deadline, began + 3)),
+                    "ready_recovery_deadline_s": .number(deadline)])
+            }
+            func checkDeadline() throws {
+                if environment.uptime() >= refreshDeadline {
+                    emitWait(waitingForPerception ? "perception_wait_expired" : "depth_wait_expired")
+                    if waitingForPerception { throw Abort.cancelled }
+                    throw Abort.failed(.depthUnavailable(lastReason))
+                }
+            }
+            while true {
+                try active()
+                try checkDeadline()
+                _ = try geometry(try await fresh().pose!)
+                try checkDeadline()
+                let observation: DepthSafetyObservation
+                do { observation = try depth() }
+                catch Abort.failed(.depthUnavailable(let reason)) where reason == .staleRawDepth || reason == .missingRawDepth {
+                    lastReason = reason
+                    if waitStarted == nil {
+                        let time = environment.uptime()
+                        waitStarted = time
+                        emitWait("depth_wait_started")
+                    }
+                    try active()
+                    try checkDeadline()
+                    guard polls < 12 else {
+                        emitWait("depth_wait_expired")
+                        throw Abort.failed(.depthUnavailable(reason))
+                    }
+                    polls += 1
+                    await environment.wait(.seconds(min(0.05, max(0, refreshDeadline - environment.uptime()))))
+                    continue
+                }
+                try active()
+                try checkDeadline()
+                waitingForPerception = !environment.prepareProbe(try await fresh())
+                try active()
+                if waitingForPerception {
+                    if waitStarted == nil {
+                        waitStarted = environment.uptime()
+                        emitWait("perception_wait_started")
+                    }
+                    try checkDeadline()
+                    guard polls < 12 else { throw Abort.cancelled }
+                    polls += 1
+                    await environment.wait(.seconds(min(0.05, max(0, refreshDeadline - environment.uptime()))))
+                    continue
+                }
+                try checkDeadline()
+                if waitStarted != nil { emitWait("depth_wait_recovered") }
+                return observation
+            }
         }
         func pulse(_ authority: PulseAuthority) async throws -> Bool {
             try active()
@@ -133,7 +204,13 @@ enum ReadyPathRecovery {
             while true {
                 let sample = try await fresh()
                 travelled = try geometry(sample.pose!)
-                let observation = try depth()
+                let observation: DepthSafetyObservation
+                if pulses == 0 {
+                    observation = try await awaitInitialProbeReadiness()
+                    // Waiting may span several captures. Validate the new pose,
+                    // never use the pre-wait geometry as movement authority.
+                    travelled = try geometry(try await fresh().pose!)
+                } else { observation = try depth() }
                 if observation.state != .clear { break }
                 if travelled >= 0.03 {
                     guard forwardPulses > 0 else { throw Abort.failed(.stalled) }

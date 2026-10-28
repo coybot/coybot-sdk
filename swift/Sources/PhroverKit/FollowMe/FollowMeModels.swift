@@ -96,8 +96,8 @@ public struct FollowMeConfiguration {
     /// next raw person fails verification. Never permits motion on stale evidence.
     public var acquisitionVerificationGraceSeconds: TimeInterval = 0.5
     public var departureRangeIncrease: Double = 0.30
-    /// Matches NavigationController's continuous rotation tolerance (radians).
-    public var alignmentAngularTolerance: Double = 0.05
+    /// Share the follow turn profile's stopped-alignment and ready-admission window (radians).
+    public var alignmentAngularTolerance: Double = FollowTurnBurstPlanner.Profile(purpose: .alignment).tolerance
     public var reacquisitionSeconds: TimeInterval = 10
 
     // MARK: Continuous following (all off by default; `.continuous` turns them on)

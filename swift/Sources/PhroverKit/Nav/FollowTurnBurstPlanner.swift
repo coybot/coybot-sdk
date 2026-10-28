@@ -15,7 +15,8 @@ public enum FollowTurnBurstPlanner {
         public init(purpose: Purpose) { self.init(purpose: purpose, fastSearch: false) }
         init(purpose: Purpose, fastSearch: Bool) {
             self.purpose = purpose
-            tolerance = purpose == .alignment ? 0.05 : 7 * .pi / 180
+            // Share Astral's practical stopped-alignment acceptance corridor.
+            tolerance = (purpose == .alignment ? 5 : 7) * .pi / 180
             settleWait = fastSearch ? 0.100 : 0.300
         }
     }

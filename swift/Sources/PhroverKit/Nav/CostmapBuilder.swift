@@ -31,7 +31,9 @@ public enum CostmapBuilder {
     @MainActor
     static func buildAsync(from meshAnchors: [ARMeshAnchor], center: Vec2,
                            params: Params = Params()) async -> Costmap? {
+        let captureStarted = ProcessInfo.processInfo.systemUptime
         let snapshot = captureMesh(from: meshAnchors)
+        let captureFinished = ProcessInfo.processInfo.systemUptime
         guard !snapshot.worldVertices.isEmpty else {
             RuntimeFileLog.append("nav_ready_map_snapshot", fields: ["availability": "no_mesh"])
             return nil
@@ -39,7 +41,10 @@ public enum CostmapBuilder {
         let result = await Task.detached(priority: .userInitiated) {
             buildWithObserved(from: snapshot, center: center, params: params)
         }.value
-        RuntimeFileLog.append("nav_ready_map_snapshot", fields: result.diagnostics)
+        var diagnostics = result.diagnostics
+        diagnostics["mesh_capture_s"] = String(captureFinished - captureStarted)
+        diagnostics["map_worker_and_delivery_s"] = String(ProcessInfo.processInfo.systemUptime - captureFinished)
+        RuntimeFileLog.append("nav_ready_map_snapshot", fields: diagnostics)
         return result.map
     }
 

@@ -2,6 +2,19 @@ import XCTest
 @testable import PhroverKit
 
 final class FollowMotionFailureResolutionTests: XCTestCase {
+    func testReadyCoverageMessageIdentifiesHiddenComponentDespiteHighAggregateCoverage() {
+        let request = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 1, purpose: .followReady, phase: "aligning")
+        let context = FollowMotionOperationContext(request: request, controllerOperationID: 1, purpose: .followReady, profile: nil)
+        let resolution = FollowMotionFailureResolution(.init(context: context,
+            reason: .depthUnavailable(.blindSweptVolume), stopOutcome: .confirmed, source: .result,
+            turnDiagnosticFields: ["depth_coverage_fraction": .number(0.95), "depth_limiting_component_fraction": .number(0),
+                "depth_limiting_component": .string("phone"), "depth_geometry_model": .string("height_sections"),
+                "depth_required_coverage_fraction": .number(0.9), "depth_outside_view_points": .number(27)]))
+        XCTAssertTrue(resolution.message.contains("0% of the phone motion space"))
+        XCTAssertTrue(resolution.message.contains("90% required"))
+        XCTAssertFalse(resolution.message.contains("95%"))
+    }
+
     func testReadyOutsideViewFailureReportsMeasuredCoverageAndPreservesFailedStopPriority() {
         let request = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 13, purpose: .followReady, phase: "aligning")
         let context = FollowMotionOperationContext(request: request, controllerOperationID: 12, purpose: .followReady, profile: nil)

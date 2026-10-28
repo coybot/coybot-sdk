@@ -4,6 +4,145 @@ import RoverNav
 
 @MainActor
 final class ReadyPathRecoveryTests: XCTestCase {
+    func testRecordedStaleStartupDepthWaitsStoppedForFreshCaptureBeforeProbing() async {
+        let fixture = ProbeFixture()
+        // Device recovery failed at 271.521 ms against the unchanged 250 ms limit.
+        fixture.rawDepthTimestamp = 10 - 0.27152120834216475
+        fixture.freshDepthAt = 10.1
+        fixture.onWait = {
+            if fixture.time < 10.1 { XCTAssertTrue(fixture.commands.isEmpty) }
+        }
+        let result = await fixture.run()
+        XCTAssertEqual(result, .clear)
+        XCTAssertGreaterThanOrEqual(fixture.firstPulseTime ?? 0, 10.1)
+        XCTAssertGreaterThan(fixture.depthReads, fixture.commands.count)
+        XCTAssertEqual(fixture.stages.filter { $0 == "depth_wait_started" }.count, 1)
+        XCTAssertEqual(fixture.stages.filter { $0 == "depth_wait_recovered" }.count, 1)
+    }
+
+    func testPersistentOrRepeatedStaleCapturesCannotRenewStartupWait() async {
+        for replaceCapture in [false, true] {
+            let fixture = ProbeFixture()
+            fixture.rawDepthTimestamp = 10 - 0.27152120834216475
+            fixture.onWait = {
+                XCTAssertTrue(fixture.commands.isEmpty)
+                if replaceCapture { fixture.rawDepthTimestamp = fixture.time - 0.27152120834216475 }
+            }
+            let result = await fixture.run()
+            XCTAssertEqual(result, .failed(.depthUnavailable(.staleRawDepth)))
+            XCTAssertTrue(fixture.commands.isEmpty)
+            XCTAssertGreaterThan(fixture.depthReads, 1)
+            XCTAssertLessThanOrEqual(fixture.depthReads, 13)
+            XCTAssertEqual(fixture.time, 10.6, accuracy: 1e-9)
+            XCTAssertEqual(fixture.stages.filter { $0 == "depth_wait_started" }.count, 1)
+            XCTAssertEqual(fixture.stages.filter { $0 == "depth_wait_expired" }.count, 1)
+        }
+    }
+
+    func testFreshDepthAtOrAfterWaitDeadlineCannotAuthorizeProbe() async {
+        for delayProvider in [false, true] {
+            let fixture = ProbeFixture()
+            fixture.rawDepthTimestamp = 9.7
+            fixture.freshDepthAt = delayProvider ? 10.05 : 10.6
+            fixture.onDepth = {
+                if delayProvider, fixture.depthReads == 2 { fixture.time = 10.61 }
+            }
+            let result = await fixture.run()
+            XCTAssertEqual(result, .failed(.depthUnavailable(.staleRawDepth)))
+            XCTAssertTrue(fixture.commands.isEmpty)
+            XCTAssertFalse(fixture.stages.contains("depth_wait_recovered"))
+        }
+    }
+
+    func testCancellationAndSourceResetDuringStartupWaitCannotMove() async {
+        for reset in [false, true] {
+            let fixture = ProbeFixture()
+            fixture.rawDepthTimestamp = 9.7
+            fixture.freshDepthAt = 10.05
+            fixture.onWait = {
+                if reset { fixture.generation = 2 } else { fixture.allowed = false }
+            }
+            let result = await fixture.run()
+            XCTAssertEqual(result, reset ? .failed(.trackingLost) : .cancelled)
+            XCTAssertTrue(fixture.commands.isEmpty)
+        }
+    }
+
+    func testTaskCancellationDuringSuspendedDepthWaitCannotUseLateFreshCapture() async {
+        let fixture = ProbeFixture()
+        fixture.rawDepthTimestamp = 9.7
+        fixture.freshDepthAt = 10.05
+        let entered = expectation(description: "stopped depth refresh")
+        let gate = FollowDiagnosticSuspension()
+        fixture.waitGate = gate
+        fixture.onWait = { entered.fulfill() }
+        let task = Task { await fixture.run() }
+        await fulfillment(of: [entered], timeout: 1)
+        task.cancel()
+        gate.release()
+        let result = await task.value
+        XCTAssertEqual(result, .cancelled)
+        XCTAssertTrue(fixture.commands.isEmpty)
+    }
+
+    func testStartupWaitDoesNotExtendOriginalProbeDeadline() async {
+        let fixture = ProbeFixture()
+        fixture.rawDepthTimestamp = 9.7
+        fixture.freshDepthAt = 10.1
+        fixture.onWait = {
+            if fixture.commands.count == 1 { fixture.time = 13.01 }
+        }
+        let result = await fixture.run()
+        XCTAssertEqual(result, .failed(.stalled))
+        XCTAssertEqual(fixture.commands.count, 1)
+    }
+
+    func testStartupWaitDoesNotExtendOverallRecoveryDeadline() async {
+        let fixture = ProbeFixture()
+        fixture.rawDepthTimestamp = 9.7
+        fixture.freshDepthAt = 10.1
+        fixture.obstacleAfter = 0.02
+        fixture.clearAfterTurn = false
+        fixture.onWait = {
+            if fixture.commands.count == 5 { fixture.time = 22.01 }
+        }
+        let result = await fixture.run()
+        XCTAssertEqual(result, .failed(.noPath))
+        XCTAssertEqual(fixture.commands.count, 5)
+    }
+
+    func testStaleDepthAfterFirstPulseDoesNotGetAnotherStartupWait() async {
+        let fixture = ProbeFixture()
+        fixture.onWait = {
+            if !fixture.commands.isEmpty { fixture.rawDepthTimestamp = fixture.time - 0.27 }
+        }
+        let result = await fixture.run()
+        XCTAssertEqual(result, .failed(.depthUnavailable(.staleRawDepth)))
+        XCTAssertEqual(fixture.commands.count, 1)
+        XCTAssertFalse(fixture.stages.contains("depth_wait_started"))
+    }
+
+    func testNonTransientDepthFailuresDoNotRetryOrLoseTheirCause() async {
+        for reason in [DepthSafetyUnavailableReason.blindSweptVolume, .invalidCalibration, .invalidCollisionGeometry, .malformedDepth] {
+            let fixture = ProbeFixture()
+            fixture.unavailableReason = reason
+            let result = await fixture.run()
+            XCTAssertEqual(result, .failed(.depthUnavailable(reason)))
+            XCTAssertTrue(fixture.commands.isEmpty)
+            XCTAssertEqual(fixture.depthReads, 1)
+            XCTAssertFalse(fixture.stages.contains("depth_wait_started"))
+        }
+    }
+
+    func testMissingDepthWithUnknownAgeWaitsBoundedlyAndKeepsMissingReason() async {
+        let fixture = ProbeFixture()
+        fixture.unavailableReason = .missingRawDepth
+        let result = await fixture.run()
+        XCTAssertEqual(result, .failed(.depthUnavailable(.missingRawDepth)))
+        XCTAssertTrue(fixture.commands.isEmpty)
+        XCTAssertEqual(fixture.time, 10.6, accuracy: 1e-9)
+    }
+
     func testClearLiveDepthProbesThenReturnsClearWithoutReverseOrTurn() async {
         let fixture = ProbeFixture()
         let result = await fixture.run()
@@ -101,6 +240,7 @@ final class ReadyPathRecoveryTests: XCTestCase {
 private final class ProbeFixture {
     var time = 10.0
     var sequence: UInt64 = 1
+    var generation: UInt64 = 1
     var position = Vec2.zero
     var yaw = 0.0
     var commands: [WheelCommand] = []
@@ -115,13 +255,31 @@ private final class ProbeFixture {
     var allowed = true
     var turnStep = 0.15
     var depthLossAfter = Int.max
+    var rawDepthTimestamp: Double?
+    var freshDepthAt: Double?
+    var depthReads = 0
+    var firstPulseTime: Double?
+    var onWait: (() -> Void)?
+    var stages: [String] = []
+    var onDepth: (() -> Void)?
+    var unavailableReason: DepthSafetyUnavailableReason?
+    var waitGate: FollowDiagnosticSuspension?
     var snapshot: NavigationPoseSample {
-        .init(pose: .init(position: position, yaw: yaw), frameID: .init(generation: 1, sequence: sequence),
+        .init(pose: .init(position: position, yaw: yaw), frameID: .init(generation: generation, sequence: sequence),
             sourceTimestamp: time - 0.001, trackingQuality: .normal)
     }
     func run() async -> ReadyPathRecovery.Outcome {
         await ReadyPathRecovery.run(start: snapshot, environment: .init(uptime: { self.time }, pose: { self.snapshot },
             depth: { command in
+                self.depthReads += 1
+                self.onDepth?()
+                if let reason = self.unavailableReason {
+                    return .unavailable(reason, sampleAge: .infinity, motionClass: .classify(command))
+                }
+                if let timestamp = self.rawDepthTimestamp,
+                   self.freshDepthAt.map({ self.time < $0 }) ?? true {
+                    return .unavailable(.staleRawDepth, sampleAge: self.time - timestamp, motionClass: .classify(command))
+                }
                 if self.unavailable || self.commands.count >= self.depthLossAfter {
                     return .unavailable(.missingRawDepth, sampleAge: 0, motionClass: .classify(command))
                 }
@@ -133,6 +291,7 @@ private final class ProbeFixture {
             }, authorized: { self.allowed }, pulse: { authority in
                 guard authority.permits(authority.command, sample: self.snapshot, now: self.time) else { return .cancelled }
                 self.commands.append(authority.command)
+                if self.firstPulseTime == nil { self.firstPulseTime = self.time }
                 if authority.command.left == authority.command.right {
                     self.position.x += authority.command.left > 0 ? self.step : -self.step
                 } else { self.yaw += self.turnStep }
@@ -145,6 +304,8 @@ private final class ProbeFixture {
             }, wait: { duration in
                 self.time += Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
                 self.sequence += 1
-            }, emit: { _, _ in }))
+                self.onWait?()
+                if let gate = self.waitGate { await gate.suspend() }
+            }, emit: { stage, _ in self.stages.append(stage) }))
     }
 }

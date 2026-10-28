@@ -20,11 +20,13 @@ enum FollowReadyDeferral: String, Sendable {
 enum FollowReadyAdmissionDecision {
     case accepted
     case deferred(FollowReadyDeferral)
+    case staleObservation
 }
 
 enum FollowReadyAdmissionBoundary: String {
     case legacyCall = "legacy_signal_call", controllerFirstSend = "controller_first_send"
     case recoveryProbe = "recovery_probe"
+    case recoveryProbeSend = "recovery_probe_send"
 }
 
 struct FollowReadyAdmissionToken: Equatable {
@@ -43,6 +45,23 @@ final class FollowReadyAdmission {
     private(set) var controllerReadUptime: Double?
     var observationSnapshot: FollowAdmissionSnapshot?
     var rejectionCondition: String?
+    var observationValidUntil: Double?
+    private var recoveryRefreshStarted: Double?
+    private var recoveryRefreshEnded = false
+    static let recoveryRefreshLimit = 0.6
+    var recoveryRefreshDeadline: Double? { recoveryRefreshStarted.map { $0 + Self.recoveryRefreshLimit } }
+
+    /// Called only by the controller after a confirmed stop, before any probe.
+    /// A single window belongs to this admission; it cannot be renewed.
+    func beginRecoveryRefresh(at uptime: Double) {
+        guard recoveryRefreshStarted == nil, !recoveryRefreshEnded, uptime.isFinite else { return }
+        recoveryRefreshStarted = uptime
+    }
+    func isRefreshingRecovery(at uptime: Double) -> Bool {
+        guard !recoveryRefreshEnded, let start = recoveryRefreshStarted else { return false }
+        return uptime.isFinite && uptime >= start && uptime < start + Self.recoveryRefreshLimit
+    }
+    func endRecoveryRefresh() { recoveryRefreshEnded = true }
     init(_ authorize: @escaping @MainActor () -> FollowReadyAdmissionDecision) {
         allowsPathRecovery = false
         self.authorize = { _, _ in authorize() }
@@ -53,12 +72,19 @@ final class FollowReadyAdmission {
         self.authorize = authorize
     }
     func admit(boundary: FollowReadyAdmissionBoundary = .legacyCall,
-               sample: NavigationPoseSample? = nil, readUptime: Double? = nil) -> Bool {
+               sample: NavigationPoseSample? = nil, readUptime: Double? = nil,
+               retryStaleObservation: Bool = false) -> Bool {
         self.boundary = boundary
         controllerSample = sample
         controllerReadUptime = readUptime
         switch authorize(sample, readUptime) {
         case .accepted: return true
+        case .staleObservation:
+            if retryStaleObservation, let readUptime, isRefreshingRecovery(at: readUptime) {
+                return false
+            }
+            deferred = .observation
+            return false
         case .deferred(let reason): deferred = reason; return false
         }
     }

@@ -32,7 +32,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(final["retained_response_rate_rad_s"] as? Double), 7.31707317073171, accuracy: 1e-12)
     }
 
-    func testThreeDegreeProbeTraceUsesReferenceOnlyAndSubMillisecondExcessWithoutInventedFloor() async throws {
+    func testFivePointOneDegreeProbeTraceUsesReferenceOnlyAndSubMillisecondExcessWithoutInventedFloor() async throws {
         let source = FollowRecoveryDiagnosticSourceFixture()
         let sink = FollowDiagnosticRecordingSink()
         var reads = 0
@@ -40,21 +40,21 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         let controller = FollowNavigationController(currentPose: { nil }, forwardClearance: { 2 }, plan: { _, _ in nil },
             lastAckAt: { Date() }, sendCommand: { _ in sends += 1; source.uptime += 0.100 }, stopRover: {},
             sleep: { duration in
-                if sends > 0 { source.pose = .init(position: .zero, yaw: .pi / 60) }
+                if sends > 0 { source.pose = .init(position: .zero, yaw: 5.1 * .pi / 180) }
                 await source.advance(duration)
             }, diagnosticEmitter: .init(streamID: "small-probe", monotonic: { 300 }, utc: { Date() }, sink: sink.append),
             poseSample: { reads += 1; return source.snapshot }, sourceNow: { source.uptime }, sourceEvents: { source.events.stream },
             sourceStopSnapshot: { source.snapshot })
         source.controller = controller
-        let result = await NavigationFollowMeMotion(navigation: controller).perform(.alignment(.pi / 60), context:
+        let result = await NavigationFollowMeMotion(navigation: controller).perform(.alignment(5.1 * .pi / 180), context:
             .init(sessionGeneration: 9, requestToken: 904, purpose: .followAlignment, phase: "aligning"))
         XCTAssertEqual(result.result, .arrived)
         XCTAssertEqual(sends, 1)
         XCTAssertEqual(reads, 1)
         let plan = try XCTUnwrap(try records(sink).first { $0["event"] as? String == "follow_scan.burst_plan" })
-        XCTAssertEqual(try XCTUnwrap(plan["selected_budget_s"] as? Double), 0.0011267585362157, accuracy: 1e-14)
-        XCTAssertEqual(try XCTUnwrap(plan["excess_rad"] as? Double), 0.00235987755982988, accuracy: 1e-14)
-        XCTAssertEqual(plan["tolerance_rad"] as? Double, 0.05)
+        XCTAssertEqual(try XCTUnwrap(plan["selected_budget_s"] as? Double), 0.0008333333333333334, accuracy: 1e-14)
+        XCTAssertEqual(try XCTUnwrap(plan["excess_rad"] as? Double), 0.0017453292519943296, accuracy: 1e-14)
+        XCTAssertEqual(try XCTUnwrap(plan["tolerance_rad"] as? Double), 5 * .pi / 180, accuracy: 1e-12)
         XCTAssertEqual(plan["response_rate_confidence"] as? String, "provisional_reference")
         XCTAssertTrue(plan["latency_allowance_s"] is NSNull)
         XCTAssertTrue(plan["minimum_host_budget_s"] is NSNull)
@@ -183,7 +183,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         })
         XCTAssertEqual(correction["stop_outcome"] as? String, "confirmed")
         XCTAssertEqual(correction["responses_after_overshoot"] as? Int, 0)
-        XCTAssertEqual(correction["tolerance_rad"] as? Double, 0.05)
+        XCTAssertEqual(try XCTUnwrap(correction["tolerance_rad"] as? Double), 5 * .pi / 180, accuracy: 1e-12)
         XCTAssertGreaterThan(try XCTUnwrap(correction["retained_response_overhead_s"] as? Double), 0.3)
     }
 
@@ -220,8 +220,8 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
             XCTAssertEqual(pulse["post_yaw_rad"] as? Double, 0.3)
             XCTAssertEqual(pulse["profile_pulse_wait_s"] as? Double, 0.080,
                 "Compatibility field describes the configured maximum, not a fixed motor wait")
-            XCTAssertEqual(pulse["profile_angular_tolerance_rad"] as? Double,
-                purpose == .followScan ? 7 * .pi / 180 : 0.05)
+            XCTAssertEqual(try XCTUnwrap(pulse["profile_angular_tolerance_rad"] as? Double),
+                (purpose == .followScan ? 7 : 5) * .pi / 180, accuracy: 1e-12)
             XCTAssertEqual(RoverConfig.followScanRotationProfile.pulseWait, 0.200,
                 "Historical configuration remains inactive metadata")
             let ack = try XCTUnwrap(events.first { $0["event"] as? String == "follow_scan.send_ack" })
@@ -1941,7 +1941,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         XCTAssertEqual(first.context.request, older)
         XCTAssertEqual(second.context.request, newer)
         XCTAssertEqual(first.context.profile?.pulseWait, 0.080)
-        XCTAssertEqual(second.context.profile?.angularTolerance, 0.05)
+        XCTAssertEqual(second.context.profile?.angularTolerance, 5 * .pi / 180)
         XCTAssertNil(first.context.targetYaw)
         XCTAssertNil(second.context.targetYaw)
         XCTAssertTrue(first.failure?.stale == true)
@@ -2038,7 +2038,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         XCTAssertEqual(second.result, .failed(.trackingLost))
         XCTAssertEqual(second.context.request, newer)
         XCTAssertEqual(second.context.purpose, .followAlignment)
-        XCTAssertEqual(second.context.profile?.angularTolerance, 0.05)
+        XCTAssertEqual(second.context.profile?.angularTolerance, 5 * .pi / 180)
         XCTAssertNotEqual(first.context.controllerOperationID, second.context.controllerOperationID)
     }
 

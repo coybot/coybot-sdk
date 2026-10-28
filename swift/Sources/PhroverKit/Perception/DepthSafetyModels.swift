@@ -37,22 +37,41 @@ struct CameraMountCalibration: Equatable, Sendable {
 }
 
 struct RoverCollisionGeometry: Equatable, Sendable {
+    /// Measured, vertically stacked parts of the assembly. Offsets are relative
+    /// to the chassis center, not the camera. Empty sections retain the box model.
+    struct Section: Equatable, Sendable {
+        let name: String
+        let length: Double
+        let width: Double
+        let minimumHeight: Double
+        let maximumHeight: Double
+        var forwardOffset: Double = 0
+        var lateralOffset: Double = 0
+    }
     let length: Double
     let width: Double
     let minimumCollisionHeight: Double
     let maximumCollisionHeight: Double
     let lateralSafetyMargin: Double
+    let sections: [Section]
 
     init(length: Double,
          width: Double,
          minimumCollisionHeight: Double,
          maximumCollisionHeight: Double,
-         lateralSafetyMargin: Double = 0.08) {
+          lateralSafetyMargin: Double = 0.08,
+          sections: [Section] = []) {
         self.length = length
         self.width = width
         self.minimumCollisionHeight = minimumCollisionHeight
         self.maximumCollisionHeight = maximumCollisionHeight
         self.lateralSafetyMargin = lateralSafetyMargin
+        self.sections = sections
+    }
+
+    var collisionSections: [Section] {
+        sections.isEmpty ? [.init(name: "bounding_box", length: length, width: width,
+            minimumHeight: minimumCollisionHeight, maximumHeight: maximumCollisionHeight)] : sections
     }
 
     var validation: DepthSafetyValidation {
@@ -64,6 +83,26 @@ struct RoverCollisionGeometry: Equatable, Sendable {
         guard minimumCollisionHeight >= 0,
               maximumCollisionHeight > minimumCollisionHeight else {
             return .invalid(.invalidCollisionHeightBand)
+        }
+        if !sections.isEmpty {
+            guard sections.count <= 8, Set(sections.map(\.name)).count == sections.count else {
+                return .invalid(.invalidCollisionSections)
+            }
+            var lower = minimumCollisionHeight
+            for section in sections {
+                let dimensions = [section.length, section.width, section.minimumHeight, section.maximumHeight,
+                                  section.forwardOffset, section.lateralOffset]
+                guard !section.name.isEmpty, section.name.count <= 64, dimensions.allSatisfy(\.isFinite),
+                      section.length > 0, section.width > 0,
+                      section.maximumHeight > section.minimumHeight,
+                      section.minimumHeight == lower,
+                      abs(section.forwardOffset) + section.length / 2 <= length / 2,
+                      abs(section.lateralOffset) + section.width / 2 <= width / 2 else {
+                    return .invalid(.invalidCollisionSections)
+                }
+                lower = section.maximumHeight
+            }
+            guard lower == maximumCollisionHeight else { return .invalid(.invalidCollisionSections) }
         }
         return .valid
     }
@@ -80,6 +119,7 @@ enum DepthSafetyInvalidReason: String, Equatable, Sendable {
     case mountOffsetOutOfRange = "mount_offset_out_of_range"
     case nonPositiveChassisDimension = "non_positive_chassis_dimension"
     case invalidCollisionHeightBand = "invalid_collision_height_band"
+    case invalidCollisionSections = "invalid_collision_sections"
 }
 
 public enum DepthSafetyUnavailableReason: String, Equatable, Sendable {
@@ -151,6 +191,26 @@ struct DepthSafetyObservation: Equatable, Sendable {
 }
 
 struct DepthSafetyCoverage: Equatable, Sendable {
+    struct Point: Equatable, Sendable {
+        enum Support: String, Sendable { case covered, outsideView = "outside_view", missingDepth = "missing_depth", occluded }
+        let section: String
+        let boundary: String
+        let travel: Double
+        let roverPosition: SIMD3<Double>
+        let support: Support
+        let outsideEdges: [String]
+        let pixelX: Double?
+        let pixelY: Double?
+        let cameraDepth: Double?
+        let measuredDepth: Double?
+    }
+    struct Component: Equatable, Sendable {
+        let name: String
+        let required: Int
+        let covered: Int
+        var boundary: String? = nil
+        var fraction: Double { required > 0 ? Double(covered) / Double(required) : 0 }
+    }
     let horizon: Double
     let requiredPoints: Int
     let coveredPoints: Int
@@ -158,7 +218,64 @@ struct DepthSafetyCoverage: Equatable, Sendable {
     let missingDepthPoints: Int
     let occludedPoints: Int
     let projectionAvailable: Bool
+    var points: [Point] = []
+    var components: [Component] = []
+    var boundaries: [Component] = []
+    var enforceBoundaryCoverage = false
+    var projectionSummary: [String: Double] = [:]
+    var cameraFromWorldColumnMajor: [Double] = []
+    var geometry: RoverCollisionGeometry?
     var fraction: Double { requiredPoints > 0 ? Double(coveredPoints) / Double(requiredPoints) : 0 }
+    var limitingComponent: Component? {
+        (components + (enforceBoundaryCoverage ? boundaries : [])).min { $0.fraction < $1.fraction }
+    }
+    var limitingFraction: Double { limitingComponent?.fraction ?? fraction }
+    func isSufficient(_ required: Double) -> Bool { fraction >= required && limitingFraction >= required }
+
+    /// Values are captured during evaluation; serialization never reads a newer
+    /// camera frame or substitutes display-preview coordinates for depth pixels.
+    func diagnosticFields(includePoints: Bool) -> [String: FollowDiagnosticValue] {
+        func number(_ value: Double?) -> FollowDiagnosticValue {
+            value.flatMap { $0.isFinite ? .number($0) : nil } ?? .null
+        }
+        let limiting = limitingComponent
+        func componentFields(_ component: Component) -> FollowDiagnosticValue {
+            .object(["name": .string(component.name), "boundary": component.boundary.map { .string($0) } ?? .null,
+                "required": .number(Double(component.required)), "covered": .number(Double(component.covered)),
+                "fraction": number(component.fraction)])
+        }
+        var fields: [String: FollowDiagnosticValue] = [
+            "depth_limiting_component": limiting.map { .string($0.name + ($0.boundary.map { ": " + $0 } ?? "")) } ?? .null,
+            "depth_limiting_component_fraction": number(limitingFraction),
+            "depth_boundary_coverage_enforced": .bool(enforceBoundaryCoverage),
+            "depth_coverage_components": .array(components.map(componentFields)),
+            "depth_coverage_boundaries": .array(boundaries.map(componentFields))]
+        guard includePoints else { return fields }
+        fields["depth_projection_coordinates"] = .string("raw_depth_pixels_x_right_y_down;rover_metres_x_right_y_up_z_forward")
+        fields["depth_projection"] = .object(projectionSummary.mapValues { number($0) })
+        fields["depth_projection_camera_from_world_column_major"] = .array(cameraFromWorldColumnMajor.map { number($0) })
+        fields["depth_coverage_points_truncated"] = .bool(points.count < requiredPoints)
+        fields["depth_coverage_points_limit"] = .number(256)
+        fields["depth_coverage_points_retention"] = .string("prefer_uncovered_when_truncated")
+        fields["depth_coverage_points"] = .array(points.map { point in
+            .object(["section": .string(point.section), "boundary": .string(point.boundary),
+                "travel_m": number(point.travel), "lateral_m": number(point.roverPosition.x),
+                "height_m": number(point.roverPosition.y), "forward_m": number(point.roverPosition.z),
+                "support": .string(point.support.rawValue), "outside_edges": .array(point.outsideEdges.map { .string($0) }),
+                "pixel_x": number(point.pixelX), "pixel_y": number(point.pixelY),
+                "camera_depth_m": number(point.cameraDepth), "measured_depth_m": number(point.measuredDepth)])
+        })
+        if let geometry {
+            fields["depth_geometry_model"] = .string(geometry.sections.isEmpty ? "conservative_bounding_box" : "height_sections")
+            fields["depth_geometry_lateral_margin_m"] = number(geometry.lateralSafetyMargin)
+            fields["depth_geometry_sections"] = .array(geometry.collisionSections.map { section in
+                .object(["name": .string(section.name), "length_m": number(section.length), "width_m": number(section.width),
+                    "minimum_height_m": number(section.minimumHeight), "maximum_height_m": number(section.maximumHeight),
+                    "forward_offset_m": number(section.forwardOffset), "lateral_offset_m": number(section.lateralOffset)])
+            })
+        }
+        return fields
+    }
 }
 
 /// Set only for controller-owned bounded readiness or its recovery probe.

@@ -45,6 +45,9 @@ public struct FollowFrameBatch: @unchecked Sendable {
     /// Detector wall-clock duration in seconds; nil means not measured.
     public let inferenceDuration: TimeInterval?
     public let perceptionDiagnostics: FollowPerceptionDiagnostics?
+    /// Delivery diagnostics only; capture timestamp remains the freshness authority.
+    var publishedUptime: TimeInterval?
+    var ingestedUptime: TimeInterval?
 
     public init(frameID: ARFrameID, timestamp: TimeInterval, pose: Pose2D?,
                 depthAvailable: Bool, people: [FollowPersonObservation],

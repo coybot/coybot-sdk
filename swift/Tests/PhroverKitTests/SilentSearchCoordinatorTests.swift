@@ -1047,6 +1047,21 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         XCTAssertNil(terminal.fields["image"])
     }
 
+    func testRepeatedTrackingHealthLogsOnlyTransitionsAndStillHandlesSafetyFailure() async throws {
+        let harness = SilentSearchTestHarness()
+        harness.readiness.snapshot = .ready(sessionGeneration: 7)
+        let coordinator = harness.coordinator()
+        coordinator.configure(try mission())
+        XCTAssertTrue(coordinator.startCalibration())
+        for _ in 0..<100 { harness.safety.send(.trackingNormal(generation: 7)) }
+        harness.safety.send(.trackingLimited(generation: 7))
+        harness.safety.send(.trackingNormal(generation: 7))
+        harness.safety.send(.reactiveSafetyFailed)
+        await eventually { coordinator.phase == .terminal(.safetyFailure(.reactiveSafety)) }
+        let reasons = harness.events.entries.filter { $0.event == "silent_search_safety" }.compactMap { $0.fields["reason"] }
+        XCTAssertEqual(reasons, ["tracking_normal", "tracking_limited", "tracking_normal", "reactive_safety_failed"])
+    }
+
     func testTransportFailureTerminatesWhileOpticalExchangeIsWaiting() async throws {
         let harness = SilentSearchTestHarness()
         harness.readiness.snapshot = .ready(sessionGeneration: 7)

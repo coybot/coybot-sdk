@@ -3,6 +3,42 @@ import RoverNav
 @testable import PhroverKit
 
 final class NavigationFollowTurnBurstTests: XCTestCase {
+    @MainActor
+    func testRecordedAlignmentResidualWaitsForPostStopPoseThenAcceptsWithoutPulse() async {
+        for residual in [0.052565507099431086, 0.08364032971500879] {
+            for sign in [-1.0, 1.0] {
+                var uptime = 10.0
+                var snapshot = sample(1, 9.99)
+                let events = AsyncStream<NavigationPoseSample>.makeStream()
+                var stops = 0
+                var sends = 0
+                var completed = false
+                let controller = NavigationController(currentPose: { snapshot.pose }, forwardClearance: { 2 },
+                    plan: { _, _ in nil }, lastAckAt: { Date() }, sendCommand: { _ in
+                        sends += 1
+                        throw CancellationError()
+                    }, stopRover: { stops += 1 }, sleep: { duration in try? await Task.sleep(for: duration) },
+                    poseSample: { snapshot }, sourceNow: { uptime }, sourceEvents: { events.stream },
+                    sourceStopSnapshot: { snapshot })
+                let task = Task {
+                    let result = await NavigationFollowMeMotion(navigation: controller).alignTowardPerson(by: sign * residual)
+                    completed = true
+                    return result
+                }
+                for _ in 0..<1000 where stops == 0 { await Task.yield() }
+                for _ in 0..<30 { await Task.yield() }
+                XCTAssertFalse(completed, "Near-aligned geometry cannot bypass the stop/source fence")
+                XCTAssertEqual(sends, 0)
+                uptime = 10.301
+                snapshot = sample(2, 10.3)
+                events.continuation.yield(snapshot)
+                let result = await task.value
+                XCTAssertEqual(result, .arrived)
+                XCTAssertEqual(sends, 0, "Accept the stopped residual instead of requesting another coarse pulse")
+                events.continuation.finish()
+            }
+        }
+    }
     func testEarlySettleWindowStartsAtActualPostStopCapture() {
         var gate = FollowTurnSourceGate()
         gate.ingest(sample(1, 9.99))
@@ -1109,7 +1145,7 @@ final class NavigationFollowTurnBurstTests: XCTestCase {
         XCTAssertEqual(budgets.count, 2, "A valid completed bracket must enable a corrective burst")
         XCTAssertEqual(budgets.first ?? -1, 0.080, accuracy: 1e-12)
         // .31 rad across a .09 s command/stop window, with .01 s overhead.
-        XCTAssertEqual(budgets.dropFirst().first ?? -1, 0.0306451612903226, accuracy: 1e-12)
+        XCTAssertEqual(budgets.dropFirst().first ?? -1, 0.019825865696857292, accuracy: 1e-12)
         XCTAssertEqual(targets, [0.5, 0.5], "Calibration must not rebase the frozen target")
         if budgets.count == 2 {
             for _ in 0..<1000 where stops < 3 { await Task.yield() }
@@ -1227,14 +1263,14 @@ final class NavigationFollowTurnBurstTests: XCTestCase {
         snapshot = sample(4, 10.6, yaw: angle + 0.1)
         events.continuation.yield(snapshot)
         let result = await task.value
-        XCTAssertEqual(result, .arrived, "0.1 rad is within scan's unchanged 7 degrees, not alignment's 0.05 rad")
+        XCTAssertEqual(result, .arrived, "0.1 rad is within scan's unchanged 7 degrees, not alignment's 5 degrees")
         XCTAssertEqual(wheels.count, 1)
         XCTAssertEqual(stops, 2)
         events.continuation.finish()
     }
     @MainActor
-    func testProductionAlignmentNearThreePointSevenDegreesUsesShortBurstAndFreshStoppedArrival() async {
-        let angle = 3.7 * Double.pi / 180
+    func testProductionAlignmentNearFivePointEightDegreesUsesShortBurstAndFreshStoppedArrival() async {
+        let angle = 5.8 * Double.pi / 180
         var uptime = 10.0
         var snapshot = sample(1, 9.99)
         let events = AsyncStream<NavigationPoseSample>.makeStream()
@@ -1270,8 +1306,8 @@ final class NavigationFollowTurnBurstTests: XCTestCase {
         XCTAssertEqual(wheels.count, 1)
         XCTAssertEqual(wheels.first?.left, -0.25)
         XCTAssertEqual(wheels.first?.right, 0.25)
-        XCTAssertEqual(budgets.first.flatMap { $0 } ?? -1, 0.00696009186955, accuracy: 1e-12,
-            "A real 3.7-degree follow alignment uses the provisional excess budget, without a 20ms floor")
+        XCTAssertEqual(budgets.first.flatMap { $0 } ?? -1, 0.006666666666666667, accuracy: 1e-12,
+            "A real 5.8-degree follow alignment uses the provisional excess budget, without a 20ms floor")
         uptime = 10.400
         snapshot = sample(3, 10.39, yaw: angle)
         events.continuation.yield(snapshot)

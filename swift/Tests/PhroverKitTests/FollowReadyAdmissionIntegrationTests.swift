@@ -6,6 +6,85 @@ import simd
 
 @MainActor
 final class FollowReadyAdmissionIntegrationTests: XCTestCase {
+    func testRealReacquisitionRefreshPreservesEpisodeDeadlineAndHardFaults() async {
+        enum Scenario: CaseIterable { case fresh, episodeDeadline, trackingFault }
+        for scenario in Scenario.allCases {
+            let fixture = Fixture()
+            fixture.mappedRecovery = true
+            var started: Double?
+            var observationExpiredWhileStopped = false
+            var injectedFault = false
+            var sequence: UInt64 = 100
+            fixture.recoveryDepth = { command in
+                if started == nil {
+                    started = fixture.clock.now
+                    // Reproduce the map/preparation delay while keeping the
+                    // same original detector observation and its capture time.
+                    fixture.clock.advance(to: fixture.clock.now + 0.334)
+                }
+                if fixture.clock.now - started! < 0.56 {
+                    return .unavailable(.staleRawDepth, sampleAge: 0.272, motionClass: .classify(command))
+                }
+                return .init(state: .clear, clearance: 2, supportCount: 0, sampleAge: 0.01,
+                    requiredStoppingDistance: 0.3, motionClass: .classify(command), speedLimit: nil)
+            }
+            fixture.readyTick = { duration in
+                let elapsed = max(0.001, Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18)
+                fixture.controllerTime = fixture.controllerTime.addingTimeInterval(elapsed)
+                fixture.clock.advance(to: fixture.clock.now + elapsed)
+                fixture.position = Vec2(Double(fixture.commands) * 0.01, 0)
+                fixture.sourceSequence += 1
+                fixture.ingestedControllerTimestamp = fixture.clock.now
+                fixture.storeControllerCapture()
+                guard let started else { await self.drain(); return }
+                if fixture.clock.now - started >= 0.5, !observationExpiredWhileStopped {
+                    observationExpiredWhileStopped = true
+                    await self.drain()
+                    XCTAssertEqual(fixture.commands, 0)
+                    XCTAssertEqual(fixture.coordinator.state, .recoveringReadyPath, "\(scenario)")
+                }
+                if observationExpiredWhileStopped, !injectedFault {
+                    injectedFault = true
+                    if scenario == .episodeDeadline { fixture.clock.advance(to: 100) }
+                    if scenario == .trackingFault {
+                        fixture.send(sequence, range: 1.7, tracking: .limited)
+                        sequence += 1
+                        fixture.send(sequence, range: 1.7)
+                        sequence += 1
+                    }
+                }
+                if fixture.clock.now - started >= 0.56 {
+                    fixture.send(sequence, range: 1.7)
+                    sequence += 1
+                }
+                await self.drain()
+            }
+            await fixture.acquire(aligned: false)
+            fixture.send(2, range: 1.6, peopleAvailable: false)
+            await drain()
+            fixture.send(3, range: 1.6); await drain()
+            await fixture.fresh(4, range: 1.6)
+            await fixture.fresh(5, range: 1.6)
+            await fixture.fresh(6, range: 1.7)
+            for _ in 0..<1000 where !fixture.feedback.entered && fixture.coordinator.isActive { await Task.yield() }
+            XCTAssertTrue(fixture.records.contains { $0["event"] as? String == "follow_recovery.started" })
+            XCTAssertTrue(observationExpiredWhileStopped, "\(scenario)")
+            if scenario == .fresh {
+                XCTAssertTrue(fixture.feedback.entered, "Fresh perception/depth must reach the real sender's ACK boundary")
+                fixture.feedback.release()
+                for _ in 0..<1000 where fixture.commands == 0 && fixture.coordinator.isActive { await Task.yield() }
+                XCTAssertGreaterThan(fixture.commands, 0)
+            } else {
+                XCTAssertFalse(fixture.coordinator.isActive, "\(scenario)")
+                XCTAssertEqual(fixture.commands, 0)
+                if scenario == .episodeDeadline { XCTAssertEqual(fixture.coordinator.state, .failed("Person lost.")) }
+            }
+            _ = await fixture.coordinator.stop()
+            fixture.feedback.release()
+            await drain()
+        }
+    }
+
     func testPendingUnknownTrackingReportsNewestFrameHealthAtActualReadyBoundary() async throws {
         let fixture = Fixture()
         await fixture.acquire()
@@ -489,24 +568,26 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
     }
 
     func testPendingFrameAndPostAckControllerPoseAtInclusiveAgeAndHeadingGatesAdmit() async throws {
-        let fixture = Fixture()
-        fixture.enriched = true
-        await fixture.acquire()
-        fixture.send(2, range: 1.6)
-        await fixture.feedback.waitUntilEntered()
-        let capturedAt = fixture.clock.now
-        fixture.clock.advance(to: capturedAt + 0.5, wakeSleepers: false)
-        fixture.controllerSourceTimestamp = capturedAt
-        fixture.yaw = 0.05
-        fixture.send(3, range: 1.6, timestamp: capturedAt)
-        fixture.feedback.release()
-        await drain()
-        XCTAssertEqual(fixture.commands, 1)
-        let authorized = try XCTUnwrap(fixture.records.first { $0["event"] as? String == "follow_ready.admission_authorized" })
-        XCTAssertEqual(authorized["frame_id"] as? String, "1:5")
-        XCTAssertEqual(authorized["controller_source_age_s"] as? Double, 0.5)
-        XCTAssertEqual(try XCTUnwrap(authorized["heading_rad"] as? Double), -0.05, accuracy: 0.000001)
-        _ = await fixture.coordinator.stop()
+        for sign in [-1.0, 1.0] {
+            let fixture = Fixture()
+            fixture.enriched = true
+            await fixture.acquire()
+            fixture.send(2, range: 1.6)
+            await fixture.feedback.waitUntilEntered()
+            let capturedAt = fixture.clock.now
+            fixture.clock.advance(to: capturedAt + 0.5, wakeSleepers: false)
+            fixture.controllerSourceTimestamp = capturedAt
+            fixture.yaw = sign * 5 * .pi / 180
+            fixture.send(3, range: 1.6, timestamp: capturedAt)
+            fixture.feedback.release()
+            await drain()
+            XCTAssertEqual(fixture.commands, 1)
+            let authorized = try XCTUnwrap(fixture.records.first { $0["event"] as? String == "follow_ready.admission_authorized" })
+            XCTAssertEqual(authorized["frame_id"] as? String, "1:5")
+            XCTAssertEqual(authorized["controller_source_age_s"] as? Double, 0.5)
+            XCTAssertEqual(try XCTUnwrap(authorized["heading_rad"] as? Double), -sign * 5 * .pi / 180, accuracy: 0.000001)
+            _ = await fixture.coordinator.stop()
+        }
     }
 
     func testStopWithHealthyPendingFrameFencesSuspendedFeedbackAndNewSession() async {
@@ -606,7 +687,7 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
         await fixture.acquire()
         fixture.send(2, range: 1.6)
         await fixture.feedback.waitUntilEntered()
-        fixture.yaw = 0.06
+        fixture.yaw = 5.1 * .pi / 180
         fixture.captureControllerFrame(sequence: 100, timestamp: fixture.clock.now)
         fixture.feedback.release()
         await drain()
@@ -615,7 +696,7 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
         // Alignment remains stop-bracketed and requires a new matched frame.
         let deferred = try XCTUnwrap(fixture.records.first { $0["event"] as? String == "follow_ready.admission_deferred" })
         XCTAssertEqual(deferred["reason"] as? String, "heading")
-        XCTAssertEqual(try XCTUnwrap(deferred["heading_rad"] as? Double), -0.06, accuracy: 0.000001)
+        XCTAssertEqual(try XCTUnwrap(deferred["heading_rad"] as? Double), -5.1 * .pi / 180, accuracy: 0.000001)
         XCTAssertEqual(deferred["ready_signal_attempted"] as? Bool, false)
         XCTAssertEqual(deferred["ready_admission_pending"] as? Bool, false)
         _ = await fixture.coordinator.stop()
@@ -983,7 +1064,7 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
         await fixture.acquire()
         fixture.send(2, range: 1.6)
         await fixture.feedback.waitUntilEntered()
-        fixture.yaw = 0.06
+        fixture.yaw = 5.1 * .pi / 180
         fixture.send(3, range: 1.6)
         await drain()
         fixture.feedback.release()
@@ -1221,8 +1302,19 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
         var ready = false
         var position = Vec2.zero
         var stationaryPauseSeconds = 0.0
+        var mappedRecovery = false
+        var recoveryDepth: ((WheelCommand) -> DepthSafetyObservation)?
+        var readyTick: ((Duration) async -> Void)?
         lazy var controller = NavigationController(currentPose: { [self] in Pose2D(position: position, yaw: yaw) },
-            forwardClearance: { [self] in clearance }, plan: { [self] _, goal in ready = true; plans += 1; return [goal] },
+            forwardClearance: { [self] in clearance }, depthSafetyObservation: recoveryDepth,
+            plan: { [self] _, goal in ready = true; plans += 1; return [goal] },
+            readySignalCostmap: mappedRecovery ? { @MainActor [self] _ in
+                ready = true; plans += 1
+                var map = Costmap(width: 120, height: 120, resolution: 0.1, origin: .init(-6, -6))
+                let cell = map.worldToCell(position)
+                map.setCost(cell.cx, cell.cy, 255)
+                return map
+            } : nil,
             lastAckAt: { [self] in await acknowledgement() }, sendCommand: { [self] command in try await sendCommand(command) },
             stopRover: { [self] in try await stopRover() },
             sleep: { [self] duration in await tick(duration) }, now: { [self] in controllerTime },
@@ -1372,6 +1464,10 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
             if failStop { throw URLError(.cannotConnectToHost) }
         }
         func tick(_ duration: Duration) async {
+            if let readyTick, FollowMotionTaskScope.evidence?.context.purpose == .followReady {
+                await readyTick(duration)
+                return
+            }
             if turning { yaw = 0 } else {
                 if FollowMotionTaskScope.evidence?.context.purpose == .followReady {
                     let elapsed = max(0.001, Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18)

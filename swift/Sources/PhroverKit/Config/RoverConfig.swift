@@ -25,13 +25,17 @@ public enum RoverConfig {
     // MARK: - Physical parameters (WAVE ROVER)
     public static let wheelBase = 0.13         // m, track width (left↔right)
     public static let maxWheelSpeed = 0.5      // m/s per Waveshare closed-loop range on encoder bases; base rover is open-loop
-    // Measured mount values must be confirmed before physical acceptance.
+    // User-reported mount: lens approximately 30 cm high and 7–10 cm
+    // behind the axle midpoint. Use the provisional midpoint of that range.
     static let cameraMountCalibration = CameraMountCalibration(
         cameraHeight: 0.30,
-        forwardOffset: 0,
+        forwardOffset: -0.085,
         lateralOffset: 0,
         headingAlignment: 0
     )
+    // Conservative box until chassis/holder dimensions are measured. Height
+    // sections can then model the narrow upper assembly without shrinking the
+    // chassis clearance or averaging away an unseen component.
     static let collisionGeometry = RoverCollisionGeometry(
         length: 0.30,
         width: 0.25,

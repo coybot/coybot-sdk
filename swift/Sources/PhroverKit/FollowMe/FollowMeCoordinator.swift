@@ -100,6 +100,8 @@ public final class FollowMeCoordinator {
     private var departureBaseline: Double?
     private var readySignalAttempted = false
     private var readyPathRecoveryAttempts = 0
+    private var activeReadyAdmission: FollowReadyAdmission?
+    private var lastFrameTimingUptime = -Double.infinity
     private var pendingAdmission: FollowReadyAdmissionToken?
     private var readySignalSucceeded = false
     private var readySignalConfirmedAfter: ARFrameID?
@@ -215,6 +217,7 @@ public final class FollowMeCoordinator {
         readySignalAttempted = false
         readyPathRecoveryAttempts = 0
         pendingAdmission = nil
+        activeReadyAdmission = nil
         readySignalSucceeded = false
         readySignalConfirmedAfter = nil
         readySignalCompletionTime = nil
@@ -334,6 +337,8 @@ public final class FollowMeCoordinator {
         pendingRecoveryTermination = recoveryTermination(reason: "lifecycle_inhibition", phase: .stopped)
         emitReadyCancellation(.stopped)
         pendingAdmission = nil
+        activeReadyAdmission?.endRecoveryRefresh()
+        activeReadyAdmission = nil
         generation &+= 1
         operation &+= 1
         state = .stopped
@@ -406,6 +411,8 @@ public final class FollowMeCoordinator {
         // A safety-stream failure can terminate before the movement result returns.
         // Revoke its unconsumed reservation before publishing terminal state.
         pendingAdmission = nil
+        activeReadyAdmission?.endRecoveryRefresh()
+        activeReadyAdmission = nil
         generation &+= 1 // Inhibit callbacks and new goals before the first suspension.
         operation &+= 1
         state = result
@@ -570,10 +577,11 @@ public final class FollowMeCoordinator {
         switch event {
         case .interrupted: _ = await finish(.failed("AR session interrupted."))
         case .failed(let message): _ = await finish(.failed(message))
-        case .frame(let batch):
+        case .frame(var batch):
             guard generation == token, isActive, !stopBlocked else { return }
             ingestedSource.include(.init(frameID: batch.frameID, sourceTimestamp: batch.timestamp))
             let receivedAt = clock.now
+            batch.ingestedUptime = receivedAt
             searchClearance?.validate(sample: .init(pose: batch.pose, frameID: batch.frameID,
                 sourceTimestamp: batch.timestamp, trackingQuality: batch.trackingQuality), session: token, now: receivedAt)
             if let expected = recoveryEpisode?.anchor?.frameID.generation, batch.frameID.generation != expected {
@@ -643,6 +651,15 @@ public final class FollowMeCoordinator {
         currentAssociation = nil
         latestBatch = batch
         let now = clock.now
+        if let published = batch.publishedUptime, let ingested = batch.ingestedUptime,
+           now - lastFrameTimingUptime >= 1 {
+            lastFrameTimingUptime = now
+            RuntimeFileLog.append("follow_perception_delivery", fields: [
+                "frame_id": "\(batch.frameID.generation):\(batch.frameID.sequence)",
+                "capture_to_receive_s": String(now - batch.timestamp),
+                "publish_to_ingest_s": String(ingested - published),
+                "ingest_to_process_s": String(now - ingested)])
+        }
         frameWatchdogTask?.cancel()
         let issue = frameIssue(batch, now: now)
         updatePerceptionIssue(issue)
@@ -1258,12 +1275,16 @@ public final class FollowMeCoordinator {
             // has already stopped/replaced this request. Facts never grant authority.
             let newestSnapshot = (self.pendingFrame ?? self.latestBatch).map { self.admissionSnapshot($0) }
             FollowReadyAdmissionScope.current?.observationSnapshot = newestSnapshot
-            @MainActor func reject(_ reason: FollowReadyDeferral, _ condition: String) -> FollowReadyAdmissionDecision {
+            FollowReadyAdmissionScope.current?.observationValidUntil = newestSnapshot.map {
+                $0.batch.timestamp + self.config.maximumObservationAge
+            }
+            @MainActor func reject(_ reason: FollowReadyDeferral, _ condition: String,
+                                   staleObservation: Bool = false) -> FollowReadyAdmissionDecision {
                 FollowReadyAdmissionScope.current?.rejectionCondition = condition
                 // Record the decision now, before asynchronous stop/result handling
                 // can replace the observation or fence this operation's delivery.
                 self.emitReadiness("follow_ready.admission_rejected", reason: reason.rawValue)
-                return .deferred(reason)
+                return staleObservation ? .staleObservation : .deferred(reason)
             }
             guard self.generation == token else { return reject(.ownership, "session_generation_changed") }
             guard self.operation == id else { return reject(.ownership, "operation_replaced") }
@@ -1277,11 +1298,17 @@ public final class FollowMeCoordinator {
             guard self.confirmationTask == nil else { return reject(.ownership, "stop_confirmation_pending") }
             guard self.perceptionReady else { return reject(.observation, "perception_not_ready") }
             guard self.poseDeadline == nil else { return reject(.observation, "outage_recovery_pending") }
-            guard self.perceptionIssue == nil else { return reject(.observation, "perception_" + self.perceptionIssue!.rawValue) }
+            if let issue = self.perceptionIssue {
+                return reject(.observation, "perception_" + issue.rawValue,
+                    staleObservation: issue == .staleFrame && self.isStoppedReadyRefresh)
+            }
             guard let snapshot = newestSnapshot else { return reject(.observation, "frame_missing") }
             let batch = snapshot.batch
             FollowReadyAdmissionScope.current?.rejectionCondition = snapshot.rejection
-            if let rejection = snapshot.rejection { return reject(.observation, rejection) }
+            if let rejection = snapshot.rejection {
+                return reject(.observation, rejection, staleObservation: self.isStoppedReadyRefresh &&
+                    FollowFrameHealth.issue(batch, now: self.clock.now, configuration: self.config) == .staleFrame)
+            }
             guard self.pendingHealthFrame == nil else { return reject(.observation, "pending_health_transition") }
             guard self.matchedFrameClearsNewestStop(batch) else { return reject(.observation, "post_stop_match_required") }
             guard let person = snapshot.person, let batchPose = batch.pose else { return reject(.observation, "matched_geometry_missing") }
@@ -1321,6 +1348,12 @@ public final class FollowMeCoordinator {
                 self.locked = person
                 self.adoptMemory(person, batch: batch, association: .acceptedPendingContinuity)
             }
+            if FollowReadyAdmissionScope.current?.boundary == .recoveryProbeSend {
+                // The stopped refresh has finished. This check neither consumes
+                // another recovery attempt nor starts the ready signal.
+                guard self.state == .recoveringReadyPath else { return reject(.ownership, "recovery_not_active") }
+                return .accepted
+            }
             if FollowReadyAdmissionScope.current?.boundary == .recoveryProbe {
                 guard self.readyPathRecoveryAttempts < 2 else { return reject(.ownership, "path_recovery_exhausted") }
                 self.readyPathRecoveryAttempts += 1
@@ -1336,10 +1369,12 @@ public final class FollowMeCoordinator {
             self.diagnosticStopState = "not_stopped"
             return .accepted
         })
+        activeReadyAdmission = admission
         movementTask = Task { [weak self, motion] in
             let contextualResult = await motion.performContextual(.ready, context: context, admission: admission,
                 recovery: self?.recoveryAuthorization(generation: token, operation: id))
             guard let self else { return }
+            if self.activeReadyAdmission === admission { self.activeReadyAdmission = nil }
             if self.pendingAdmission == admissionToken { self.pendingAdmission = nil }
             if await self.consumeResult(contextualResult) { return }
             if self.recoveryExpired { _ = await self.expireRecovery(generation: token); return }
@@ -1351,7 +1386,10 @@ public final class FollowMeCoordinator {
                 return
             }
             if contextualResult.result == .cancelled, self.state == .recoveringReadyPath,
-               admission.deferred == nil {
+               admission.deferred == nil || admission.deferred == .observation || admission.deferred == .ownership {
+                // Admission may observe a queued hard fault before its frame
+                // processor. Never turn that recovery cancellation into a
+                // normal pre-motion observation deferral that can resume later.
                 _ = await self.finish(.failed("Floor check interrupted. Wait for stable perception and restart following."))
                 return
             }
@@ -1819,10 +1857,10 @@ public final class FollowMeCoordinator {
         return .init(episodeID: episode.id, expectedGeneration: anchor.frameID.generation, deadline: episode.deadline,
             now: { [clock] in clock.now }, canContinue: { [weak self] in
                 guard let self, self.generation == token, self.operation == id,
-                      self.recoveryEpisode?.id == episode.id, self.canScan,
+                       self.recoveryEpisode?.id == episode.id, self.canScan || self.isStoppedReadyRefresh,
                       let batch = self.pendingFrame ?? self.latestBatch,
                       batch.frameID.generation == anchor.frameID.generation else { return false }
-                guard self.frameIssue(batch, now: self.clock.now) == nil else { return false }
+                guard self.frameIssue(batch, now: self.clock.now) == nil || self.isStoppedReadyRefresh else { return false }
                 if self.state == .reacquiring, self.recoveryStopBoundary == nil,
                    self.pendingFrame?.frameID == batch.frameID, let point = anchor.position {
                     let association = self.tracker.reacquireEvaluated(batch.people,
@@ -1959,10 +1997,28 @@ public final class FollowMeCoordinator {
         }
     }
 
+    /// Only the controller's confirmed-stopped pre-probe window can tolerate
+    /// capture age. Structural faults and stop/ownership transitions never do.
+    private var isStoppedReadyRefresh: Bool {
+        guard state == .recoveringReadyPath, poseDeadline == nil,
+              !stopBlocked, stopTask == nil, confirmationTask == nil, pendingHealthFrame == nil,
+              let latestBatch, FollowFrameHealth.safetyTransitionPriority(latestBatch) == 0,
+              clock.now >= latestBatch.timestamp else { return false }
+        let batch = pendingFrame ?? latestBatch
+        guard FollowFrameHealth.safetyTransitionPriority(batch) == 0,
+              clock.now.isFinite, clock.now >= batch.timestamp else { return false }
+        return activeReadyAdmission?.isRefreshingRecovery(at: clock.now) == true
+    }
+
     private func perceptionUnavailable(_ issue: FollowPerceptionIssue, generation token: UInt64) async {
         guard generation == token else { return }
         if state == .recoveringReadyPath {
             updatePerceptionIssue(issue)
+            if issue == .staleFrame, isStoppedReadyRefresh {
+                // No probe has started. The controller owns the fixed refresh
+                // deadline and must revalidate the newest target before sending.
+                return
+            }
             _ = await finish(.failed("Floor check stopped. " + issue.message))
             return
         }

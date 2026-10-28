@@ -2,6 +2,45 @@ import XCTest
 import PhroverKit
 
 final class FollowTurnBurstPlannerTests: XCTestCase {
+    func testAstralAndCoybotResidualsUseInclusiveFiveDegreeAlignmentAcceptance() {
+        for sign in [-1.0, 1.0] {
+            for residual in [0.052565507099431086, 0.08364032971500879, 5 * Double.pi / 180] {
+                XCTAssertEqual(plan(target: sign * residual), .arrived)
+            }
+            guard case .burst(let direction, _) = plan(target: sign * 5.1 * .pi / 180) else {
+                return XCTFail("Outside five degrees still requires correction")
+            }
+            XCTAssertEqual(direction, sign < 0 ? -1 : 1)
+        }
+        XCTAssertEqual(plan(target: 0.08364032971500879, authorized: false), .unavailable)
+        XCTAssertEqual(FollowMeConfiguration().alignmentAngularTolerance, 5 * .pi / 180)
+    }
+
+    func testRecordedCoybotUndershootAcceptsSettledResidualDespiteStopOverhead() {
+        // iPhone 15 Pro, 2026-10-28 03:35:22Z, alignment operation 14.
+        // Immutable bracket endpoints suffice here: the measured rate remains
+        // below the reference floor, preserving the exact logged inverse model.
+        let seed = initial(2.051134330124257)
+        let profile = Planner.Profile(purpose: .alignment)
+        let first = sample(1.8138976608582102, 3240, 127361.15422266599, collected: 127361.25510495834)
+        let last = sample(1.9642580417755016, 3279, 127361.804265333, collected: 127361.90646229168)
+        let measured = Planner.recording(.init(operationID: 1, generation: 7, targetYaw: seed.targetYaw,
+            clockDomain: "test_uptime", requestedBudget: 0.08,
+            sendEntryUptime: 127361.40614795835, sendResponseUptime: 127361.47170787501,
+            stopObligationUptime: 127361.55479579167, stopAcknowledgementUptime: 127361.67355866668,
+            samples: [first, last],
+            planningEvaluation: sample(first.yaw, 3240, first.sourceTimestamp, collected: 127361.40558191667),
+            stoppedEvaluation: sample(last.yaw, 3279, last.sourceTimestamp, collected: 127362.05452745834)),
+            in: seed, profile: profile)
+        XCTAssertNil(measured.rejection)
+        XCTAssertEqual(measured.calibration.responseOverhead, 0.18741070832940748, accuracy: 1e-10)
+        for actual in [last.yaw, 1.9674940004092483] {
+            XCTAssertEqual(Planner.plan(.init(actualYaw: actual, profile: profile,
+                calibration: measured.calibration, sendEntryUptime: 127362.14889920835,
+                provisionalProbeIssued: true)), .arrived)
+        }
+    }
+
     func testRecordedStopLatencySpikeAllowsOneShrunkenOppositeCorrection() throws {
         // iPhone 15 Pro Max, 2026-10-24 17:54:25–26Z, alignment 14,
         // pulse 6. Minimized to the immutable ingress endpoints plus their
@@ -23,7 +62,7 @@ final class FollowTurnBurstPlannerTests: XCTestCase {
         XCTAssertNil(measured.rejection)
         XCTAssertEqual(measured.calibration.responseOverhead, 0.3169927916768938, accuracy: 1e-9)
         let ceiling = try XCTUnwrap(measured.calibration.overshootCeiling)
-        XCTAssertEqual(ceiling, 0.007364870741655125, accuracy: 1e-9)
+        XCTAssertEqual(ceiling, 0.0016909030703662143, accuracy: 1e-9)
         let decision = Planner.plan(.init(actualYaw: 2.042520687077125, profile: profile,
             calibration: measured.calibration, sendEntryUptime: 1482628.42, provisionalProbeIssued: true))
         guard case .burst(let direction, let budget) = decision else {
@@ -177,11 +216,12 @@ final class FollowTurnBurstPlannerTests: XCTestCase {
     }
     private typealias Planner = FollowTurnBurstPlanner
     func testLearnedOverheadResolutionBoundaryDoesNotRoundUpOrHideUnrepresentableDeadline() {
-        let calibration = initial(0.3)
+        let target = 0.25 + 5 * Double.pi / 180
+        let calibration = initial(target)
         let profile = Planner.Profile(purpose: .alignment)
         // Exactly representable timing: .5 rad / .125 s = 4 rad/s,
         // overhead .125 - .0625 = .0625 s. Zero-budget travel is .25 rad.
-        let measured = Planner.recording(.init(operationID: 1, generation: 7, targetYaw: 0.3,
+        let measured = Planner.recording(.init(operationID: 1, generation: 7, targetYaw: target,
             clockDomain: "test_uptime", requestedBudget: 0.0625, sendEntryUptime: 100,
             sendResponseUptime: 100.01, stopObligationUptime: 100.0625, stopAcknowledgementUptime: 100.125,
             samples: [sample(-1), sample(-0.5, 2, 100.5)]), in: calibration, profile: profile)
@@ -226,11 +266,11 @@ final class FollowTurnBurstPlannerTests: XCTestCase {
             .resolutionFailure(.rotationResolutionInsufficient))
         let measured = Planner.recording(response(calibration, samples: [sample(0), sample(0.2, 2, 100.4)]),
             in: calibration, profile: .init(purpose: .scan))
-        XCTAssertEqual(Planner.plan(.init(actualYaw: 0.2, profile: .init(purpose: .scan),
+        XCTAssertEqual(Planner.plan(.init(actualYaw: 0.18, profile: .init(purpose: .scan),
             calibration: measured.calibration, sendEntryUptime: 101)), .arrived)
-        guard case .burst(_, let budget) = Planner.plan(.init(actualYaw: 0.2, profile: .init(purpose: .alignment),
+        guard case .burst(_, let budget) = Planner.plan(.init(actualYaw: 0.18, profile: .init(purpose: .alignment),
             calibration: measured.calibration, sendEntryUptime: 101)) else { return XCTFail("Alignment retains its tighter gate") }
-        XCTAssertEqual(budget, 0.0125, accuracy: 1e-10)
+        XCTAssertEqual(budget, 0.080, accuracy: 1e-10, "Observed pulse fits the remaining five-degree corridor")
         let laterMissing = Planner.recording(response(calibration, entry: 101),
             in: measured.calibration, profile: .init(purpose: .alignment))
         XCTAssertEqual(Planner.plan(.init(actualYaw: 0, profile: .init(purpose: .alignment),
@@ -244,26 +284,26 @@ final class FollowTurnBurstPlannerTests: XCTestCase {
             sendEntryUptime: entry, authorized: authorized))
     }
 
-    func testFirstThreeDegreeProbeUsesWorkedSubMillisecondExcessWithoutFloor() {
-        guard case let .burst(direction, budget) = plan(target: 0.05235987755982989) else {
+    func testFirstFivePointOneDegreeProbeUsesWorkedSubMillisecondExcessWithoutFloor() {
+        guard case let .burst(direction, budget) = plan(target: 5.1 * .pi / 180) else {
             return XCTFail("Unknown response must permit one provisional probe")
         }
         XCTAssertEqual(direction, 1)
-        XCTAssertEqual(budget, 0.0011267585362157, accuracy: 1e-14)
+        XCTAssertEqual(budget, 0.0008333333333333334, accuracy: 1e-14)
     }
 
     func testCircularErrorUsesInclusivePurposeToleranceAndExactPiNegativeDirection() {
-        XCTAssertEqual(plan(target: 0.05), .arrived)
-        XCTAssertEqual(plan(target: -0.05), .arrived)
+        XCTAssertEqual(plan(target: 5 * .pi / 180), .arrived)
+        XCTAssertEqual(plan(target: -5 * .pi / 180), .arrived)
         XCTAssertEqual(plan(target: 7 * .pi / 180, purpose: .scan), .arrived)
         XCTAssertEqual(plan(target: .pi), .burst(direction: -1, budget: 0.080))
         XCTAssertEqual(plan(target: -.pi), .burst(direction: -1, budget: 0.080))
         XCTAssertEqual(plan(target: 0.5235987755982988, purpose: .scan), .burst(direction: 1, budget: 0.080))
         XCTAssertEqual(plan(target: -0.5235987755982988, purpose: .scan), .burst(direction: -1, budget: 0.080))
-        for (target, actual, sign) in [(-3.10, 3.10, 1), (3.10, -3.10, -1)] {
+        for (target, actual, sign) in [(-3.09, 3.09, 1), (3.09, -3.09, -1)] {
             guard case let .burst(direction, budget) = plan(target: target, actual: actual) else { return XCTFail() }
             XCTAssertEqual(direction, sign)
-            XCTAssertEqual(budget, 0.015844817026962252, accuracy: 1e-14)
+            XCTAssertEqual(budget, 0.00760068840959383, accuracy: 1e-14)
         }
     }
 
@@ -278,7 +318,7 @@ final class FollowTurnBurstPlannerTests: XCTestCase {
         XCTAssertEqual(plan(target: 1, entry: -1), .unavailable)
     }
 
-    private func initial(_ target: Double = 0.05235987755982989) -> Planner.Calibration {
+    private func initial(_ target: Double = 0.1) -> Planner.Calibration {
         .init(operationID: 1, generation: 7, targetYaw: target, clockDomain: "test_uptime")
     }
     private func response(_ calibration: Planner.Calibration, budget: Double = 0.080,
@@ -410,14 +450,14 @@ final class FollowTurnBurstPlannerTests: XCTestCase {
             let reduced = Planner.recording(response(calibration, samples: [sample(0), sample(sign * 0.2, 2, 100.4)],
                 send: 0, stop: 0), in: calibration, profile: profile)
             XCTAssertNil(reduced.rejection)
-            XCTAssertEqual(reduced.calibration.overshootCeiling ?? -1, 0.020, accuracy: 1e-12)
+            XCTAssertEqual(reduced.calibration.overshootCeiling ?? -1, 0.005093414960113412, accuracy: 1e-12)
             guard case let .burst(direction, budget) = Planner.plan(.init(actualYaw: sign * 0.2, profile: profile,
                 calibration: reduced.calibration, sendEntryUptime: 101)) else { return XCTFail() }
             XCTAssertEqual(direction, sign > 0 ? -1 : 1)
-            XCTAssertEqual(budget, 0.020, accuracy: 1e-12)
+            XCTAssertEqual(budget, 0.005093414960113412, accuracy: 1e-12)
             guard case let .burst(_, largerBudget) = Planner.plan(.init(actualYaw: -sign, profile: profile,
                 calibration: reduced.calibration, sendEntryUptime: 101)) else { return XCTFail() }
-            XCTAssertEqual(largerBudget, 0.020, accuracy: 1e-12)
+            XCTAssertEqual(largerBudget, 0.005093414960113412, accuracy: 1e-12)
         }
         let seam = initial(-3.0)
         let notCrossed = Planner.recording(response(seam, samples: [sample(0), sample(0.2, 2, 100.4)],

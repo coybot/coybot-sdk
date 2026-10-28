@@ -261,7 +261,7 @@ enum DepthSafetyEvaluator {
         let visibilityHorizon = boundedForward ? stoppingDistance : cautionDistance
         func checkingCoverage(_ observation: DepthSafetyObservation, horizon: Double) -> DepthSafetyObservation {
             let coverage = sweptVolumeCoverage(snapshot: snapshot, command: command, motion: motion, horizon: horizon)
-            var result = coverage.fraction >= minimumSweptVolumeCoverage ? observation : DepthSafetyObservation(
+            var result = coverage.isSufficient(minimumSweptVolumeCoverage) ? observation : DepthSafetyObservation(
                 state: .unavailable(.blindSweptVolume), clearance: observation.clearance,
                 supportCount: observation.supportCount, sampleAge: age, requiredStoppingDistance: stoppingDistance,
                 motionClass: motion, speedLimit: nil)
@@ -270,21 +270,33 @@ enum DepthSafetyEvaluator {
             return result
         }
         var contactTravel: [DepthSafetyCell: Double] = [:]
+        let collisionSections = snapshot.geometry.collisionSections
         for occupiedCell in snapshot.cells {
             if confirmedRotation {
                 let lateral = (Double(occupiedCell.lateralIndex) + 0.5) * snapshot.cellResolution
                 let forward = (Double(occupiedCell.forwardIndex) + 0.5) * snapshot.cellResolution
-                let gap = max(0, hypot(lateral, forward) - FollowSearchClearancePolicy.sweptRadius(
-                    geometry: snapshot.geometry, cellResolution: snapshot.cellResolution))
+                let height = (Double(occupiedCell.heightIndex) + 0.5) * snapshot.cellResolution
+                let radii = collisionSections.filter {
+                    height + snapshot.cellResolution / 2 >= $0.minimumHeight &&
+                        height - snapshot.cellResolution / 2 <= $0.maximumHeight
+                }.map {
+                    hypot(abs($0.forwardOffset) + $0.length / 2,
+                          abs($0.lateralOffset) + $0.width / 2 + snapshot.geometry.lateralSafetyMargin)
+                        + snapshot.cellResolution / sqrt(2)
+                }
+                guard let radius = radii.max() else { continue }
+                let gap = max(0, hypot(lateral, forward) - radius)
                 if gap <= cautionDistance { contactTravel[occupiedCell] = gap }
                 continue
             }
             let point = center(of: occupiedCell)
             if let travel = firstContactTravel(
                 lateral: point.x,
+                height: point.y,
                 forward: point.z,
                 command: command,
                 geometry: snapshot.geometry,
+                sections: collisionSections,
                 horizon: cautionDistance
             ) {
                 contactTravel[occupiedCell] = travel
@@ -365,15 +377,24 @@ enum DepthSafetyEvaluator {
     }
 
     private static func firstContactTravel(lateral: Double,
+                                           height: Double,
                                            forward: Double,
                                            command: WheelCommand,
                                            geometry: RoverCollisionGeometry,
+                                           sections: [RoverCollisionGeometry.Section],
                                            horizon: Double) -> Double? {
-        let halfWidth = geometry.width / 2 + geometry.lateralSafetyMargin + cellResolution / 2
-        let halfLength = geometry.length / 2 + cellResolution / 2
+        // A voxel can straddle two height bands. Check the union, not merely
+        // the section containing its center, so a chassis-edge hazard survives.
+        let intersecting = sections.filter {
+            height + cellResolution / 2 >= $0.minimumHeight && height - cellResolution / 2 <= $0.maximumHeight
+        }
         let motion = DepthSafetyMotionClass.classify(command)
         if motion == .rotating {
-            return hypot(lateral, forward) <= hypot(halfLength, halfWidth) ? 0 : nil
+            return intersecting.contains {
+                let halfWidth = $0.width / 2 + geometry.lateralSafetyMargin + cellResolution / 2
+                let halfLength = $0.length / 2 + cellResolution / 2
+                return hypot(lateral, forward) <= hypot(abs($0.forwardOffset) + halfLength, abs($0.lateralOffset) + halfWidth)
+            } ? 0 : nil
         }
         let average = (command.left + command.right) / 2
         guard average > 0 else { return nil }
@@ -387,7 +408,10 @@ enum DepthSafetyEvaluator {
             let dz = forward - pose.z
             let localLateral = dx * cos(pose.heading) + dz * sin(pose.heading)
             let localForward = -dx * sin(pose.heading) + dz * cos(pose.heading)
-            if abs(localLateral) <= halfWidth, abs(localForward) <= halfLength {
+            if intersecting.contains(where: {
+                abs(localLateral - $0.lateralOffset) <= $0.width / 2 + geometry.lateralSafetyMargin + cellResolution / 2 &&
+                    abs(localForward - $0.forwardOffset) <= $0.length / 2 + cellResolution / 2
+            }) {
                 return travel
             }
         }
@@ -404,80 +428,169 @@ enum DepthSafetyEvaluator {
             geometry: snapshot.geometry,
             horizon: horizon
         )
-        guard let projection = snapshot.projection else {
-            return .init(horizon: horizon, requiredPoints: points.count, coveredPoints: 0,
-                outsideViewPoints: 0, missingDepthPoints: points.count, occludedPoints: 0, projectionAvailable: false)
-        }
         var covered = 0, outside = 0, missing = 0, occluded = 0
+        var details: [DepthSafetyCoverage.Point] = []
+        var componentCounts: [String: (required: Int, covered: Int)] = [:]
+        var boundaryCounts: [CoverageGroup: (required: Int, covered: Int)] = [:]
         for point in points {
-            switch depthSupport(at: point, projection: projection) {
+            let detail = depthSupport(at: point, projection: snapshot.projection)
+            var counts = componentCounts[point.section] ?? (0, 0)
+            counts.required += 1
+            if detail.support == .covered { counts.covered += 1 }
+            componentCounts[point.section] = counts
+            let group = CoverageGroup(section: point.section, boundary: point.boundary)
+            var edgeCounts = boundaryCounts[group] ?? (0, 0)
+            edgeCounts.required += 1
+            if detail.support == .covered { edgeCounts.covered += 1 }
+            boundaryCounts[group] = edgeCounts
+            if details.count < 256 { details.append(detail) }
+            else if detail.support != .covered, let replace = details.firstIndex(where: { $0.support == .covered }) {
+                details[replace] = detail // Retain failing points preferentially; decisions still count every sample.
+            }
+            switch detail.support {
             case .covered: covered += 1
             case .outsideView: outside += 1
             case .missingDepth: missing += 1
             case .occluded: occluded += 1
             }
         }
-        return .init(horizon: horizon, requiredPoints: points.count, coveredPoints: covered,
-            outsideViewPoints: outside, missingDepthPoints: missing, occludedPoints: occluded, projectionAvailable: true)
+        var result = DepthSafetyCoverage(horizon: horizon, requiredPoints: points.count, coveredPoints: covered,
+            outsideViewPoints: outside, missingDepthPoints: missing, occludedPoints: occluded, projectionAvailable: snapshot.projection != nil)
+        result.points = details
+        result.components = snapshot.geometry.collisionSections.compactMap { section in
+            componentCounts[section.name].map { .init(name: section.name, required: $0.required, covered: $0.covered) }
+        }
+        result.geometry = snapshot.geometry
+        result.boundaries = boundaryCounts.keys.sorted { ($0.section, $0.boundary) < ($1.section, $1.boundary) }.map { group in
+            let counts = boundaryCounts[group]!
+            return .init(name: group.section, required: counts.required, covered: counts.covered, boundary: group.boundary)
+        }
+        // A newly entering side cannot be hidden by a large visible front face.
+        // Preserve the legacy box policy until measured sections are configured.
+        result.enforceBoundaryCoverage = !snapshot.geometry.sections.isEmpty
+        if let projection = snapshot.projection {
+            let cameraWorld = simd_inverse(projection.cameraFromWorld).columns.3
+            let relative = SIMD3<Double>(Double(cameraWorld.x), Double(cameraWorld.y), Double(cameraWorld.z)) - projection.roverOrigin
+            result.projectionSummary = ["image_width_px": Double(projection.width), "image_height_px": Double(projection.height),
+                "fx_px": projection.fx, "fy_px": projection.fy, "cx_px": projection.cx, "cy_px": projection.cy,
+                "camera_height_above_rover_origin_m": relative.y,
+                "camera_forward_offset_m": simd_dot(relative, projection.roverForward),
+                "camera_lateral_offset_m": simd_dot(relative, projection.roverRight), "depth_capture_uptime_s": snapshot.timestamp]
+            for (name, vector) in [("rover_origin_world", projection.roverOrigin),
+                                   ("rover_right_world", projection.roverRight), ("rover_forward_world", projection.roverForward)] {
+                for axis in 0..<3 { result.projectionSummary["\(name)_\(["x", "y", "z"][axis])"] = vector[axis] }
+            }
+            result.cameraFromWorldColumnMajor = (0..<4).flatMap { column in
+                (0..<4).map { row in Double(projection.cameraFromWorld[column][row]) }
+            }
+        }
+        return result
+    }
+
+    private struct CoverageLocation {
+        let section: String
+        let boundary: String
+        let travel: Double
+        let position: SIMD3<Double>
+    }
+
+    private struct CoverageGroup: Hashable {
+        let section: String
+        let boundary: String
     }
 
     private static func coveragePoints(command: WheelCommand,
                                        motion: DepthSafetyMotionClass,
                                        geometry: RoverCollisionGeometry,
-                                       horizon: Double) -> [SIMD3<Double>] {
-        let halfWidth = geometry.width / 2 + geometry.lateralSafetyMargin
-        let halfLength = geometry.length / 2
-        let heights = [
-            geometry.minimumCollisionHeight + cellResolution / 2,
-            (geometry.minimumCollisionHeight + geometry.maximumCollisionHeight) / 2,
-            geometry.maximumCollisionHeight - cellResolution / 2,
-        ]
-        if motion == .rotating {
-            let radius = hypot(halfLength, halfWidth)
-            return (0..<36).flatMap { index -> [SIMD3<Double>] in
-                let angle = 2 * Double.pi * Double(index) / 36
-                return heights.map { height in
-                    SIMD3(radius * sin(angle), height, radius * cos(angle))
+                                        horizon: Double) -> [CoverageLocation] {
+        var result: [CoverageLocation] = []
+        for section in geometry.collisionSections {
+            let halfWidth = section.width / 2 + geometry.lateralSafetyMargin
+            let halfLength = section.length / 2
+            let inset = min(cellResolution / 2, (section.maximumHeight - section.minimumHeight) / 2)
+            let heights = Array(Set([section.minimumHeight + inset,
+                (section.minimumHeight + section.maximumHeight) / 2, section.maximumHeight - inset])).sorted()
+            if motion == .rotating {
+                let radius = hypot(abs(section.forwardOffset) + halfLength, abs(section.lateralOffset) + halfWidth)
+                for index in 0..<36 {
+                    let angle = 2 * Double.pi * Double(index) / 36
+                    for height in heights {
+                        result.append(.init(section: section.name, boundary: "rotation_\(index)", travel: 0,
+                            position: SIMD3(radius * sin(angle), height, radius * cos(angle))))
+                    }
                 }
+                continue
             }
-        }
-
-        let average = (command.left + command.right) / 2
-        guard average > 0 else { return [] }
-        let delta = command.right - command.left
-        let curvature = abs(delta) < 0.001 ? 0 : delta / (RoverConfig.wheelBase * average)
-        let steps = max(1, Int(ceil(horizon / cellResolution)))
-        var result: [SIMD3<Double>] = []
-        for index in 0...steps {
-            let travel = horizon * Double(index) / Double(steps)
-            let pose = pose(at: travel, curvature: curvature)
-            let boundary: [(Double, Double)] = [
-                (-halfWidth, halfLength),
-                (0, halfLength),
-                (halfWidth, halfLength),
-            ]
-            // For forward arcs, validate the leading edge that the forward-facing
-            // depth camera can actually observe. Occupied cells still use the full
-            // rover footprint in firstContactTravel.
-            for (localLateral, localForward) in boundary {
-                let lateral = pose.x
-                    + localLateral * cos(pose.heading)
-                    - localForward * sin(pose.heading)
-                let forward = pose.z
-                    + localLateral * sin(pose.heading)
-                    + localForward * cos(pose.heading)
-                for height in heights {
-                    result.append(SIMD3(lateral, height, forward))
+            let average = (command.left + command.right) / 2
+            guard average > 0 else { return [] }
+            let delta = command.right - command.left
+            let curvature = abs(delta) < 0.001 ? 0 : delta / (RoverConfig.wheelBase * average)
+            let boundary = enteringBoundary(section: section, margin: geometry.lateralSafetyMargin,
+                curvature: curvature, sectioned: !geometry.sections.isEmpty)
+            let steps = max(1, Int(ceil(horizon / cellResolution)))
+            for index in 0...steps {
+                let travel = horizon * Double(index) / Double(steps)
+                let pose = pose(at: travel, curvature: curvature)
+                for (label, localLateral, localForward) in boundary {
+                    let lateral = pose.x + localLateral * cos(pose.heading) - localForward * sin(pose.heading)
+                    let forward = pose.z + localLateral * sin(pose.heading) + localForward * cos(pose.heading)
+                    for height in heights {
+                        result.append(.init(section: section.name, boundary: label, travel: travel,
+                            position: SIMD3(lateral, height, forward)))
+                    }
                 }
             }
         }
         return result
     }
 
-    private enum DepthSupport { case covered, outsideView, missingDepth, occluded }
+    /// Offset bodies can enter space along their sides/rear during an arc.
+    /// In rover coordinates a boundary point's velocity per metre travelled is
+    /// (-curvature * forward, 1 + curvature * lateral). Sample outward-moving
+    /// portions of faces, including a midpoint in each entering portion. Shared
+    /// corners remain checks in BOTH face groups; they cannot erase a side gate.
+    /// Legacy box sampling is unchanged.
+    private static func enteringBoundary(section: RoverCollisionGeometry.Section, margin: Double,
+                                         curvature: Double, sectioned: Bool) -> [(String, Double, Double)] {
+        let halfWidth = section.width / 2 + margin
+        let halfLength = section.length / 2
+        let xs = [section.lateralOffset - halfWidth, section.lateralOffset, section.lateralOffset + halfWidth]
+        let front = section.forwardOffset + halfLength
+        if !sectioned {
+            return zip(["left", "center", "right"], xs).map { ($0.0, $0.1, front) }
+        }
+        let back = section.forwardOffset - halfLength
+        var result: [(String, Double, Double)] = []
+        func face(_ label: String, from start: Double, to end: Double,
+                  slope: Double, intercept: Double, position: (Double) -> (Double, Double)) {
+            let startVelocity = slope * start + intercept
+            let endVelocity = slope * end + intercept
+            guard max(startVelocity, endVelocity) > 0 else { return }
+            var lower = start, upper = end
+            if startVelocity < 0 { lower = -intercept / slope }
+            if endVelocity < 0 { upper = -intercept / slope }
+            for coordinate in [lower, (lower + upper) / 2, upper] {
+                let (x, z) = position(coordinate)
+                result.append((label, x, z))
+            }
+        }
+        face("front", from: xs[0], to: xs[2], slope: curvature, intercept: 1) { ($0, front) }
+        face("rear", from: xs[0], to: xs[2], slope: -curvature, intercept: -1) { ($0, back) }
+        face("left_side", from: back, to: front, slope: curvature, intercept: 0) { (xs[0], $0) }
+        face("right_side", from: back, to: front, slope: -curvature, intercept: 0) { (xs[2], $0) }
+        return result
+    }
 
-    private static func depthSupport(at roverPoint: SIMD3<Double>,
-                                      projection: DepthSafetyProjection) -> DepthSupport {
+    private static func depthSupport(at location: CoverageLocation,
+                                     projection: DepthSafetyProjection?) -> DepthSafetyCoverage.Point {
+        var x: Double?, y: Double?, cameraDepth: Double?, measuredDepth: Double?
+        func detail(_ support: DepthSafetyCoverage.Point.Support, edges: [String] = []) -> DepthSafetyCoverage.Point {
+            .init(section: location.section, boundary: location.boundary, travel: location.travel,
+                roverPosition: location.position, support: support, outsideEdges: edges,
+                pixelX: x, pixelY: y, cameraDepth: cameraDepth, measuredDepth: measuredDepth)
+        }
+        guard let projection else { return detail(.missingDepth) }
+        let roverPoint = location.position
         let world = projection.roverOrigin
             + projection.roverRight * roverPoint.x
             + SIMD3<Double>(0, roverPoint.y, 0)
@@ -486,16 +599,25 @@ enum DepthSafetyEvaluator {
             Float(world.x), Float(world.y), Float(world.z), 1
         )
         let targetDepth = -Double(camera.z)
-        guard targetDepth > 0.05, targetDepth.isFinite else { return .outsideView }
-        let x = (projection.fx * Double(camera.x) / targetDepth + projection.cx).rounded()
-        let y = (projection.cy - projection.fy * Double(camera.y) / targetDepth).rounded()
-        guard x.isFinite, y.isFinite, x >= 0, x < Double(projection.width),
-              y >= 0, y < Double(projection.height) else { return .outsideView }
-        let pixelX = Int(x), pixelY = Int(y)
-        guard pixelY * projection.width + pixelX < projection.depthValues.count else { return .missingDepth }
+        cameraDepth = targetDepth.isFinite ? targetDepth : nil
+        guard targetDepth > 0.05, targetDepth.isFinite else { return detail(.outsideView, edges: ["behind_or_near_camera"]) }
+        let px = (projection.fx * Double(camera.x) / targetDepth + projection.cx).rounded()
+        let py = (projection.cy - projection.fy * Double(camera.y) / targetDepth).rounded()
+        x = px.isFinite ? px : nil
+        y = py.isFinite ? py : nil
+        guard px.isFinite, py.isFinite else { return detail(.outsideView, edges: ["invalid_projection"]) }
+        var edges: [String] = []
+        if px < 0 { edges.append("left") }
+        if px >= Double(projection.width) { edges.append("right") }
+        if py < 0 { edges.append("top") }
+        if py >= Double(projection.height) { edges.append("bottom") }
+        guard edges.isEmpty else { return detail(.outsideView, edges: edges) }
+        let pixelX = Int(px), pixelY = Int(py)
+        guard pixelY * projection.width + pixelX < projection.depthValues.count else { return detail(.missingDepth) }
         let measured = Double(projection.depthValues[pixelY * projection.width + pixelX])
-        guard measured > 0.05, measured.isFinite else { return .missingDepth }
-        return measured + cellResolution >= targetDepth ? .covered : .occluded
+        measuredDepth = measured.isFinite ? measured : nil
+        guard measured > 0.05, measured.isFinite else { return detail(.missingDepth) }
+        return detail(measured + cellResolution >= targetDepth ? .covered : .occluded)
     }
 
     private static func sweepStepCount(horizon: Double, curvature: Double) -> Int {

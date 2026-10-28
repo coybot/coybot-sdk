@@ -58,6 +58,22 @@ stop; they are not classified as obstacle disagreements.
   with a 5 cm measured-position limit, using 20 ms host pulses and confirmed stops.
   This uses the existing 0.25 wheel-command breakaway magnitude at a lower duty
   cycle; the command is not a calibrated physical speed guarantee.
+* Before the first recovery pulse, missing/stale depth can wait while stopped for
+  up to 600 ms, polling the real provider every 50 ms. The 250 ms raw-depth age
+  limit is unchanged. New stale captures do not renew the wait; fresh data at or
+  after its deadline cannot authorize movement. The original three-second probe
+  and twelve-second recovery deadlines include this waiting time. Cancellation,
+  tracking/source reset, invalid calibration, malformed depth and blind coverage
+  are not retried. Only the initial assessment gets this refresh allowance;
+  subsequent pulse, return and search depth failures remain terminal.
+* This pre-probe refresh also tolerates ordinary person-frame age expiry while
+  the controller remains confirmed stopped, including during reacquisition.
+  Fresh target association, heading, clearance and depth must all pass again
+  before the first pulse. Waiting for perception shares the same fixed 600 ms
+  deadline; it never starts a second window. The first sender also carries the
+  observation/window expiry through queueing. Structural perception faults,
+  invalid clocks and ownership changes remain terminal, and once any recovery
+  pulse starts, perception loss retains the immediate stop policy.
 * If the probe remains clear, its displacement counts toward the original 10 cm
   ready signal. The actual ready admission is checked again before continuing.
 * A confirmed obstruction returns only along the newly probed straight segment,
@@ -78,6 +94,8 @@ coverage includes clear/blocked/unknown paths, retained-path bounds, source rese
 cancelled ownership, failed stops and the coordinator's perception-outage handoff.
 Physical probe distance, reverse stop behavior and clear-heading reacquisition
 still require device acceptance.
+The same event records `depth_wait_started`, `depth_wait_recovered`, or
+`depth_wait_expired`, including elapsed time, poll count, reason and fixed deadlines.
 
 ### Bounded ready-motion depth coverage
 
@@ -126,3 +144,104 @@ inference time, capture-to-publication time and coalesced completed-frame count.
 Device acceptance should confirm that searching resumes on fresh observations,
 does not spend interruption allowance without dispatch, and still stops on real
 tracking/source loss.
+
+## Search calibration delivery ordering
+
+A synchronous stop-boundary pose read can overtake older queued pose events.
+Such delivery order is not usable on its own, but a complete bounded AR-ingress
+archive can reconcile it when every collected control sample exactly matches its
+original generation, sequence, source timestamp and yaw witness. Archived capture
+times are retained; delayed delivery and duplicate reads do not invent fresh
+frames or additional travelled angle.
+
+Unhealthy/stale control reads, regressing collection clocks, conflicting sample
+values, incomplete archives and invalid ingress chronology still reject calibration.
+This covers the iPhone trace with control delivery `2506 → 2508 → 2507 → 2508`;
+it does not disable the calibration evidence requirement.
+
+## Shared five-degree alignment acceptance
+
+Follow alignment now accepts an inclusive 5° residual in either direction. The
+coordinator's default alignment and ready-admission tolerance comes from the same
+follow turn profile. Search retains 7°; generic rotation keeps its own tolerance.
+Acceptance still requires the confirmed-stop/settled-source fence, a fresh matched
+person and valid clearance. It does not authorize a ready movement by heading alone.
+
+This restores Astral's October 9 acceptance fix from stash commits `afa1fba` and
+`bfaa867`, which was absent from the committed `6eb91e4` source used by the port.
+The October 27 iPhone 15 Pro run (03:35:22Z on October 28, alignment operation 14)
+settled at 4.9776° and subsequently read 4.7922° residual. Both satisfy 5°, but the
+old 0.05-radian gate rejected them and requested an unresolvable additional pulse.
+Regression coverage preserves the actual 187.411 ms response overhead, validates
+both signs and the 5°/5.1° boundary, and requires the real adapter's stop/source
+fence before accepting without another pulse.
+
+## Perception and map timing
+
+`follow_perception_delivery` reports capture-to-processing, publication-to-ingress
+and ingress-to-processing durations, at most once per second. These timestamps
+are diagnostics only and never replace the capture timestamp used for freshness.
+`follow_perception_latency` also separates projection/publication cost from inference;
+`nav_ready_map_snapshot` separates main-actor mesh capture from worker/delivery time.
+Repeated identical `silent_search_safety` events are logged only on transitions;
+every safety event is still processed. No mesh obstacle is erased based solely on
+its proximity to the rover; a blocked start still requires live-depth recovery.
+
+## Mounted camera calibration
+
+The operator reports a rear camera lens approximately 30 cm above the floor and
+7–10 cm behind the midpoint between the front and rear axles. The depth projection
+uses `cameraHeight = 0.30 m`, `forwardOffset = -0.085 m` as a provisional midpoint.
+Negative forward offset means behind the chassis center along the camera-aligned
+rover-forward axis. Lateral offset and heading alignment remain unmeasured defaults.
+
+For the configured 30 cm chassis length, the leading boundary is now 23.5 cm
+ahead of the lens rather than 15 cm (22–25 cm over the reported offset range).
+Synthetic projection tests cover the range and retain near-obstacle stopping.
+They also show that ordinary-FOV coverage can remain below 90% after this correction;
+the offset is not a visibility exemption or proof that this mount passes on-device.
+Collision dimensions, the height band and the required coverage fraction are unchanged.
+
+## Detailed visibility diagnostics and assembly sections
+
+On a `blind_swept_volume` assessment, `follow_depth.candidate` and the retained
+failure evidence now include:
+
+- `depth_coverage_points`: section name, left/center/right leading boundary (or
+  rotational boundary), travel distance, rover-relative lateral/height/forward
+  position, projected pixel, camera depth, measured depth, support classification,
+  and outside edges (`left`, `right`, `top`, `bottom`, or behind/too near the camera).
+- `depth_projection`: the captured depth image dimensions, scaled intrinsics,
+  effective camera offset/height, capture uptime, and rover axes/origin in world
+  coordinates. `depth_projection_camera_from_world_column_major` preserves the
+  matching 4×4 transform for replaying visibility with that same captured pose.
+- `depth_geometry_sections` and `depth_geometry_lateral_margin_m`: the exact
+  assembly model used, rather than an assumed camera-centered box.
+- `depth_coverage_components` and `depth_limiting_component_fraction`: complete
+  required/covered counts per section. Every component must independently meet
+  90%; a large visible component cannot hide a small invisible component.
+- `depth_coverage_boundaries`: counts for each sampled boundary. Explicit section
+  models require each entering boundary to meet 90% too, so visible front samples
+  cannot conceal a blind side. Legacy box admission keeps its existing policy.
+
+Pixels are in **raw depth-image coordinates**, not the rotated/cropped UI preview.
+Nonfinite or unavailable measurements are null. Point diagnostics retain at most
+256 points, preferentially keeping uncovered points when full; truncation is
+explicit. Aggregate and component decisions always use all required points.
+Detailed points are emitted only for visibility failure, not every clear command.
+No image or full depth map is attached to these events.
+
+`RoverCollisionGeometry.sections` supports measured, contiguous height bands for
+the chassis, mount and phone, each with its own footprint and center offset. The
+same sections govern coverage and collision contact, including voxels straddling
+height boundaries and operator-confirmed rotation's radial clearance. Curved
+section motion checks entering side/rear edges using their local velocity, rather
+than assuming every offset part only enters space along its front edge.
+Missing/gapped/overlapping, oversized or invalid sections fail
+validation. Reverse, freshness and confirmed-stop requirements remain unchanged.
+
+The production profile still reports `conservative_bounding_box`: only lens height
+and rearward offset have been supplied. Chassis height, upper-assembly footprint,
+offsets and top height are needed before enabling narrower sections. Photos alone
+do not establish those dimensions, and this diagnostic build does not claim that
+the observed 57% visibility failure is resolved.

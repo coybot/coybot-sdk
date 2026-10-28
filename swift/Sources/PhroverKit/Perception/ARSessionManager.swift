@@ -505,7 +505,8 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
             command: command,
             now: timestamp,
             operatorClearedRotation: FollowSearchRotationScope.authorized,
-            boundedReadyMotion: ReadyMotionDepthScope.active
+            boundedReadyMotion: ReadyMotionDepthScope.active,
+            visibilityPolicy: FollowDepthPolicyScope.current
         )
     }
 

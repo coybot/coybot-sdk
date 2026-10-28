@@ -819,6 +819,131 @@ final class DepthSafetyEvaluatorTests: XCTestCase {
         XCTAssertNotEqual(result.state, .stop)
     }
 
+    // MARK: - Follow depth policy (docs/follow-depth-policy.md)
+
+    func testAstralCompatibleDropsOnlyTheVisibilityRequirementAndStillReportsIt() throws {
+        let snapshot = liveNearBlindSnapshot()
+        let cases: [(String, WheelCommand, Bool)] = [("ready", .init(left: 0.25, right: 0.25), true),
+                                                     ("pursuit", .init(left: 0.25, right: 0.25), false),
+                                                     ("curve", .init(left: 0.20, right: 0.25), false),
+                                                     ("turn", .init(left: -0.25, right: 0.25), false)]
+        var blindUnderFullVolume: [String] = []
+        for (name, command, bounded) in cases {
+            let full = DepthSafetyEvaluator.evaluate(snapshot, command: command, now: 10.05, boundedReadyMotion: bounded)
+            let astral = DepthSafetyEvaluator.evaluate(snapshot, command: command, now: 10.05,
+                boundedReadyMotion: bounded, visibilityPolicy: .astralCompatible)
+            XCTAssertEqual(full.visibilityPolicy, .fullVolume)
+            XCTAssertEqual(astral.visibilityPolicy, .astralCompatible)
+            XCTAssertEqual(astral.coverageProvenance, "astral_compatible", name)
+            // Same measurement under both policies; only enforcement differs.
+            XCTAssertEqual(astral.fullVolumeWouldBlock, full.fullVolumeWouldBlock, name)
+            XCTAssertEqual(astral.coverage?.coveredPoints, full.coverage?.coveredPoints, name)
+            XCTAssertEqual(astral.requiredStoppingDistance, full.requiredStoppingDistance, name)
+            XCTAssertEqual(astral.state, .clear, name)
+            if full.state == .unavailable(.blindSweptVolume) {
+                blindUnderFullVolume.append(name)
+                XCTAssertEqual(full.fullVolumeWouldBlock, true, name)
+            } else {
+                XCTAssertEqual(full.state, .clear, name)
+                XCTAssertEqual(full.fullVolumeWouldBlock, false, name)
+            }
+        }
+        // The 30 cm ready-signal horizon is the near-field case the mount cannot see;
+        // pursuit's longer horizon dilutes the blind near samples in this synthetic scene.
+        XCTAssertTrue(blindUnderFullVolume.contains("ready"), "\(blindUnderFullVolume)")
+        XCTAssertTrue(blindUnderFullVolume.contains("turn"), "\(blindUnderFullVolume)")
+    }
+
+    func testAstralCompatibleKeepsEveryOtherDepthVeto() throws {
+        let command = WheelCommand(left: 0.25, right: 0.25)
+        func astral(_ snapshot: DepthSafetySnapshot, _ command: WheelCommand = .init(left: 0.25, right: 0.25),
+                    now: TimeInterval = 10.05) -> DepthSafetyObservation {
+            DepthSafetyEvaluator.evaluate(snapshot, command: command, now: now, visibilityPolicy: .astralCompatible)
+        }
+        let live = liveNearBlindSnapshot()
+        func withCells(_ cells: Set<DepthSafetyCell>) -> DepthSafetySnapshot {
+            .init(timestamp: 10, cells: cells, cellResolution: 0.04, validSampleRatio: 1,
+                  geometry: geometry, projection: live.projection, failureReason: nil)
+        }
+        XCTAssertEqual(astral(live, now: 10.30).state, .unavailable(.staleRawDepth))
+        for reason: DepthSafetyUnavailableReason in [.missingRawDepth, .malformedDepth, .invalidCalibration] {
+            let failed = DepthSafetySnapshot(timestamp: 10, cells: [], cellResolution: 0.04, validSampleRatio: 0,
+                geometry: geometry, projection: nil, failureReason: reason)
+            XCTAssertEqual(astral(failed).state, .unavailable(reason))
+        }
+        XCTAssertEqual(astral(live, .init(left: -0.25, right: -0.25)).state, .unavailable(.blindSweptVolume),
+            "Reverse has no rear depth under either policy")
+
+        let near = Set((1...3).map { DepthSafetyCell(lateralIndex: 0, heightIndex: $0, forwardIndex: 10) })
+        let stop = astral(withCells(near))
+        XCTAssertEqual(stop.state, .stop)
+        XCTAssertLessThanOrEqual(stop.clearance, 0.30)
+
+        let ahead = Set((1...3).map { DepthSafetyCell(lateralIndex: 0, heightIndex: $0, forwardIndex: 14) })
+        let caution = astral(withCells(ahead))
+        XCTAssertEqual(caution.state, .caution)
+        XCTAssertEqual(caution.speedLimit, 0.12)
+
+        let beside = Set((1...3).map { DepthSafetyCell(lateralIndex: 6, heightIndex: $0, forwardIndex: 0) })
+        XCTAssertEqual(astral(withCells(beside), .init(left: -0.25, right: 0.25)).state, .stop,
+            "A visible obstacle inside the turning radius still stops a turn")
+
+        let box = Set((-1...1).map { DepthSafetyCell(lateralIndex: $0, heightIndex: 1, forwardIndex: 25) })
+        let remembered = astral(liveNearBlindSnapshot(history: [try rememberedFrame(back: 0.8, age: 0.5, cells: box)]), command)
+        XCTAssertEqual(remembered.state, .stop, "A remembered obstacle the camera cannot see still stops")
+        XCTAssertEqual(remembered.rememberedHazardCellCount, 3)
+    }
+
+    @MainActor
+    func testDepthPolicyReachesOnlyFollowOwnedDepthReads() {
+        let ar = ARSessionManager()
+        ar.ingestDepthSafety(rawDepthMap: makeDepthBuffer(width: 80, height: 60, constantDepth: 3),
+            intrinsics: ordinaryIntrinsics, cameraTransform: cameraTransform(height: 0.30), timestamp: 10)
+        let command = WheelCommand(left: 0.25, right: 0.25)
+        func ready() -> DepthSafetyObservation {
+            ReadyMotionDepthScope.$active.withValue(true) { ar.depthSafetyObservation(for: command, at: 10.05) }
+        }
+        // Ordinary navigation and Silent Search call the provider outside any policy scope.
+        XCTAssertEqual(ready().state, .unavailable(.blindSweptVolume))
+        XCTAssertEqual(ready().visibilityPolicy, .fullVolume)
+        let scoped = FollowDepthPolicyScope.$current.withValue(.astralCompatible) { ready() }
+        XCTAssertEqual(scoped.state, .clear)
+        XCTAssertEqual(scoped.visibilityPolicy, .astralCompatible)
+        XCTAssertEqual(FollowDepthPolicyScope.current, .fullVolume, "The scope never leaks past its read")
+        XCTAssertEqual(RoverConfig.followDepthPolicy, .astralCompatible,
+            "Default for the current WAVE ROVER mount; change deliberately with docs/follow-depth-policy.md")
+    }
+
+    @MainActor
+    func testFollowControllerAppliesItsPolicyToEveryDepthReadAndLogsIt() async throws {
+        let snapshot = liveNearBlindSnapshot()
+        for policy: FollowDepthPolicy in [.astralCompatible, .fullVolume] {
+            let sink = FollowDiagnosticRecordingSink()
+            var scopes: [FollowDepthPolicy] = []
+            let pose = NavigationPoseSample(pose: .init(position: .zero, yaw: 0),
+                frameID: .init(generation: 1, sequence: 1), sourceTimestamp: 10, trackingQuality: .normal)
+            let controller = FollowNavigationController(currentPose: { pose.pose }, forwardClearance: { 2 },
+                depthSafetyObservation: { command in
+                    // Mirrors ARSessionManager's provider, which reads the scope the same way.
+                    scopes.append(FollowDepthPolicyScope.current)
+                    return DepthSafetyEvaluator.evaluate(snapshot, command: command, now: 10.05,
+                        boundedReadyMotion: true, visibilityPolicy: FollowDepthPolicyScope.current)
+                },
+                plan: { _, goal in [goal] }, lastAckAt: { Date() }, sendCommand: { _ in }, stopRover: {}, sleep: { _ in },
+                diagnosticEmitter: .init(streamID: "depth-policy", monotonic: { 10.05 }, utc: { Date() }, sink: sink.append),
+                poseSample: { pose }, sourceNow: { 10.05 }, sourceStopSnapshot: { pose }, depthPolicy: policy)
+            XCTAssertEqual(controller.depthPolicy, policy)
+            _ = await controller.sendFollowTurnBurst(.init(left: 0.25, right: 0.25), requestedBudget: 0.02, purpose: .followReady)
+            XCTAssertFalse(scopes.isEmpty)
+            XCTAssertTrue(scopes.allSatisfy { $0 == policy }, "\(scopes)")
+            let payload = try XCTUnwrap(sink.records.first { $0.event == "follow_depth.candidate" }?.fields["payload"])
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any])
+            XCTAssertEqual(json["depth_visibility_policy"] as? String, policy.rawValue)
+            XCTAssertEqual(json["depth_full_volume_would_block"] as? Bool, true)
+            XCTAssertEqual(json["depth_state"] as? String, policy == .fullVolume ? "blind_swept_volume" : "clear")
+        }
+    }
+
     private func offsetSectionGeometry(lateralOffset: Double = 0.03) -> RoverCollisionGeometry {
         .init(length: 0.30, width: 0.25, minimumCollisionHeight: 0.04, maximumCollisionHeight: 0.34, sections: [
             .init(name: "chassis", length: 0.30, width: 0.25, minimumHeight: 0.04, maximumHeight: 0.14),

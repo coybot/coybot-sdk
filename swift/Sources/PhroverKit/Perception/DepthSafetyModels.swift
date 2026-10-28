@@ -131,6 +131,22 @@ public enum DepthSafetyUnavailableReason: String, Equatable, Sendable {
     case blindSweptVolume = "blind_swept_volume"
 }
 
+/// Which depth evidence a follow-me motion needs. See docs/follow-depth-policy.md.
+enum FollowDepthPolicy: String, Sendable {
+    /// At least 90% of the motion-volume samples must be visible (live or remembered).
+    case fullVolume = "full_volume"
+    /// No visibility fraction is required, as in Astral. Astral's own forward gate
+    /// (`ObstacleGuard`, central-region clearance) runs in the follow controller under
+    /// both policies; depth freshness, missing depth and visible obstacles still stop.
+    case astralCompatible = "astral_compatible"
+}
+
+/// Set only by the follow-me controller around its own depth reads. Ordinary
+/// navigation and Silent Search never see anything but `fullVolume`.
+enum FollowDepthPolicyScope {
+    @TaskLocal static var current: FollowDepthPolicy = .fullVolume
+}
+
 enum DepthSafetyState: Equatable, Sendable {
     case clear
     case caution
@@ -176,6 +192,9 @@ struct DepthSafetyObservation: Equatable, Sendable {
     var coverage: DepthSafetyCoverage?
     /// Occupied cells contributed by retained frames where the live camera is blind.
     var rememberedHazardCellCount = 0
+    var visibilityPolicy: FollowDepthPolicy = .fullVolume
+    /// Whether the 90% visibility requirement fails for this command, under either policy.
+    var fullVolumeWouldBlock: Bool?
 
     static func unavailable(_ reason: DepthSafetyUnavailableReason,
                             sampleAge: TimeInterval,

@@ -99,6 +99,10 @@ The same event records `depth_wait_started`, `depth_wait_recovered`, or
 
 ### Bounded ready-motion depth coverage
 
+> The 90% requirement below applies under `full_volume`. Follow-me now defaults
+> to `astral_compatible`, which measures and logs coverage but does not require
+> it; every other check here is unchanged. See `docs/follow-depth-policy.md`.
+
 Every bounded ready signal and its recovery probe check visibility through the stopping corridor (at least 30 cm),
 without requiring the additional 35 cm cruise look-ahead. Collision detection
 still evaluates the original hazard horizon, and 90% coverage is still required

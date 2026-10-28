@@ -43,6 +43,11 @@ public enum RoverConfig {
         maximumCollisionHeight: 0.50,
         lateralSafetyMargin: 0.08
     )
+    /// Follow-me depth gate. The WAVE ROVER mount cannot see enough of the near
+    /// motion volume to pass `.fullVolume` with the conservative box above, so
+    /// follow drops the visibility requirement, as Astral did, until measured
+    /// height sections make `.fullVolume` passable. See docs/follow-depth-policy.md.
+    static let followDepthPolicy: FollowDepthPolicy = .astralCompatible
     /// Minimum in-place turn command that reliably overcomes WAVE ROVER static friction.
     /// The autonomous rotate loop may compute a smaller speed from yaw error, but values
     /// below this can make interpreted voice turns appear to do nothing.

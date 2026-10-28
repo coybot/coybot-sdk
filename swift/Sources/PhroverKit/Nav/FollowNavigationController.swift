@@ -47,6 +47,8 @@ final class FollowNavigationController {
     private var pendingFollowTurnBurstDrain: FollowTurnBurstDrain?
     var followTurnBurstPendingStatus: FollowTurnBurstPendingStatus? { pendingFollowTurnBurst?.status }
     private let depthSafetyObservation: (WheelCommand) -> DepthSafetyObservation
+    /// Applied to every follow-owned depth read; ordinary navigation never sees it.
+    let depthPolicy: FollowDepthPolicy
     private let observeDepthSafety: ((@escaping (DepthSafetySnapshot?) -> Void) -> (() -> Void))?
     private struct DepthSafetyStop: Error { let failure: NavigationFailure }
     private let currentForwardClearance: () -> Double
@@ -222,7 +224,8 @@ final class FollowNavigationController {
     }
 
     init(ar: ARSessionManager, control: RoverControl,
-         depthSafetyObservation: ((WheelCommand) -> DepthSafetyObservation)? = nil) {
+         depthSafetyObservation: ((WheelCommand) -> DepthSafetyObservation)? = nil,
+         depthPolicy: FollowDepthPolicy = RoverConfig.followDepthPolicy) {
         let planner = AStarPlanner()
         currentPose = { ar.pose }
         currentPoseSample = { ar.latestSnapshot.map(NavigationPoseSample.init(snapshot:)) }
@@ -251,7 +254,11 @@ final class FollowNavigationController {
             }
         }
         currentForwardClearance = { ar.forwardClearance }
-        self.depthSafetyObservation = depthSafetyObservation ?? { ar.depthSafetyObservation(for: $0) }
+        let provider = depthSafetyObservation ?? { ar.depthSafetyObservation(for: $0) }
+        self.depthPolicy = depthPolicy
+        self.depthSafetyObservation = { command in
+            FollowDepthPolicyScope.$current.withValue(depthPolicy) { provider(command) }
+        }
         self.observeDepthSafety = { ar.observeDepthSafety($0) }
         makePlan = { start, goal in
             let costmap = CostmapBuilder.build(from: ar.meshAnchors, center: start)
@@ -291,7 +298,8 @@ final class FollowNavigationController {
          sourceHighWater: (() -> FollowTurnSourceHighWater?)? = nil,
           sourceHealth: (() -> FollowTurnSourceHealth)? = nil,
           turnPoseEvidence: ((ARFrameID, ARFrameID) -> [FollowTurnBurstPlanner.Sample]?)? = nil,
-         transportUptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+         transportUptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         depthPolicy: FollowDepthPolicy = RoverConfig.followDepthPolicy) {
         self.currentPose = currentPose
         self.currentPoseSample = poseSample
         self.sourceNow = sourceNow
@@ -303,9 +311,13 @@ final class FollowNavigationController {
         self.currentForwardClearance = forwardClearance
         self.observeDepthSafety = observeDepthSafety
         // Legacy fixtures supply scalar clearance; production always uses AR depth provenance.
-        self.depthSafetyObservation = depthSafetyObservation ?? { command in
+        let provider = depthSafetyObservation ?? { command in
             .init(state: .clear, clearance: forwardClearance(), supportCount: 0, sampleAge: 0,
                   requiredStoppingDistance: 0, motionClass: .classify(command), speedLimit: nil)
+        }
+        self.depthPolicy = depthPolicy
+        self.depthSafetyObservation = { command in
+            FollowDepthPolicyScope.$current.withValue(depthPolicy) { provider(command) }
         }
         self.makePlan = plan
         self.readySignalCostmap = readySignalCostmap
@@ -1721,7 +1733,7 @@ final class FollowNavigationController {
         let removeDepthObserver: (() -> Void)? = (grant == nil || bypassAcquisitionDepth) ? nil : observeDepthSafety? { snapshot in
             guard self.operationGeneration == owner, evidence?.fenced != true else { return }
             let observation = snapshot.map { DepthSafetyEvaluator.evaluate($0, command: command,
-                now: self.sourceNow(), operatorClearedRotation: true) }
+                now: self.sourceNow(), operatorClearedRotation: true, visibilityPolicy: self.depthPolicy) }
                 ?? .unavailable(.missingRawDepth, sampleAge: .infinity, motionClass: .classify(command))
             guard case .allow(let accepted, _) = self.guardLayer.evaluate(command: command, depthSafety: observation),
                   accepted == command else {
@@ -3049,7 +3061,9 @@ final class FollowNavigationController {
             "depth_clearance_m": finite(observation.clearance), "depth_support_count": .number(Double(observation.supportCount)),
             "depth_motion_class": .string(observation.motionClass.rawValue), "depth_candidate_disposition": .string(disposition),
             "depth_required_stopping_distance_m": finite(observation.requiredStoppingDistance),
-            "depth_remembered_hazard_cells": .number(Double(observation.rememberedHazardCellCount))]
+            "depth_remembered_hazard_cells": .number(Double(observation.rememberedHazardCellCount)),
+            "depth_visibility_policy": .string(observation.visibilityPolicy.rawValue),
+            "depth_full_volume_would_block": observation.fullVolumeWouldBlock.map { .bool($0) } ?? .null]
         let coverage = observation.coverage
         let coverageFields: [String: FollowDiagnosticValue] = [
             "depth_coverage_horizon_m": coverage.map { finite($0.horizon) } ?? .null,

@@ -222,7 +222,21 @@ enum DepthSafetyEvaluator {
                          command: WheelCommand,
                           now: TimeInterval,
                           operatorClearedRotation: Bool = false,
-                          boundedReadyMotion: Bool = false) -> DepthSafetyObservation {
+                          boundedReadyMotion: Bool = false,
+                          visibilityPolicy: FollowDepthPolicy = .fullVolume) -> DepthSafetyObservation {
+        var observation = evaluateMotion(snapshot, command: command, now: now,
+            operatorClearedRotation: operatorClearedRotation, boundedReadyMotion: boundedReadyMotion,
+            astralCompatible: visibilityPolicy == .astralCompatible)
+        observation.visibilityPolicy = visibilityPolicy
+        return observation
+    }
+
+    private static func evaluateMotion(_ snapshot: DepthSafetySnapshot,
+                                       command: WheelCommand,
+                                       now: TimeInterval,
+                                       operatorClearedRotation: Bool,
+                                       boundedReadyMotion: Bool,
+                                       astralCompatible: Bool) -> DepthSafetyObservation {
         let motion = DepthSafetyMotionClass.classify(command)
         let age = max(0, now - snapshot.timestamp)
         guard now.isFinite, snapshot.timestamp.isFinite, now >= snapshot.timestamp,
@@ -272,12 +286,17 @@ enum DepthSafetyEvaluator {
         }
         func checkingCoverage(_ observation: DepthSafetyObservation, horizon: Double) -> DepthSafetyObservation {
             let coverage = sweptVolumeCoverage(snapshot: snapshot, command: command, motion: motion, horizon: horizon)
-            var result = coverage.isSufficient(minimumSweptVolumeCoverage) ? observation : DepthSafetyObservation(
+            let sufficient = coverage.isSufficient(minimumSweptVolumeCoverage)
+            // Astral-compatible follow does not require the visibility fraction; it is
+            // still measured so logs show where the full-volume policy would have stopped.
+            var result = sufficient || astralCompatible ? observation : DepthSafetyObservation(
                 state: .unavailable(.blindSweptVolume), clearance: observation.clearance,
                 supportCount: observation.supportCount, sampleAge: age, requiredStoppingDistance: stoppingDistance,
                 motionClass: motion, speedLimit: nil)
             result.coverage = coverage
-            result.coverageProvenance = boundedForward ? "bounded_ready_motion_stopping_corridor" : "depth"
+            result.fullVolumeWouldBlock = !sufficient
+            result.coverageProvenance = astralCompatible ? "astral_compatible"
+                : (boundedForward ? "bounded_ready_motion_stopping_corridor" : "depth")
             return finalized(result)
         }
         var contactTravel: [DepthSafetyCell: Double] = [:]

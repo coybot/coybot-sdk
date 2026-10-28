@@ -215,6 +215,22 @@ final class MissionAgentTests: XCTestCase {
         }
     }
 
+    func testVisualQueryFollowSeedUsesTheDetectionReceiptFrame() async {
+        let perception = FakePerception()
+        perception.objects = [PerceivedObject(label: "person", confidence: 0.95,
+                                              normalizedPoint: CGPoint(x: 0.5, y: 0.5))]
+        perception.unprojectResult = Vec2(9, 9)          // newest frame: the wall behind them
+        perception.detectedUnprojectResult = Vec2(1, 2)  // frame the box was detected in
+        let follower = FakeFollower()
+        let brain = FakeBrain(script: [.follow(.visualQuery("person")), .done])
+        let agent = MissionAgent(motion: FakeMotion(), perception: perception, voice: FakeVoice(),
+                                 follower: follower) { brain }
+
+        await agent.handle("track the selected subject")
+
+        XCTAssertEqual(follower.seeds.compactMap { $0 }, [Vec2(1, 2)])
+    }
+
     func testPlainFollowRequestsAreRecognisedWithoutABrain() {
         let cases: [(String, String?)] = [
             ("follow me", "person"),
@@ -4592,6 +4608,11 @@ private final class FakePerception: RoverPerception {
     func unproject(normalizedPoint: CGPoint) -> Vec2? {
         unprojectFrameSequences.append(frameSequence)
         return unprojectResult
+    }
+    /// Projection through the detection receipt's own frame; nil mirrors the protocol default.
+    var detectedUnprojectResult: Vec2?
+    func unprojectDetectedObject(normalizedPoint: CGPoint) -> Vec2? {
+        detectedUnprojectResult ?? unproject(normalizedPoint: normalizedPoint)
     }
     func capturedFrameJPEG() -> Data? { nil }
     func explorationFrontiers() -> [Frontier] {

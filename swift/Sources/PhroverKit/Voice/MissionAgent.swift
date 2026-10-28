@@ -4346,8 +4346,10 @@ public final class MissionAgent {
         case .visualQuery(let query):
             let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return nil }
+            // The grounded point comes from the cached detection receipt, so project it
+            // with that receipt's camera and depth, not the newest frame's.
             return (TargetSpec(query: trimmed), perception.groundObject(query: trimmed)
-                        .flatMap { perception.unproject(normalizedPoint: $0) })
+                        .flatMap { perception.unprojectDetectedObject(normalizedPoint: $0) })
         case .imagePoint(let point):
             guard let seed = perception.unproject(normalizedPoint: point) else { return nil }
             guard let label = nearestDetectedLabel(toWorldPoint: seed) else { return nil }

@@ -36,6 +36,10 @@ final class DepthSafetyProcessor {
     }
 
     func submit(_ input: Input) {
+        // A structural tracking fault is not a coalescible camera sample.
+        // Revoke at ingress so a newer normal waiter cannot erase the loss,
+        // and an in-flight pre-loss projection cannot repopulate memory.
+        guard input.trackingNormal else { invalidate(); return }
         // Bound retained camera buffers to the running capture and the newest waiter.
         pending = (input, generation)
         guard task == nil else { return }
@@ -51,7 +55,7 @@ final class DepthSafetyProcessor {
                 // if their native computation could not be cancelled mid-frame.
                 guard job.generation == generation else { continue }
                 var delivered = snapshot
-                if job.input.trackingNormal { memory.attach(to: &delivered) } else { memory.clear() }
+                memory.attach(to: &delivered)
                 didProcess(delivered)
             }
         }

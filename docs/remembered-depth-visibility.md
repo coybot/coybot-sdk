@@ -45,6 +45,12 @@ Memory is cleared when:
 - A depth frame arrives with tracking quality other than normal. Relocalization
   can move the world origin, so earlier frames are no longer comparable.
 
+Tracking loss is handled synchronously at submission, before newest-frame
+coalescing. It revokes the published depth snapshot and fences running projection
+results. Non-normal captures are not projected or published as depth authority.
+A later normal capture starts a new memory epoch, even if it immediately follows
+the non-normal frame while the projector is busy.
+
 Frames whose own depth evaluation failed are not retained.
 
 ## Limits

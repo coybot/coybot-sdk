@@ -4,6 +4,39 @@ import RoverNav
 
 @MainActor
 final class ReadyPathRecoveryTests: XCTestCase {
+    func testProbeCompletionNeverOverridesHardBoundsSourceOrDeadline() {
+        let authority = ReadyPathRecovery.PulseAuthority(stage: .probe, origin: .init(position: .zero, yaw: 0),
+            generation: 7, maximumAlong: 0.05, expiresAt: 11, command: .init(left: 0.25, right: 0.25))
+        func source(x: Double = 0.031, lateral: Double = 0, yaw: Double = 0,
+                    generation: UInt64 = 7, timestamp: Double = 9.99,
+                    tracking: ARTrackingQuality = .normal) -> NavigationPoseSample {
+            .init(pose: .init(position: .init(x, lateral), yaw: yaw), frameID: .init(generation: generation, sequence: 1),
+                sourceTimestamp: timestamp, trackingQuality: tracking)
+        }
+        XCTAssertEqual(authority.assessment(authority.command, sample: source(x: 0.029), now: 10), .permitted)
+        for x in [0.03, 0.031, 0.05] {
+            XCTAssertEqual(authority.assessment(authority.command, sample: source(x: x), now: 10), .goalReached)
+            XCTAssertFalse(authority.permits(authority.command, sample: source(x: x), now: 10))
+        }
+        XCTAssertEqual(authority.assessment(authority.command, sample: source(x: 0.050001), now: 10), .rejected(.travelLimit))
+        XCTAssertEqual(authority.assessment(authority.command, sample: source(lateral: 0.010001), now: 10), .rejected(.lateralLimit))
+        XCTAssertEqual(authority.assessment(authority.command, sample: source(yaw: 0.050001), now: 10), .rejected(.headingLimit))
+        XCTAssertEqual(authority.assessment(authority.command, sample: source(x: -0.005001), now: 10), .rejected(.backwardLimit))
+        XCTAssertEqual(authority.assessment(authority.command, sample: source(generation: 8), now: 10), .rejected(.source("source_generation_changed")))
+        XCTAssertEqual(authority.assessment(authority.command, sample: source(timestamp: 9), now: 10), .rejected(.source("stale_source")))
+        XCTAssertEqual(authority.assessment(authority.command, sample: source(tracking: .limited), now: 10), .rejected(.source("unhealthy_tracking")))
+        XCTAssertEqual(authority.assessment(authority.command, sample: source(timestamp: 10.9), now: 11), .rejected(.expired))
+        XCTAssertEqual(authority.assessment(authority.command, sample: source(), now: .nan), .rejected(.invalidClock))
+    }
+
+    func testPoseShiftBeforeAnyRealProbeCannotDeclareRecoveryClear() async {
+        let fixture = ProbeFixture()
+        fixture.onDepth = { fixture.position.x = 0.031 }
+        let result = await fixture.run()
+        XCTAssertEqual(result, .failed(.stalled))
+        XCTAssertTrue(fixture.commands.isEmpty)
+    }
+
     func testRecordedStaleStartupDepthWaitsStoppedForFreshCaptureBeforeProbing() async {
         let fixture = ProbeFixture()
         // Device recovery failed at 271.521 ms against the unchanged 250 ms limit.

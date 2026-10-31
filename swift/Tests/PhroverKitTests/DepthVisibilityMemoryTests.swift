@@ -80,10 +80,40 @@ final class DepthVisibilityMemoryTests: XCTestCase {
         var delivered: [DepthSafetySnapshot] = []
         let processor = DepthSafetyProcessor(evaluate: Self.result(for:)) { delivered.append($0) }
         try await submit(1.0, to: processor) { delivered.count }
-        try await submit(1.2, trackingNormal: false, to: processor) { delivered.count }
+        processor.submit(try input(at: 1.2, trackingNormal: false))
         try await submit(1.4, to: processor) { delivered.count }
-        XCTAssertEqual(delivered.map(\.history.count), [0, 0, 0],
+        XCTAssertEqual(delivered.map(\.timestamp), [1.0, 1.4], "Untracked captures cannot publish depth authority")
+        XCTAssertEqual(delivered.map(\.history.count), [0, 0],
             "Frames from before limited tracking or relocalization are never compared")
+    }
+
+    func testCoalescedTrackingLossFencesRunningProjectionAndClearsRetainedHistory() async throws {
+        let entered = expectation(description: "pre-loss projection running")
+        let recovered = expectation(description: "post-loss normal capture delivered")
+        let gate = DispatchSemaphore(value: 0)
+        defer { gate.signal() }
+        var delivered: [DepthSafetySnapshot] = []
+        let processor = DepthSafetyProcessor(evaluate: { input in
+            if input.timestamp == 1.2 {
+                entered.fulfill()
+                _ = gate.wait(timeout: .now() + 3)
+            }
+            return Self.result(for: input)
+        }, didProcess: { snapshot in
+            delivered.append(snapshot)
+            if snapshot.timestamp == 1.6 { recovered.fulfill() }
+        })
+        try await submit(1.0, to: processor) { delivered.count }
+        processor.submit(try input(at: 1.2))
+        await fulfillment(of: [entered], timeout: 2)
+        processor.submit(try input(at: 1.4, trackingNormal: false))
+        processor.submit(try input(at: 1.6))
+        gate.signal()
+        await fulfillment(of: [recovered], timeout: 2)
+        XCTAssertEqual(delivered.map(\.timestamp), [1.0, 1.6])
+        XCTAssertTrue(try XCTUnwrap(delivered.last).history.isEmpty)
+        try await submit(1.8, to: processor) { delivered.count }
+        XCTAssertEqual(delivered.last?.history.map(\.timestamp), [1.6], "Only the new continuous-tracking epoch can rebuild memory")
     }
 
     func testProcessorInvalidationClearsMemory() async throws {
@@ -100,13 +130,17 @@ final class DepthVisibilityMemoryTests: XCTestCase {
     private func submit(_ timestamp: TimeInterval, trackingNormal: Bool = true,
                         to processor: DepthSafetyProcessor, count: () -> Int) async throws {
         let before = count()
-        var map: CVPixelBuffer?
-        CVPixelBufferCreate(kCFAllocatorDefault, 2, 2, kCVPixelFormatType_DepthFloat32, nil, &map)
-        processor.submit(.init(rawDepthMap: try XCTUnwrap(map), intrinsics: matrix_identity_float3x3,
-            imageResolution: nil, cameraTransform: matrix_identity_float4x4, timestamp: timestamp,
-            trackingNormal: trackingNormal))
+        processor.submit(try input(at: timestamp, trackingNormal: trackingNormal))
         for _ in 0..<2000 where count() == before { await Task.yield() }
         XCTAssertEqual(count(), before + 1)
+    }
+
+    private func input(at timestamp: TimeInterval, trackingNormal: Bool = true) throws -> DepthSafetyProcessor.Input {
+        var map: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 2, 2, kCVPixelFormatType_DepthFloat32, nil, &map)
+        return .init(rawDepthMap: try XCTUnwrap(map), intrinsics: matrix_identity_float3x3,
+            imageResolution: nil, cameraTransform: matrix_identity_float4x4, timestamp: timestamp,
+            trackingNormal: trackingNormal)
     }
 
     private func snapshot(at timestamp: TimeInterval, failure: DepthSafetyUnavailableReason? = nil,

@@ -2,6 +2,23 @@ import XCTest
 @testable import PhroverKit
 
 final class FollowMotionFailureResolutionTests: XCTestCase {
+    func testReadyProbeBoundsAndSourceRejectionsHaveDistinctMessages() {
+        for cause in [FollowMotionFailureCause.readyProbeLateralDeviation, .readyProbeHeadingDeviation,
+                      .readyProbeTravelLimit, .readyProbeExpired] {
+            let context = FollowMotionOperationContext(request: nil, controllerOperationID: 1,
+                purpose: .followReady, profile: nil, failureCause: cause)
+            let resolution = FollowMotionFailureResolution(.init(context: context, reason: .stalled,
+                stopOutcome: .confirmed, source: .result))
+            XCTAssertTrue(resolution.message.contains("floor-check"))
+            XCTAssertTrue(resolution.message.contains("Stop confirmed"))
+            XCTAssertFalse(resolution.message.contains("AR tracking lost"))
+        }
+        let context = FollowMotionOperationContext(request: nil, controllerOperationID: 1,
+            purpose: .followReady, profile: nil, failureCause: .readyProbeSourceInvalid)
+        let resolution = FollowMotionFailureResolution(.init(context: context, reason: .trackingLost,
+            stopOutcome: .confirmed, source: .result))
+        XCTAssertTrue(resolution.message.contains("camera pose evidence"))
+    }
     func testReadyCoverageMessageIdentifiesHiddenComponentDespiteHighAggregateCoverage() {
         let request = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 1, purpose: .followReady, phase: "aligning")
         let context = FollowMotionOperationContext(request: request, controllerOperationID: 1, purpose: .followReady, profile: nil)

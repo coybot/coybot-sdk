@@ -103,6 +103,9 @@ struct FollowMotionFailureResolution {
         switch primaryReason {
         case .noPose: return "Rover pose unavailable. Wait for AR tracking to recover."
         case .trackingLost:
+            if context.purpose == .followReady, context.failureCause == .readyProbeSourceInvalid {
+                return "Floor check stopped: camera pose evidence became invalid or changed. Wait for fresh tracking and restart following."
+            }
             return context.failureCause == .poseSourceStale
                 ? "Camera pose is stale. Motion stopped; wait for fresh camera frames."
                 : "AR tracking lost. Wait for tracking to recover."

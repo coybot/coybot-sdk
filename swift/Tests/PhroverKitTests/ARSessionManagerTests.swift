@@ -192,6 +192,42 @@ final class ARSessionManagerTests: XCTestCase {
         }
     }
 
+    func testTrackingLossRevokesPublishedDepthUntilNewNormalProjectionCompletes() async throws {
+        let entered = expectation(description: "new normal projection started")
+        let published = expectation(description: "new normal projection published")
+        let gate = DispatchSemaphore(value: 0)
+        defer { gate.signal() }
+        let ar = ARSessionManager(relativeHeadingTelemetry: { _, _ in }, depthProjection: { input in
+            XCTAssertTrue(input.trackingNormal)
+            entered.fulfill()
+            _ = gate.wait(timeout: .now() + 3)
+            return DepthSafetyProcessor.project(input)
+        })
+        ar.resetTracking(generation: 1, runSession: false)
+        let map = makeDepth(2)
+        ar.ingestDepthSafety(rawDepthMap: map, intrinsics: matrix_identity_float3x3,
+            cameraTransform: matrix_identity_float4x4, timestamp: 10)
+        XCTAssertNotNil(ar.latestDepthSafetySnapshot)
+        var revoked = false
+        let remove = ar.observeDepthSafety { snapshot in
+            if snapshot == nil { revoked = true }
+            if snapshot?.timestamp == 10.2 { published.fulfill() }
+        }
+        defer { remove() }
+        ar.enqueueDepthSafety(rawDepthMap: map, intrinsics: matrix_identity_float3x3,
+            cameraTransform: matrix_identity_float4x4, timestamp: 10.1, trackingNormal: false)
+        XCTAssertTrue(revoked, "Tracking loss must synchronously revoke already-published depth")
+        XCTAssertNil(ar.latestDepthSafetySnapshot)
+        ar.enqueueDepthSafety(rawDepthMap: map, intrinsics: matrix_identity_float3x3,
+            cameraTransform: matrix_identity_float4x4, timestamp: 10.2)
+        await fulfillment(of: [entered], timeout: 2)
+        XCTAssertNil(ar.latestDepthSafetySnapshot, "Normal tracking alone cannot revive the pre-loss capture")
+        gate.signal()
+        await fulfillment(of: [published], timeout: 2)
+        XCTAssertEqual(ar.latestDepthSafetySnapshot?.timestamp, 10.2)
+        XCTAssertEqual(ar.latestDepthSafetySnapshot?.history.count, 0)
+    }
+
     func testSnapshotPreservesDepthConfidenceOrientationAndIngressEvidence() throws {
         var image: CVPixelBuffer?
         var confidence: CVPixelBuffer?

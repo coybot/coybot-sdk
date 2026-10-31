@@ -960,7 +960,7 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
         _ = await fixture.coordinator.stop()
     }
 
-    func testStalePerceptionAfterRealSendCannotRetryWhenHealthyFramesRecover() async {
+    func testStalePerceptionAfterRealSendRetriesAfterConfirmedStopAndFreshFrames() async {
         let fixture = Fixture()
         fixture.suspendSend = true
         await fixture.acquire()
@@ -977,9 +977,9 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
         await fixture.fresh(4, range: 1.6)
         await fixture.fresh(5, range: 1.6)
         await fixture.fresh(6, range: 1.6)
-        XCTAssertEqual(fixture.commands, 1)
-        XCTAssertEqual(fixture.plans, 1)
-        XCTAssertEqual(fixture.coordinator.state, .failed("Ready signal interrupted. Stop and start following again."))
+        XCTAssertEqual(fixture.commands, 2)
+        XCTAssertEqual(fixture.plans, 2)
+        XCTAssertEqual(fixture.coordinator.state, .signalingReady)
         _ = await fixture.coordinator.stop()
     }
 

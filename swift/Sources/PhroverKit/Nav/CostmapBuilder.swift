@@ -48,6 +48,35 @@ public enum CostmapBuilder {
         return result.map
     }
 
+    @MainActor
+    static func planFollowAsync(from anchors: [ARMeshAnchor], start: Vec2, goal: Vec2) async -> FollowPursuitPlan? {
+        let began = ProcessInfo.processInfo.systemUptime
+        let snapshot = captureMesh(from: anchors)
+        let captured = ProcessInfo.processInfo.systemUptime
+        let result = await planCaptured(snapshot, start: start, goal: goal)
+        RuntimeFileLog.append("nav_follow_plan_snapshot", fields: [
+            "mesh_capture_s": String(captured - began),
+            "worker_and_delivery_s": String(ProcessInfo.processInfo.systemUptime - captured),
+            "vertex_count": String(snapshot.worldVertices.count),
+            "outcome": result == nil ? "no_path" : "planned"])
+        return result
+    }
+
+    static func planCaptured(_ snapshot: MeshSnapshot, start: Vec2, goal: Vec2,
+                             compute: @escaping @Sendable (MeshSnapshot, Vec2, Vec2) -> FollowPursuitPlan? = { mesh, start, goal in
+        guard !mesh.worldVertices.isEmpty else { return nil }
+        let map = buildWithObserved(from: mesh, center: start).map
+        guard let path = AStarPlanner().plan(from: start, to: goal, in: map) else { return nil }
+        return .init(path: path, map: map)
+    }) async -> FollowPursuitPlan? {
+        let worker = Task.detached(priority: .userInitiated) { () -> FollowPursuitPlan? in
+            guard !Task.isCancelled else { return nil }
+            let result = compute(snapshot, start, goal)
+            return Task.isCancelled ? nil : result
+        }
+        return await withTaskCancellationHandler { await worker.value } onCancel: { worker.cancel() }
+    }
+
     public struct Params: Sendable {
         public var resolution: Double        // m/cell
         public var size: Double              // m — square window centered on the robot

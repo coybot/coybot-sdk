@@ -140,7 +140,8 @@ public final class NavigationController {
          sourceHighWater: (() -> FollowTurnSourceHighWater?)? = nil,
           sourceHealth: (() -> FollowTurnSourceHealth)? = nil,
           turnPoseEvidence: ((ARFrameID, ARFrameID) -> [FollowTurnBurstPlanner.Sample]?)? = nil,
-         transportUptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+         transportUptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         pursuitPlan: (@MainActor (Vec2, Vec2) async -> FollowPursuitPlan?)? = nil) {
         self.init(ar: ARSessionManager(), control: RoverControl())
         self.genericStop = stopRover
         self.followNavigation = FollowNavigationController(
@@ -151,7 +152,7 @@ public final class NavigationController {
             diagnosticEmitter: diagnosticEmitter, poseSample: poseSample, sourceNow: sourceNow,
             sourceEvents: sourceEvents, sourceStopSnapshot: sourceStopSnapshot,
             sourceHighWater: sourceHighWater, sourceHealth: sourceHealth,
-            turnPoseEvidence: turnPoseEvidence, transportUptime: transportUptime)
+            turnPoseEvidence: turnPoseEvidence, transportUptime: transportUptime, pursuitPlan: pursuitPlan)
         configureFollowFailureDelivery()
     }
 

@@ -99,6 +99,8 @@ public final class FollowMeCoordinator {
     private var alignmentSourceWaiter: CheckedContinuation<Void, Never>?
     private var departureBaseline: Double?
     private var readySignalAttempted = false
+    private var readySignalRecoveryAttempts = 0
+    private var readySignalInterruptedByStalePerception = false
     private var readyPathRecoveryAttempts = 0
     private var activeReadyAdmission: FollowReadyAdmission?
     private var lastFrameTimingUptime = -Double.infinity
@@ -215,6 +217,8 @@ public final class FollowMeCoordinator {
         alignmentConfirmedAfter = nil
         departureBaseline = nil
         readySignalAttempted = false
+        readySignalRecoveryAttempts = 0
+        readySignalInterruptedByStalePerception = false
         readyPathRecoveryAttempts = 0
         pendingAdmission = nil
         activeReadyAdmission = nil
@@ -832,7 +836,21 @@ public final class FollowMeCoordinator {
                             }
                             state = .waitingForMovement
                         } else {
-                            _ = await finish(.failed("Ready signal interrupted. Stop and start following again."))
+                            if readySignalInterruptedByStalePerception,
+                               readySignalRecoveryAttempts < 2,
+                               poseDeadline == nil,
+                               stopTask == nil,
+                               confirmationTask == nil,
+                               !stopBlocked {
+                                readySignalRecoveryAttempts += 1
+                                readySignalInterruptedByStalePerception = false
+                                readySignalAttempted = false
+                                emitReadiness("follow_ready.retry_after_stale_perception",
+                                    reason: "confirmed_stop_fresh_observation_attempt_\(readySignalRecoveryAttempts)")
+                                await signalReady(generation: token)
+                            } else {
+                                _ = await finish(.failed("Ready signal interrupted. Stop and start following again."))
+                            }
                         }
                     } else {
                         state = .aligning
@@ -2012,6 +2030,9 @@ public final class FollowMeCoordinator {
 
     private func perceptionUnavailable(_ issue: FollowPerceptionIssue, generation token: UInt64) async {
         guard generation == token else { return }
+        if state == .signalingReady, issue == .staleFrame {
+            readySignalInterruptedByStalePerception = true
+        }
         if state == .recoveringReadyPath {
             updatePerceptionIssue(issue)
             if issue == .staleFrame, isStoppedReadyRefresh {

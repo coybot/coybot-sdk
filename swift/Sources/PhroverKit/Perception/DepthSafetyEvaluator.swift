@@ -224,10 +224,12 @@ enum DepthSafetyEvaluator {
                           operatorClearedRotation: Bool = false,
                           boundedReadyMotion: Bool = false,
                           visibilityPolicy: FollowDepthPolicy = .fullVolume) -> DepthSafetyObservation {
+        let evaluationStarted = ProcessInfo.processInfo.systemUptime
         var observation = evaluateMotion(snapshot, command: command, now: now,
             operatorClearedRotation: operatorClearedRotation, boundedReadyMotion: boundedReadyMotion,
             astralCompatible: visibilityPolicy == .astralCompatible)
         observation.visibilityPolicy = visibilityPolicy
+        observation.evaluationDuration = ProcessInfo.processInfo.systemUptime - evaluationStarted
         return observation
     }
 
@@ -276,12 +278,16 @@ enum DepthSafetyEvaluator {
         let collisionSections = snapshot.geometry.collisionSections
         let reach = (collisionSections.map {
             hypot(abs($0.forwardOffset) + $0.length / 2, abs($0.lateralOffset) + $0.width / 2 + snapshot.geometry.lateralSafetyMargin)
-        }.max() ?? 0) + cautionDistance + snapshot.cellResolution
+        }.max() ?? 0) + cautionDistance + max(snapshot.cellResolution, cellResolution)
         // Obstacles seen moments ago stay hazards wherever the live camera is now blind.
-        let rememberedHazards = rememberedHazardCells(snapshot: snapshot, reach: reach)
+        var rememberedProjectionCount = 0
+        var collisionCandidateCount = 0
+        let rememberedHazards = rememberedHazardCells(snapshot: snapshot, reach: reach, projectionCount: &rememberedProjectionCount)
         func finalized(_ observation: DepthSafetyObservation) -> DepthSafetyObservation {
             var result = observation
             result.rememberedHazardCellCount = rememberedHazards.count
+            result.collisionCandidateCount = collisionCandidateCount
+            result.rememberedProjectionCount = rememberedProjectionCount
             return result
         }
         func checkingCoverage(_ observation: DepthSafetyObservation, horizon: Double) -> DepthSafetyObservation {
@@ -304,6 +310,8 @@ enum DepthSafetyEvaluator {
             if confirmedRotation {
                 let lateral = (Double(occupiedCell.lateralIndex) + 0.5) * snapshot.cellResolution
                 let forward = (Double(occupiedCell.forwardIndex) + 0.5) * snapshot.cellResolution
+                guard hypot(lateral, forward) <= reach else { continue }
+                collisionCandidateCount += 1
                 let height = (Double(occupiedCell.heightIndex) + 0.5) * snapshot.cellResolution
                 let radii = collisionSections.filter {
                     height + snapshot.cellResolution / 2 >= $0.minimumHeight &&
@@ -319,6 +327,11 @@ enum DepthSafetyEvaluator {
                 continue
             }
             let point = center(of: occupiedCell)
+            // The rover origin moves at most the travelled arc length; every
+            // footprint corner stays within its radius plus voxel padding.
+            // Cells outside this enclosing disc cannot intersect any sweep pose.
+            guard hypot(point.x, point.z) <= reach else { continue }
+            collisionCandidateCount += 1
             if let travel = firstContactTravel(
                 lateral: point.x,
                 height: point.y,
@@ -694,18 +707,38 @@ enum DepthSafetyEvaluator {
     /// Occupied cells from retained frames, re-expressed in the live rover frame,
     /// that the live camera cannot currently see. Where live depth reaches the
     /// spot, live cells already describe it, including an obstacle that has left.
-    private static func rememberedHazardCells(snapshot: DepthSafetySnapshot, reach: Double) -> Set<DepthSafetyCell> {
+    private static func rememberedHazardCells(snapshot: DepthSafetySnapshot, reach: Double,
+                                               projectionCount: inout Int) -> Set<DepthSafetyCell> {
         guard let live = snapshot.projection, !snapshot.history.isEmpty, reach.isFinite else { return [] }
         let geometry = snapshot.geometry
         var result = Set<DepthSafetyCell>()
         for frame in snapshot.history {
             let age = snapshot.timestamp - frame.timestamp
             guard age > 0, age <= DepthVisibilityMemory.maximumAge else { continue }
+            // Reject distant cells in their original planar frame before doing
+            // world transforms and projection work. Ingest produces orthonormal
+            // horizontal axes; custom/malformed projections fall back to the
+            // original world-space checks instead of assuming that contract.
+            let offset = live.roverOrigin - frame.projection.roverOrigin
+            let centerLateral = simd_dot(offset, frame.projection.roverRight)
+            let centerForward = simd_dot(offset, frame.projection.roverForward)
+            let planar = abs(simd_length_squared(frame.projection.roverRight) - 1) < 1e-12 &&
+                abs(simd_length_squared(frame.projection.roverForward) - 1) < 1e-12 &&
+                abs(simd_dot(frame.projection.roverRight, frame.projection.roverForward)) < 1e-12 &&
+                frame.projection.roverRight.y == 0 && frame.projection.roverForward.y == 0
+            // Scale the rounding allowance with world coordinates, including
+            // the permitted near-unit basis error. The exact world check remains.
+            let paddedReach = reach + max(1e-9,
+                (simd_length(live.roverOrigin) + simd_length(frame.projection.roverOrigin) + reach) * 1e-12)
             for cell in frame.cells {
                 let local = SIMD3<Double>(
                     (Double(cell.lateralIndex) + 0.5) * frame.cellResolution,
                     (Double(cell.heightIndex) + 0.5) * frame.cellResolution,
                     (Double(cell.forwardIndex) + 0.5) * frame.cellResolution)
+                if planar, abs(local.x - centerLateral) > paddedReach || abs(local.z - centerForward) > paddedReach {
+                    continue
+                }
+                projectionCount += 1
                 let world = worldPoint(local, in: frame.projection)
                 let relative = world - live.roverOrigin
                 let lateral = simd_dot(relative, live.roverRight)

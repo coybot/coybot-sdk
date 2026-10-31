@@ -481,6 +481,12 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         depthProcessor.submit(.init(rawDepthMap: rawDepthMap, intrinsics: intrinsics,
             imageResolution: intrinsicsImageSize, cameraTransform: cameraTransform, timestamp: timestamp,
             trackingNormal: trackingNormal))
+        if !trackingNormal, latestDepthSafetySnapshot != nil {
+            // Revoke the published pre-loss snapshot as well as worker history;
+            // normal tracking can resume before the next projection completes.
+            latestDepthSafetySnapshot = nil
+            depthSnapshotVersion &+= 1
+        }
     }
 
     func observeDepthSafety(_ observer: @escaping (DepthSafetySnapshot?) -> Void) -> () -> Void {
@@ -497,7 +503,8 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
             return .unavailable(
                 .missingRawDepth,
                 sampleAge: .infinity,
-                motionClass: DepthSafetyMotionClass.classify(command)
+                motionClass: DepthSafetyMotionClass.classify(command),
+                visibilityPolicy: FollowDepthPolicyScope.current
             )
         }
         return DepthSafetyEvaluator.evaluate(

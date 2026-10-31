@@ -44,6 +44,14 @@ enum FollowMotionFailureCause: String, Sendable {
     case readyPathBlocked = "ready_path_blocked"
     case readyMapUnavailable = "ready_map_unavailable"
     case readyMapStale = "ready_map_stale"
+    case readyProbeSourceInvalid = "ready_probe_source_invalid"
+    case readyProbeExpired = "ready_probe_expired"
+    case readyProbeBackwardLimit = "ready_probe_backward_limit"
+    case readyProbeTravelLimit = "ready_probe_travel_limit"
+    case readyProbeLateralDeviation = "ready_probe_lateral_deviation"
+    case readyProbeHeadingDeviation = "ready_probe_heading_deviation"
+    case readyProbeScanTranslation = "ready_probe_scan_translation"
+    case readyProbeInvalidGeometry = "ready_probe_invalid_geometry"
 
     var readyDescription: String? {
         switch self {
@@ -56,6 +64,13 @@ enum FollowMotionFailureCause: String, Sendable {
         case .readyPreSendPoseShift: return "pose changed before the first motor command"
         case .readyInvalidGeometry: return "invalid measured pose geometry"
         case .readyMapStale: return "obstacle-map preparation exceeded the freshness limit"
+        case .readyProbeExpired: return "the floor-check movement authorization expired"
+        case .readyProbeBackwardLimit: return "floor-check backward movement exceeded 5 mm"
+        case .readyProbeTravelLimit: return "floor-check movement exceeded its retained travel limit"
+        case .readyProbeLateralDeviation: return "floor-check sideways drift exceeded 1 cm"
+        case .readyProbeHeadingDeviation: return "floor-check heading exceeded its stage limit"
+        case .readyProbeScanTranslation: return "floor-check turning displacement exceeded 1.5 cm"
+        case .readyProbeInvalidGeometry: return "invalid floor-check command, clock, or pose geometry"
         default: return nil
         }
     }

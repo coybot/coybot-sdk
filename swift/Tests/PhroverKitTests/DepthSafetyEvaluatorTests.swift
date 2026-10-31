@@ -5,6 +5,74 @@ import RoverNav
 @testable import PhroverKit
 
 final class DepthSafetyEvaluatorTests: XCTestCase {
+    func testFarSceneAndTwentyRetainedFramesDoNotConsumeNearMotionWork() throws {
+        var farCells = Set<DepthSafetyCell>()
+        for lateral in -40...40 { for height in 1...10 { for forward in 30...39 {
+            farCells.insert(.init(lateralIndex: lateral, heightIndex: height, forwardIndex: forward))
+        } } }
+        let history = try (1...20).map { try rememberedFrame(back: 0, age: Double($0) * 0.1, cells: farCells) }
+        let live = liveNearBlindSnapshot()
+        var scene = DepthSafetySnapshot(timestamp: 10, cells: farCells, cellResolution: 0.04,
+            validSampleRatio: 1, geometry: geometry, projection: live.projection, failureReason: nil)
+        scene.history = history
+        let command = WheelCommand(left: 0.25, right: 0.25)
+        let observed = DepthSafetyEvaluator.evaluate(scene, command: command, now: 10.21194466701126657,
+            boundedReadyMotion: true, visibilityPolicy: .astralCompatible)
+        XCTAssertEqual(observed.state, .clear)
+        XCTAssertEqual(observed.collisionCandidateCount, 0)
+        XCTAssertEqual(observed.rememberedProjectionCount, 0)
+        XCTAssertEqual(observed.sampleAge, 0.21194466701126657, accuracy: 1e-12)
+        XCTAssertEqual(observed.requiredStoppingDistance, 0.30)
+        XCTAssertEqual(observed.coverage?.coveredPoints, DepthSafetyEvaluator.evaluate(live,
+            command: command, now: 10.21194466701126657, boundedReadyMotion: true,
+            visibilityPolicy: .astralCompatible).coverage?.coveredPoints)
+    }
+
+    func testDistantScenePruningPreservesNearbyHazardsAcrossTranslatedRotatedHistory() throws {
+        let live = liveNearBlindSnapshot()
+        let liveProjection = try XCTUnwrap(live.projection)
+        let targetWorld = liveProjection.roverOrigin + liveProjection.roverForward * 0.10 + SIMD3<Double>(0, 0.06, 0)
+        var farCells = Set<DepthSafetyCell>()
+        for lateral in -20...20 { for height in 1...8 { for forward in 70...79 {
+            farCells.insert(.init(lateralIndex: lateral, heightIndex: height, forwardIndex: forward))
+        } } }
+        for angle in [Float(0), .pi / 2, -.pi / 2, .pi] {
+            var transform = simd_float4x4(simd_quatf(angle: angle, axis: SIMD3(0, 1, 0)))
+            let direction = SIMD3<Double>(-Double(transform.columns.2.x), 0, -Double(transform.columns.2.z))
+            let cameraPosition = liveProjection.roverOrigin - direction * 0.885 + SIMD3<Double>(0, 0.30, 0)
+            transform.columns.3 = SIMD4(Float(cameraPosition.x), Float(cameraPosition.y), Float(cameraPosition.z), 1)
+            let older = DepthSafetyEvaluator.ingest(
+                rawDepthMap: makeDepthBuffer(width: 80, height: 60, constantDepth: 3), intrinsics: ordinaryIntrinsics,
+                cameraTransform: transform, timestamp: 9.5, calibration: RoverConfig.cameraMountCalibration, geometry: geometry)
+            let projection = try XCTUnwrap(older.projection)
+            let relative = targetWorld - projection.roverOrigin
+            let x = Int(floor(simd_dot(relative, projection.roverRight) / 0.04))
+            let z = Int(floor(simd_dot(relative, projection.roverForward) / 0.04))
+            let near = Set((-1...1).map { DepthSafetyCell(lateralIndex: x + $0, heightIndex: 1, forwardIndex: z) })
+            for command in [WheelCommand(left: 0.25, right: 0.25), .init(left: 0.20, right: 0.25),
+                            .init(left: 0.25, right: 0.20), .init(left: -0.25, right: 0.25)] {
+                func evaluate(dense: Bool) -> DepthSafetyObservation {
+                    var snapshot = DepthSafetySnapshot(timestamp: 10, cells: dense ? farCells : [], cellResolution: 0.04,
+                        validSampleRatio: 1, geometry: geometry, projection: live.projection, failureReason: nil)
+                    snapshot.history = [.init(timestamp: 9.5, projection: projection,
+                        cells: dense ? near.union(farCells) : near, cellResolution: 0.04)]
+                    return DepthSafetyEvaluator.evaluate(snapshot, command: command, now: 10.05,
+                        operatorClearedRotation: command.left == -command.right, visibilityPolicy: .astralCompatible)
+                }
+                let sparse = evaluate(dense: false)
+                let dense = evaluate(dense: true)
+                XCTAssertEqual(sparse.state, .stop, "Historical hazard must survive the \(angle) viewpoint")
+                XCTAssertEqual(dense.state, sparse.state)
+                XCTAssertEqual(dense.clearance, sparse.clearance)
+                XCTAssertEqual(dense.supportCount, sparse.supportCount)
+                XCTAssertEqual(dense.requiredStoppingDistance, sparse.requiredStoppingDistance)
+                XCTAssertEqual(dense.rememberedHazardCellCount, sparse.rememberedHazardCellCount)
+                XCTAssertEqual(dense.collisionCandidateCount, sparse.collisionCandidateCount)
+                XCTAssertEqual(dense.rememberedProjectionCount, sparse.rememberedProjectionCount)
+            }
+        }
+    }
+
     func testEnteringSideInteriorIsCheckedEvenWhenItsCornerAlsoBelongsToFront() throws {
         for mirrored in [false, true] {
             let shape = RoverCollisionGeometry(length: 0.30, width: 0.25, minimumCollisionHeight: 0.04,
@@ -821,6 +889,38 @@ final class DepthSafetyEvaluatorTests: XCTestCase {
 
     // MARK: - Follow depth policy (docs/follow-depth-policy.md)
 
+    func testRecordedFiftyEightPercentProjectionIsDiagnosticOnlyInAstralMode() throws {
+        // iPhone 15 Pro, 2026-10-28 18:37:32Z: exact captured projection, not
+        // captured imagery. Synthetic clear depth isolates visibility policy;
+        // obstacle, stale and missing-depth vetoes are tested separately below.
+        let projection = DepthSafetyProjection(width: 256, height: 192,
+            fx: 176.47981770833334, fy: 176.47981770833334, cx: 128.76909993489582, cy: 95.360791015625,
+            depthValues: [Float](repeating: 3, count: 256 * 192),
+            cameraFromWorld: simd_float4x4(columns: (
+                SIMD4(-0.005413723178207874, -0.9993904829025269, -0.03448743745684624, 0),
+                SIMD4(-0.992006778717041, 0.009715255349874496, -0.12581051886081696, 0),
+                SIMD4(0.12606890499591827, 0.03353067487478256, -0.9914547204971313, 0),
+                SIMD4(-0.13229060173034668, -0.1129429042339325, -0.05048505589365959, 1.0000001192092896))),
+            roverOrigin: SIMD3(-0.1123764251525939, -0.4364874094724655, 0.05535976502374017),
+            roverRight: SIMD3(-0.9993955610517431, 0, 0.034763667097581934),
+            roverForward: SIMD3(0.034763667097581934, 0, 0.9993955610517431))
+        let snapshot = DepthSafetySnapshot(timestamp: 142181.038492, cells: [], cellResolution: 0.04,
+            validSampleRatio: 1, geometry: geometry, projection: projection, failureReason: nil)
+        for policy: FollowDepthPolicy in [.fullVolume, .astralCompatible] {
+            let observation = DepthSafetyEvaluator.evaluate(snapshot, command: .init(left: 0.25, right: 0.25),
+                now: snapshot.timestamp + 0.12113945835153572, boundedReadyMotion: true, visibilityPolicy: policy)
+            let coverage = try XCTUnwrap(observation.coverage)
+            XCTAssertEqual(coverage.requiredPoints, 81)
+            XCTAssertEqual(coverage.coveredPoints, 47)
+            XCTAssertEqual(coverage.outsideViewPoints, 34)
+            XCTAssertEqual(coverage.missingDepthPoints, 0)
+            XCTAssertEqual(coverage.occludedPoints, 0)
+            XCTAssertEqual(observation.fullVolumeWouldBlock, true)
+            XCTAssertEqual(observation.visibilityPolicy, policy)
+            XCTAssertEqual(observation.state, policy == .fullVolume ? .unavailable(.blindSweptVolume) : .clear)
+        }
+    }
+
     func testAstralCompatibleDropsOnlyTheVisibilityRequirementAndStillReportsIt() throws {
         let snapshot = liveNearBlindSnapshot()
         let cases: [(String, WheelCommand, Bool)] = [("ready", .init(left: 0.25, right: 0.25), true),
@@ -912,6 +1012,35 @@ final class DepthSafetyEvaluatorTests: XCTestCase {
         XCTAssertEqual(FollowDepthPolicyScope.current, .fullVolume, "The scope never leaks past its read")
         XCTAssertEqual(RoverConfig.followDepthPolicy, .astralCompatible,
             "Default for the current WAVE ROVER mount; change deliberately with docs/follow-depth-policy.md")
+    }
+
+    @MainActor
+    func testMissingDepthKeepsSelectedPolicyInRealProviderAndFollowDiagnostics() async throws {
+        let ar = ARSessionManager()
+        let command = WheelCommand(left: 0.25, right: 0.25)
+        let observation = FollowDepthPolicyScope.$current.withValue(.astralCompatible) {
+            ar.depthSafetyObservation(for: command, at: 10.05)
+        }
+        XCTAssertEqual(observation.state, .unavailable(.missingRawDepth))
+        XCTAssertEqual(observation.visibilityPolicy, .astralCompatible)
+        XCTAssertNil(observation.fullVolumeWouldBlock)
+        XCTAssertEqual(ar.depthSafetyObservation(for: command, at: 10.05).visibilityPolicy, .fullVolume)
+        let sink = FollowDiagnosticRecordingSink()
+        let pose = NavigationPoseSample(pose: .init(position: .zero, yaw: 0),
+            frameID: .init(generation: 1, sequence: 1), sourceTimestamp: 10, trackingQuality: .normal)
+        var sends = 0
+        let controller = FollowNavigationController(currentPose: { pose.pose }, forwardClearance: { 2 },
+            depthSafetyObservation: { ar.depthSafetyObservation(for: $0, at: 10.05) }, plan: { _, goal in [goal] },
+            lastAckAt: { Date() }, sendCommand: { _ in sends += 1 }, stopRover: {}, sleep: { _ in },
+            diagnosticEmitter: .init(streamID: "missing-depth-policy", monotonic: { 10.05 }, utc: { Date() }, sink: sink.append),
+            poseSample: { pose }, sourceNow: { 10.05 }, sourceStopSnapshot: { pose }, depthPolicy: .astralCompatible)
+        _ = await controller.sendFollowTurnBurst(command, requestedBudget: 0.02, purpose: .followReady)
+        XCTAssertEqual(sends, 0)
+        let payload = try XCTUnwrap(sink.records.first { $0.event == "follow_depth.candidate" }?.fields["payload"])
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any])
+        XCTAssertEqual(json["depth_visibility_policy"] as? String, "astral_compatible")
+        XCTAssertEqual(json["depth_state"] as? String, "missing_raw_depth")
+        XCTAssertTrue(json["depth_full_volume_would_block"] is NSNull)
     }
 
     @MainActor

@@ -249,3 +249,33 @@ and rearward offset have been supplied. Chassis height, upper-assembly footprint
 offsets and top height are needed before enabling narrower sections. Photos alone
 do not establish those dimensions, and this diagnostic build does not claim that
 the observed 57% visibility failure is resolved.
+
+## Ready-probe decisions and completion races
+
+The October 29 09:48:54 PDT run failed during floor-check recovery before pursuit.
+AR tracking was reported normal and depth was fresh/clear. Seven probe sends
+were acknowledged; the eighth proposal failed before sending. The old Boolean
+authorization mapped every rejection to `trackingLost`, including motion bounds.
+The rejecting controller pose was not logged, so that run cannot establish the
+exact boundary that failed.
+
+Probe authorization now distinguishes permitted motion, goal already reached,
+invalid source, command/clock errors, expiry, and individual movement bounds.
+A healthy pose at 3–5 cm forward travel within the existing lateral/heading
+limits requests a stopped recheck rather than another pulse or a tracking failure.
+No-op rechecks do not increment pulse counters, fabricate a stop/source fence,
+renew deadlines, or create a return-path grant. Completion still requires a real
+earlier forward pulse, fresh depth and source, and the original probe deadline.
+
+The check is repeated after acknowledgement reads and at transport/source-observer
+boundaries. A transport-denied completion can be retried as a no-op only when both
+the receipt and captured attempt history prove zero HTTP attempts. Unknown,
+entered, or contradictory outcomes retain their failure/stop handling.
+
+`follow_ready.recovery_decision` records the boundary, authority ID, decision,
+actual source frame/time/age/tracking state, original/current poses, along and
+lateral displacement, heading change, and original limits/deadline. Proposed
+probe events carry the same pose metrics. Geometry failures receive floor-check
+messages; `trackingLost` is reserved for invalid pose-source evidence in this path.
+Limits remain 3 cm probe goal, 5 cm maximum travel, 1 cm lateral deviation and
+0.05 rad heading deviation. Physical rover acceptance remains pending.

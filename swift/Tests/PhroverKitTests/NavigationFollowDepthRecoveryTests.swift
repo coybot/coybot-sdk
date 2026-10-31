@@ -620,24 +620,44 @@ final class NavigationFollowDepthRecoveryTests: XCTestCase {
         XCTAssertTrue(fixture.commands.isEmpty)
     }
 
-    func testTransportCannotReuseDepthPastItsOriginalFreshnessDeadline() async {
-        let time = DepthRecoveryTransportClock()
-        var allowedAfterDelay = true
-        let controller = FollowNavigationController(currentPose: { .init(position: .zero, yaw: 0) },
-            forwardClearance: { 5 }, depthSafetyObservation: { command in
-                .init(state: .clear, clearance: 5, supportCount: 5, sampleAge: 0.24,
-                    requiredStoppingDistance: 0.4, motionClass: .classify(command), speedLimit: nil)
-            }, plan: { _, goal in [goal] }, lastAckAt: { Date() }, sendCommand: { _ in },
-            stopRover: {}, sleep: { _ in }, sendCommandReceipt: { _ in
-                time.value += 0.02
-                allowedAfterDelay = FollowTurnBurstTransportScope.authorization!.isAuthorized()
-                return .init(receipt: .init(httpStatus: nil, acknowledged: false,
-                    acknowledgementUTC: nil, attempts: 0, outcome: "expired"),
-                    failure: FollowTurnBurstTransportDenial.expired)
-            }, sourceNow: { time.value }, transportUptime: { time.value })
-        let receipt = await controller.sendFollowTurnBurst(.init(left: -0.25, right: 0.25), requestedBudget: 0.080, purpose: .followScan)
-        XCTAssertEqual(receipt.result.receipt.outcome, "depth_safety_stop")
-        XCTAssertFalse(allowedAfterDelay, "A fresh pose cannot renew the depth snapshot used for motor authorization")
+    func testTransportCannotReuseDepthPastItsOriginalFreshnessDeadline() async throws {
+        for policy: FollowDepthPolicy in [.fullVolume, .astralCompatible] {
+            for delayProvider in [false, true] {
+                let time = DepthRecoveryTransportClock()
+                let sink = FollowDiagnosticRecordingSink()
+                var transportCalls = 0
+                let controller = FollowNavigationController(currentPose: { .init(position: .zero, yaw: 0) },
+                    forwardClearance: { 5 }, depthSafetyObservation: { command in
+                        if delayProvider { time.value += 0.02 }
+                        return .init(state: .clear, clearance: 5, supportCount: 5, sampleAge: 0.24,
+                            requiredStoppingDistance: 0.4, motionClass: .classify(command), speedLimit: nil,
+                            visibilityPolicy: policy)
+                    }, plan: { _, goal in [goal] }, lastAckAt: { Date() }, sendCommand: { _ in XCTFail("No unchecked sender") },
+                    stopRover: {}, sleep: { _ in }, sendCommandReceipt: { _ in
+                        transportCalls += 1
+                        time.value += 0.02
+                        XCTAssertFalse(FollowTurnBurstTransportScope.authorization!.isAuthorized(),
+                            "A fresh pose cannot renew the depth snapshot used for motor authorization")
+                        return .init(receipt: .init(httpStatus: nil, acknowledged: false,
+                            acknowledgementUTC: nil, attempts: 0, outcome: "expired"),
+                            failure: FollowTurnBurstTransportDenial.expired)
+                    }, diagnosticEmitter: .init(streamID: "depth-expiry-policy", monotonic: { time.value }, utc: { Date() }, sink: sink.append),
+                    sourceNow: { time.value }, transportUptime: { time.value }, depthPolicy: policy)
+                let receipt = await controller.sendFollowTurnBurst(.init(left: -0.25, right: 0.25), requestedBudget: 0.080, purpose: .followScan)
+                XCTAssertEqual(receipt.result.receipt.outcome, "depth_safety_stop")
+                XCTAssertEqual(transportCalls, delayProvider ? 0 : 1)
+                let records = try sink.records.compactMap { record -> [String: Any]? in
+                    guard record.event == "follow_depth.candidate", let text = record.fields["payload"] else { return nil }
+                    return try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any]
+                }
+                let expired = try XCTUnwrap(records.first {
+                    $0["depth_candidate_disposition"] as? String == (delayProvider ? "expired_before_send" : "expired_at_transport")
+                })
+                XCTAssertEqual(expired["depth_visibility_policy"] as? String, policy.rawValue)
+                XCTAssertEqual(expired["depth_state"] as? String, "stale_raw_depth")
+                XCTAssertTrue(expired["depth_full_volume_would_block"] is NSNull)
+            }
+        }
     }
 
     func testDepthExpiryShortensActiveBurstAndConfirmsStop() async throws {

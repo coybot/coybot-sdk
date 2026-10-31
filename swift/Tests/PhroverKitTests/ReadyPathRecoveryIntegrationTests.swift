@@ -4,6 +4,160 @@ import RoverNav
 
 @MainActor
 final class ReadyPathRecoveryIntegrationTests: XCTestCase {
+    func testHardSourceVetoCannotBecomeRecoverableObstacleAfterPoseReturnsInBounds() async {
+        let fixture = RecoveryControllerFixture()
+        var injected = false
+        fixture.onDepth = {
+            if fixture.commands.count == 1, !injected, FollowTurnBurstTransportScope.authorization != nil {
+                injected = true
+                fixture.position.y = 0.02
+                fixture.sequence += 1
+                fixture.controller.ingestFollowTurnSource(fixture.snapshot)
+                fixture.position.y = 0
+                fixture.blocked = true
+            }
+        }
+        let result = await fixture.run()
+        XCTAssertTrue(injected)
+        XCTAssertEqual(result.result, .failed(.stalled))
+        XCTAssertEqual(result.context.failureCause?.rawValue, "ready_probe_lateral_deviation")
+        XCTAssertEqual(fixture.commands.count, 1, "A sticky terminal veto cannot authorize return or scanning")
+        XCTAssertEqual(result.stopOutcome, .confirmed)
+    }
+
+    func testBacktrackGoalCrossingAtFinalPreSendCheckHasKnownZeroAttempts() async {
+        let fixture = RecoveryControllerFixture()
+        fixture.obstacleAfter = 0.02
+        var reads = 0
+        var crossed = false
+        fixture.onPoseRead = {
+            if fixture.blocked, fixture.commands.count == 2, !crossed,
+               FollowTurnBurstTransportScope.authorization != nil {
+                reads += 1
+                if reads == 2 {
+                    crossed = true
+                    fixture.position.x = 0.004
+                    fixture.sequence += 1
+                }
+            }
+        }
+        let result = await fixture.run()
+        XCTAssertTrue(crossed)
+        XCTAssertEqual(result.result, .reobservationRequired)
+        XCTAssertNil(result.failure)
+        XCTAssertFalse(fixture.commands.contains { $0.left < 0 && $0.left == $0.right })
+        XCTAssertTrue(fixture.events.contains {
+            $0["ready_recovery_boundary"] as? String == "return_or_scan_sender" &&
+                $0["ready_recovery_decision"] as? String == "goal_reached"
+        })
+    }
+
+    func testQueuedGoalCompletionRequiresProofOfZeroTransportAttempts() async {
+        enum TransportEvidence: CaseIterable { case zeroAttempts, unknown, entered, contradictory }
+        for mode in TransportEvidence.allCases {
+            let canSkip = mode == .zeroAttempts
+            let fixture = RecoveryControllerFixture(usesReceipts: mode != .unknown)
+            fixture.denialAttempts = mode == .entered ? 1 : 0
+            var crossed = false
+            fixture.beforeSend = {
+                if fixture.commands.count == 2, !crossed {
+                    if mode == .contradictory, let authorization = FollowTurnBurstTransportScope.authorization {
+                        authorization.didEnterAttempt?(.init(operationID: authorization.operationID, attempt: 1, entryUptime: fixture.time))
+                    }
+                    crossed = true
+                    fixture.position.x = 0.031
+                    fixture.sequence += 1
+                    fixture.controller.ingestFollowTurnSource(fixture.snapshot)
+                }
+            }
+            let result = await fixture.run()
+            XCTAssertTrue(crossed)
+            XCTAssertEqual(result.result, canSkip ? .arrived : .failed(.commandFailed))
+            XCTAssertEqual(result.stopOutcome, .confirmed)
+            if canSkip {
+                XCTAssertTrue(fixture.boundaries.contains(.controllerFirstSend))
+                XCTAssertEqual(fixture.sentBoundaries.filter { $0 == .recoveryProbeSend }.count, 2)
+            } else {
+                XCTAssertEqual(fixture.commands.count, 2, "Unknown transport outcomes cannot be called an unsent completion")
+            }
+        }
+    }
+
+    func testProbeGoalReachedDuringAcknowledgementReadDoesNotSendAnotherProbeOrLoseTracking() async {
+        let fixture = RecoveryControllerFixture()
+        var crossed = false
+        fixture.onDepth = {
+            if fixture.commands.count == 2, !crossed, FollowTurnBurstTransportScope.authorization == nil {
+                fixture.onAck = {
+                    crossed = true
+                    fixture.position.x = 0.031
+                    fixture.onAck = nil
+                }
+            }
+        }
+        fixture.beforeSend = {
+            if crossed, fixture.commands.count == 2 {
+                XCTAssertEqual(fixture.boundaries.last, .controllerFirstSend,
+                    "The next command must belong to remaining ready motion, not a third probe")
+            }
+        }
+        let result = await fixture.run()
+        XCTAssertTrue(crossed)
+        XCTAssertEqual(result.result, .arrived)
+        XCTAssertNil(result.failure)
+        XCTAssertEqual(result.stopOutcome, .confirmed)
+        XCTAssertTrue(fixture.boundaries.contains(.controllerFirstSend))
+        XCTAssertLessThanOrEqual(fixture.position.x, 0.12)
+    }
+
+    func testHealthyPoseOutsideProbeCorridorIsNotReportedAsARTrackingLoss() async {
+        let fixture = RecoveryControllerFixture()
+        var shifted = false
+        fixture.onDepth = {
+            if fixture.commands.count == 2, !shifted, FollowTurnBurstTransportScope.authorization == nil {
+                fixture.onAck = {
+                    shifted = true
+                    fixture.position.y = 0.02
+                    fixture.onAck = nil
+                }
+            }
+        }
+        let result = await fixture.run()
+        XCTAssertTrue(shifted)
+        XCTAssertEqual(result.result, .failed(.stalled))
+        XCTAssertEqual(result.context.failureCause?.rawValue, "ready_probe_lateral_deviation")
+        XCTAssertEqual(fixture.commands.count, 2)
+        XCTAssertEqual(result.stopOutcome, .confirmed)
+        let rejected = fixture.events.last { $0["event"] as? String == "follow_ready.recovery_decision" }
+        XCTAssertEqual(rejected?["ready_recovery_decision"] as? String, "lateral_limit")
+        XCTAssertEqual(rejected?["ready_recovery_boundary"] as? String, "after_acknowledgement")
+        XCTAssertEqual(rejected?["ready_recovery_lateral_m"] as? Double ?? 0, 0.02, accuracy: 1e-9)
+        XCTAssertEqual(rejected?["ready_recovery_tracking"] as? String, "normal")
+    }
+
+    func testTransientBackwardPoseJumpIsRecheckedWhileStopped() async {
+        let fixture = RecoveryControllerFixture()
+        var injected = false
+        var restored = false
+        fixture.onWait = {
+            guard fixture.commands.count == 1, !restored else { return }
+            if !injected {
+                injected = true
+                fixture.position.x = -0.01
+                fixture.sequence += 1
+            } else {
+                restored = true
+                fixture.position.x = 0
+                fixture.sequence += 1
+            }
+        }
+        let result = await fixture.run()
+        XCTAssertTrue(injected)
+        XCTAssertTrue(restored)
+        XCTAssertEqual(result.result, .arrived)
+        XCTAssertEqual(result.stopOutcome, .confirmed)
+    }
+
     func testStoppedRefreshRequiresBothFreshDepthAndFreshTargetBeforeFirstPulse() async {
         let fixture = RecoveryControllerFixture()
         fixture.rawDepthTimestamp = 10 - 0.272
@@ -202,6 +356,9 @@ private final class RecoveryControllerFixture {
     var maximumX = 0.0
     var commands: [WheelCommand] = []
     var boundaries: [FollowReadyAdmissionBoundary] = []
+    var sentBoundaries: [FollowReadyAdmissionBoundary?] = []
+    var events: [[String: Any]] = []
+    var denialAttempts = 0
     var obstacleAfter = Double.infinity
     var blocked = false
     var unavailable = false
@@ -215,13 +372,15 @@ private final class RecoveryControllerFixture {
     var freshDepthAt: Double?
     var onWait: (() -> Void)?
     var onAck: (() -> Void)?
+    var onPoseRead: (() -> Void)?
     var perceptionFreshAt = -Double.infinity
     var observationLifetime = Double.infinity
     var snapshot: NavigationPoseSample {
-        .init(pose: .init(position: position, yaw: yaw), frameID: .init(generation: generation, sequence: sequence),
+        onPoseRead?()
+        return .init(pose: .init(position: position, yaw: yaw), frameID: .init(generation: generation, sequence: sequence),
             sourceTimestamp: time - 0.001, trackingQuality: .normal)
     }
-    init(mappedObstacle: Bool = true) {
+    init(mappedObstacle: Bool = true, usesReceipts: Bool = false) {
         let transportClock = self.transportClock
         var map = Costmap(width: 120, height: 120, resolution: 0.10, origin: .init(-6, -6))
         let cell = map.worldToCell(.zero)
@@ -251,18 +410,7 @@ private final class RecoveryControllerFixture {
                     motionClass: .classify(command), speedLimit: nil)
             }, plan: { _, goal in [goal] }, readySignalCostmap: { _ in capturedMap },
             lastAckAt: { self.onAck?(); return Date(timeIntervalSince1970: self.time) }, sendCommand: { command in
-                self.beforeSend?()
-                if let authority = FollowTurnBurstTransportScope.authorization, !authority.isAuthorized() {
-                    throw FollowTurnBurstTransportDenial.fenced
-                }
-                self.commands.append(command)
-                if command.left == command.right {
-                    self.position.x += command.left > 0 ? 0.01 : -0.01
-                } else { self.yaw += 0.15 }
-                self.minimumX = min(self.minimumX, self.position.x)
-                self.maximumX = max(self.maximumX, self.position.x)
-                self.time += 0.03
-                self.sequence += 1
+                try self.send(command)
             }, stopRover: {
                 if self.failStopAfterMovement, !self.commands.isEmpty { throw URLError(.timedOut) }
                 self.time += 0.001
@@ -272,8 +420,35 @@ private final class RecoveryControllerFixture {
                 self.controller.ingestFollowTurnSource(self.snapshot)
                 self.onWait?()
                 await Task.yield()
-            }, now: { Date(timeIntervalSince1970: self.time) }, poseSample: { self.snapshot },
+            }, now: { Date(timeIntervalSince1970: self.time) }, sendCommandReceipt: usesReceipts ? { @MainActor command in
+                do {
+                    try self.send(command)
+                    return .init(receipt: .init(httpStatus: 200, acknowledged: true, acknowledgementUTC: Date(),
+                        attempts: 1, outcome: "acknowledged"), failure: nil)
+                } catch {
+                    return .init(receipt: .init(httpStatus: nil, acknowledged: false, acknowledgementUTC: nil,
+                        attempts: self.denialAttempts, outcome: "fenced"), failure: error)
+                }
+            } : nil, diagnosticEmitter: .init(streamID: "ready-recovery", monotonic: { self.time }, utc: { Date() }, sink: { _, fields in
+                if let text = fields["payload"], let json = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] {
+                    self.events.append(json)
+                }
+            }), poseSample: { self.snapshot },
             sourceNow: { self.time }, sourceStopSnapshot: { self.snapshot }, transportUptime: { transportClock.now })
+    }
+    private func send(_ command: WheelCommand) throws {
+        beforeSend?()
+        if let authority = FollowTurnBurstTransportScope.authorization, !authority.isAuthorized() {
+            throw FollowTurnBurstTransportDenial.fenced
+        }
+        commands.append(command)
+        sentBoundaries.append(FollowReadyAdmissionScope.current?.boundary)
+        if command.left == command.right { position.x += command.left > 0 ? 0.01 : -0.01 }
+        else { yaw += 0.15 }
+        minimumX = min(minimumX, position.x)
+        maximumX = max(maximumX, position.x)
+        time += 0.03
+        sequence += 1
     }
     func run() async -> FollowMotionResult {
         let admission = FollowReadyAdmission(allowsPathRecovery: true, validating: { _, _ in

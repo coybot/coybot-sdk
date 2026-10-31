@@ -195,10 +195,15 @@ struct DepthSafetyObservation: Equatable, Sendable {
     var visibilityPolicy: FollowDepthPolicy = .fullVolume
     /// Whether the 90% visibility requirement fails for this command, under either policy.
     var fullVolumeWouldBlock: Bool?
+    /// Work performed by the evaluator, not evidence of physical clearance.
+    var collisionCandidateCount: Int?
+    var rememberedProjectionCount: Int?
+    var evaluationDuration: TimeInterval?
 
     static func unavailable(_ reason: DepthSafetyUnavailableReason,
-                            sampleAge: TimeInterval,
-                            motionClass: DepthSafetyMotionClass) -> DepthSafetyObservation {
+                             sampleAge: TimeInterval,
+                            motionClass: DepthSafetyMotionClass,
+                            visibilityPolicy: FollowDepthPolicy = .fullVolume) -> DepthSafetyObservation {
         DepthSafetyObservation(
             state: .unavailable(reason),
             clearance: .infinity,
@@ -206,7 +211,8 @@ struct DepthSafetyObservation: Equatable, Sendable {
             sampleAge: sampleAge,
             requiredStoppingDistance: 0,
             motionClass: motionClass,
-            speedLimit: nil
+            speedLimit: nil,
+            visibilityPolicy: visibilityPolicy
         )
     }
 }

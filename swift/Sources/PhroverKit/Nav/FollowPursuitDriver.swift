@@ -18,6 +18,7 @@ struct FollowPursuitPlan: Sendable {
 struct FollowPursuitSendFailure: Error {
     let reason: NavigationFailure
     var definitelyUnsent = false
+    var authorizationExpired = false
 }
 
 /// One follow owner, one worker, and a newest-only goal mailbox. Planning never
@@ -61,6 +62,7 @@ final class FollowPursuitDriver {
     private let guardLayer = ObstacleGuard()
     private var job: Job?
     private var active = true
+    private var lastPlanStarted = -Double.infinity
     private(set) var revision: UInt64 = 0
     private(set) var goal: Vec2
     private(set) var acceptingGoals = true
@@ -87,6 +89,7 @@ final class FollowPursuitDriver {
         guard job == nil, let pose = source.pose else { return }
         let next = Job(revision: revision, goal: goal, source: source, started: environment.uptime())
         job = next
+        lastPlanStarted = next.started
         environment.emit("planning_started", ["goal_x": .number(goal.x), "goal_z": .number(goal.y),
             "revision": .number(Double(revision)), "reason": .string(reason)])
         let plan = environment.plan
@@ -114,11 +117,31 @@ final class FollowPursuitDriver {
         var movementActive = false
         var refreshDeadline: Double?
         var refreshReason = DepthSafetyUnavailableReason.staleRawDepth
+        var expiryRecoveries = 0
+        var refreshAfter: (frame: ARFrameID?, time: Double)?
         var progress = DriveProgressWatchdog(timeout: 2.5, minimumProgress: 0.05)
         var previousPosition: Vec2?
         var previousGoal: Vec2?
         var approach = 0.0
         var lastDiagnostic = -Double.infinity
+
+        func recoverExpiredCommand(expiry: Double) async -> NavigationFailure? {
+            guard expiryRecoveries < 2 else { return .depthUnavailable(.staleRawDepth) }
+            if refreshDeadline == nil {
+                refreshDeadline = min(sent ? .infinity : began + Self.initialAdmissionTimeout,
+                    environment.uptime() + Self.depthRefreshLimit)
+            }
+            expiryRecoveries += 1
+            environment.emit("authorization_expired", ["recovery_attempt": .number(Double(expiryRecoveries)),
+                "refresh_deadline_s": .number(refreshDeadline!), "command_valid_until_s": .number(expiry),
+                "evaluated_at_s": .number(environment.uptime()), "reason": .string("command_authorization_expired"),
+                "transport_attempts": .number(0)])
+            do { try await environment.stop() } catch { return .commandFailed }
+            movementActive = false
+            refreshAfter = (environment.pose().frameID, environment.uptime())
+            environment.emit("depth_refresh_stop_confirmed", [:])
+            return nil
+        }
 
         while owned {
             let tick = environment.uptime()
@@ -128,6 +151,13 @@ final class FollowPursuitDriver {
                   let pose = source.pose else { return .failed(.trackingLost) }
             if !sent, tick >= began + Self.initialAdmissionTimeout { return .failed(.noPath) }
             if let refreshDeadline, tick >= refreshDeadline { return .failed(.depthUnavailable(refreshReason)) }
+            if let boundary = refreshAfter {
+                guard let timestamp = source.sourceTimestamp, timestamp > boundary.time,
+                      let frame = source.frameID, let previous = boundary.frame,
+                      frame.generation == previous.generation, frame.sequence > previous.sequence else {
+                    await environment.sleep(.milliseconds(20)); continue
+                }
+            }
             if let job {
                 guard tick >= job.started, tick < job.started + Self.planningTimeout else { return .failed(.noPath) }
                 if job.completed {
@@ -151,7 +181,8 @@ final class FollowPursuitDriver {
                 }
             }
             guard owned else { return .cancelled }
-            if job == nil, route == nil || routeRevision != revision || tick - lastPlan >= 1 {
+            if job == nil, (!sent || tick - lastPlanStarted >= 0.5),
+               route == nil || routeRevision != revision || tick - lastPlan >= 1 {
                 beginPlan(from: source, reason: route == nil ? "startup" : (routeRevision != revision ? "live_goal" : "periodic"))
             }
 
@@ -210,7 +241,7 @@ final class FollowPursuitDriver {
             }
             if unavailable == nil, !depthExpiry.isFinite || environment.uptime() >= depthExpiry { unavailable = .staleRawDepth }
             if let unavailable {
-                guard !sent, unavailable == .staleRawDepth || unavailable == .missingRawDepth else {
+                guard (!sent || refreshAfter != nil), unavailable == .staleRawDepth || unavailable == .missingRawDepth else {
                     return .failed(.depthUnavailable(unavailable))
                 }
                 refreshReason = unavailable
@@ -239,7 +270,10 @@ final class FollowPursuitDriver {
             let ackExpiry = ack.map { sendTime + RoverConfig.commsWatchdogTimeout - environment.date().timeIntervalSince($0) } ?? sendTime
             let expiry = min(depthExpiry, finalSource.sourceTimestamp.map { $0 + 0.5 } ?? .infinity,
                 ackExpiry, sent ? .infinity : began + Self.initialAdmissionTimeout, refreshDeadline ?? .infinity)
-            guard sendTime < expiry else { return .failed(.depthUnavailable(.staleRawDepth)) }
+            guard sendTime < expiry else {
+                if let failure = await recoverExpiredCommand(expiry: expiry) { return .failed(failure) }
+                continue
+            }
             if sendTime - lastDiagnostic >= 0.5 {
                 lastDiagnostic = sendTime
                 environment.emit("drive_tick", ["goal_x": .number(routeGoal.x), "goal_z": .number(routeGoal.y),
@@ -251,11 +285,18 @@ final class FollowPursuitDriver {
             if refreshDeadline != nil { environment.emit("depth_wait_recovered", [:]) }
             environment.moving()
             guard owned, revision == sendRevision else { continue }
-            guard environment.uptime() < expiry else { return .failed(.depthUnavailable(.staleRawDepth)) }
+            guard environment.uptime() < expiry else {
+                if let failure = await recoverExpiredCommand(expiry: expiry) { return .failed(failure) }
+                continue
+            }
             do { try await environment.send(safeCommand, expiry) }
             catch {
                 guard owned else { return .cancelled }
                 if let rejected = error as? FollowPursuitSendFailure {
+                    if rejected.definitelyUnsent, rejected.authorizationExpired {
+                        if let failure = await recoverExpiredCommand(expiry: expiry) { return .failed(failure) }
+                        continue
+                    }
                     if rejected.definitelyUnsent, revision != sendRevision { continue }
                     return .failed(rejected.reason)
                 }
@@ -265,6 +306,7 @@ final class FollowPursuitDriver {
             sent = true
             movementActive = true
             refreshDeadline = nil
+            refreshAfter = nil
             await environment.sleep(.milliseconds(100))
         }
         return .cancelled

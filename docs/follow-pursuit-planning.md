@@ -21,6 +21,10 @@ plan), and live-goal updates. A job has a fixed one-second deadline. Results fro
 replaced goals, owners or AR generations cannot authorize motion. Initial planning
 and admission share a two-second outer limit, so goal churn cannot wait forever.
 
+After first movement, planning starts are spaced at least 500 ms apart. Goal
+updates still coalesce to the newest revision; safety checks and driving continue
+while a replan is throttled or pending.
+
 Only the exact current goal revision can commit a plan. Before first movement,
 the source must be healthy/fresh, the path endpoint must match the requested goal,
 and the current pose must connect to the captured map's path. The control loop
@@ -56,6 +60,16 @@ Hard depth faults and hazards do not get this grace. After motion has begun,
 stale depth remains a stop/failure; it never permits continuing on cached evidence.
 The existing `astral_compatible`/`full_volume` policy selection is preserved.
 
+An expired command authorization is distinct from a stale depth observation.
+When an expired command is proven unsent (zero attempts in both the receipt and
+transport capture), pursuit confirms a new stop before re-observing. It requires
+a newer same-generation frame captured after that stop, rechecks all normal
+guards, and computes a new command with new authority. The old command's expiry
+is never extended. The fixed 600 ms refresh window includes stop time and cannot
+be renewed by repeated expiry; at most two expiry recoveries are allowed per
+pursuit operation. Uncertain sends, failed stops, source faults and hazards still
+terminate. The original startup and progress deadlines remain in force.
+
 Retargeting after an unsuccessful send is allowed without another stop only when
 the receipt and captured attempt history both prove zero HTTP attempts. An
 attempted or uncertain send failure terminates and confirms a stop, even if the
@@ -71,6 +85,9 @@ owner responsible for its cleanup stop.
 - `follow_pursuit.planning_started`, `planning_completed`, `planning_superseded`:
   operation-correlated planning lifecycle and revision.
 - `follow_pursuit.depth_wait_started`, `depth_wait_recovered`: bounded refresh.
+- `follow_pursuit.authorization_expired`: original command deadline, evaluation
+  time, zero-attempt evidence and fixed recovery deadline.
+- `follow_pursuit.depth_refresh_stop_confirmed`: expiry recovery has confirmed stop.
 - `follow_pursuit.drive_tick`: committed/requested goal, revisions, pending worker,
   wheels and original depth expiry, at most twice per second.
 

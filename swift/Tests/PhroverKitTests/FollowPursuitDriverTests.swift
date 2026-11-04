@@ -47,7 +47,10 @@ final class FollowPursuitDriverTests: XCTestCase {
         f.holdPlanNumber = 2
         f.failStopNumber = 2
         f.afterSend = {
-            if f.commands.count == 1 { XCTAssertTrue(f.controller.updateFollowGoal(Vec2(0, 5))) }
+            if f.commands.count == 1 {
+                f.clock.value += 0.5
+                XCTAssertTrue(f.controller.updateFollowGoal(Vec2(0, 5)))
+            }
         }
         let result = await f.run()
         XCTAssertEqual(result.result, .failed(.commandFailed))
@@ -66,6 +69,7 @@ final class FollowPursuitDriverTests: XCTestCase {
         f.afterSend = {
             if f.commands.count == 1 {
                 f.arrival = Vec2(0, 5)
+                f.clock.value += 0.5
                 XCTAssertTrue(f.controller.updateFollowGoal(f.arrival))
             }
         }
@@ -140,6 +144,97 @@ final class FollowPursuitDriverTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(f.firstSendTime ?? 0, 10.15)
         XCTAssertGreaterThan(f.depthReads, 1)
         XCTAssertGreaterThanOrEqual(f.stops, 2)
+    }
+
+    func testMovingGoalUpdatesThrottlePlanningWithoutBlockingDriving() async {
+        let f = Fixture()
+        var planningTimes: [Double] = []
+        f.planProvider = { _, goal in
+            planningTimes.append(f.time)
+            return .init(path: [goal])
+        }
+        f.onSend = { _ in
+            _ = f.driver.updateGoal(Vec2(5 + Double(f.commands.count) * 0.1, 0))
+            if f.time >= 11.2 { f.allowed = false }
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .cancelled)
+        XCTAssertGreaterThan(planningTimes.count, 1)
+        for (previous, current) in zip(planningTimes, planningTimes.dropFirst()) {
+            XCTAssertGreaterThanOrEqual(current - previous, 0.5)
+        }
+        XCTAssertGreaterThan(f.commands.count, planningTimes.count)
+    }
+
+    func testTransportExpiryStopsBeforeRebuildingFreshCommand() async {
+        let f = ControllerFixture()
+        var attempts = 0
+        var stopsAtExpiry = 0
+        f.beforeAttempt = {
+            attempts += 1
+            if attempts == 1 {
+                stopsAtExpiry = f.stops
+                f.clock.value += 0.30
+            } else {
+                XCTAssertGreaterThan(f.stops, stopsAtExpiry)
+            }
+        }
+        let result = await f.run()
+        XCTAssertEqual(result.result, .arrived)
+        XCTAssertEqual(attempts, 2)
+        XCTAssertEqual(f.commands.count, 1)
+        XCTAssertEqual(result.stopOutcome, .confirmed)
+    }
+
+    func testExpiryRecoveryCannotContinueAfterFailedStopOrNewObstacle() async {
+        for stopFails in [true, false] {
+            let f = ControllerFixture()
+            f.beforeAttempt = {
+                f.beforeAttempt = nil
+                f.clock.value += 0.30
+            }
+            if stopFails { f.failStopNumber = 2 }
+            else { f.onStop = { if f.stops == 2 { f.obstacle = true } } }
+            let result = await f.run()
+            XCTAssertEqual(result.result, .failed(stopFails ? .commandFailed : .obstacle))
+            XCTAssertTrue(f.commands.isEmpty)
+        }
+    }
+
+    func testExpiryRecoveryRequiresANewFrameWithinFixedWindow() async {
+        let f = ControllerFixture()
+        f.beforeAttempt = {
+            f.beforeAttempt = nil
+            f.clock.value += 0.30
+            f.sleepHandler = { _ in f.clock.value += 0.02; await Task.yield() }
+        }
+        let result = await f.run()
+        XCTAssertEqual(result.result, .failed(.depthUnavailable(.staleRawDepth)))
+        XCTAssertTrue(f.commands.isEmpty)
+        XCTAssertLessThan(f.clock.value, 11.0)
+        XCTAssertEqual(result.stopOutcome, .confirmed)
+    }
+
+    func testExpiryRecoveryAfterMovingStopsBeforeNextNonzeroCommand() async {
+        let f = ControllerFixture()
+        f.arrival = .zero
+        var expired = false
+        var stopCount = 0
+        f.beforeAttempt = {
+            if f.commands.count == 1, !expired {
+                expired = true
+                stopCount = f.stops
+                f.clock.value += 0.30
+            } else if expired {
+                XCTAssertGreaterThan(f.stops, stopCount)
+                f.arrival = Vec2(5, 0)
+            }
+        }
+        let result = await f.run()
+        XCTAssertTrue(expired)
+        XCTAssertEqual(result.result, .arrived)
+        XCTAssertEqual(f.commands.count, 2)
+        XCTAssertEqual(result.stopOutcome, .confirmed)
     }
 
     func testRealControllerRejectsDepthExpiryAndNewObstacleAtTransport() async {

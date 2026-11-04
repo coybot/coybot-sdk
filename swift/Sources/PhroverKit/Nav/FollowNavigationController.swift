@@ -495,7 +495,10 @@ final class FollowNavigationController {
                     entry + max(0, $0.deadline - $0.now())
                 } ?? .infinity)
                 guard fence.arm(entry: entry, budget: expiry - entry) != nil,
-                      fence.publishValidity(from: entry, untilExclusive: expiry) else { throw FollowTurnBurstTransportDenial.expired }
+                       fence.publishValidity(from: entry, untilExclusive: expiry) else {
+                    throw FollowPursuitSendFailure(reason: .depthUnavailable(.staleRawDepth),
+                        definitelyUnsent: true, authorizationExpired: true)
+                }
                 self.pursuitCommandFence = fence
                 defer {
                     fence.inhibit()
@@ -512,7 +515,8 @@ final class FollowNavigationController {
                               self.readFollowPose().rejection(at: self.sourceNow(), expectedGeneration: source.frameID?.generation) == nil else {
                             fence.inhibit(); return false
                         }
-                        switch self.exactDepthDecision(command, disposition: "pursuit_transport") {
+                         guard fence.authorized(at: uptime()) else { return false }
+                         switch self.exactDepthDecision(command, disposition: "pursuit_transport") {
                         case .allow(let accepted, _) where accepted == command: break
                         case .allow: depthFailure = .obstacle
                         case .stopDepth(let observation): depthFailure = self.recordDepthRejection(observation)
@@ -541,7 +545,8 @@ final class FollowNavigationController {
                         result.receipt.attempts == 0 && result.receipt.httpStatus == nil && result.receipt.acknowledged == false &&
                         transport.attempts.isEmpty && ["expired", "fenced", "cancelled"].contains(result.receipt.outcome)
                     throw FollowPursuitSendFailure(reason: depthFailure ??
-                        (denial == .expired ? .depthUnavailable(.staleRawDepth) : .commandFailed), definitelyUnsent: unsent)
+                         (denial == .expired ? .depthUnavailable(.staleRawDepth) : .commandFailed), definitelyUnsent: unsent,
+                         authorizationExpired: depthFailure == nil && denial == .expired)
                 }
             }, stop: { try await self.rotationStop(origin: "cleanup") }, sleep: { await self.sleep($0) }, publishPath: { self.path = $0 }, moving: {
                 if self.state != .driving { self.state = .driving; self.publishSafetyState(.moving) }

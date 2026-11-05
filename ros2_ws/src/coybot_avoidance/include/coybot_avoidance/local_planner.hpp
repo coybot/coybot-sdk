@@ -20,9 +20,9 @@
 // No valid plan: keep the current reference while it is clear; if it meets the map nearer than the stopping
 // distance v^2 / (2 brake_acc) + v brake_latency_s + brake_margin_m, replace it with a straight stop at brake_acc.
 //
-// Map: voxels of map_res_m; a voxel is occupied after hit_count depth hits and grows a sphere of inflate_m as it
-// becomes occupied. Nothing is ever cleared (static scenes). The map covers a box around start and goal, fixed
-// when the goal is set; outside it counts as blocked.
+// Map: voxels of map_res_m with log-odds occupancy (VoxelMap): depth returns mark voxels, rays through them clear
+// them, so noisy returns do not stay as phantom obstacles. An occupied voxel blocks a sphere of inflate_m around it.
+// The map covers a box around start and goal, fixed when the goal is set; outside it counts as blocked.
 //
 // Units: m, s, rad, kg, N; positions in one world frame (ENU in the ROS node), z up.
 #pragma once
@@ -44,9 +44,10 @@ struct Params
   double lead_s = 0.15;           // a new plan starts this far ahead on the current reference
   double map_res_m = 0.1;
   double inflate_m = 0.8;         // keep-out from any seen surface (vehicle radius included)
-  int hit_count = 2;              // depth hits before a voxel counts as occupied
+  int hit_count = 2;              // returns before an unknown voxel counts as occupied
+  bool clear_rays = true;         // each return also clears the voxels its ray passes through
   double max_range_m = 15.0;      // depth beyond this is ignored
-  int skip_pixel = 2;             // use every n-th depth pixel in each direction
+  int skip_pixel = 4;             // use every n-th depth pixel in each direction (returns and clearing rays)
   double slab_m = 1.0;            // plans stay within +- slab_m of the goal altitude
   double rrt_timeout_s = 0.02;
   double rrt_retry_timeout_s = 0.1;  // second route search when the first does not reach the local goal
@@ -82,13 +83,29 @@ struct Params
   double map_top_m = 2.5;         // map extends from z = 0 to goal altitude + this
 };
 
-// Occupancy grid with growth: 0 free or unknown, 1 occupied, 2 within inflate_m of an occupied voxel.
+// Occupancy grid with clearing and growth. Each voxel holds a log-odds occupancy (OctoMap's model): a depth return
+// adds l_hit, a ray passing through adds l_miss, clamped to [l_min, l_max]; a voxel is occupied when its log-odds
+// exceeds (hit_count - 0.5) l_hit, i.e. hit_count returns from an unknown start. Each voxel also counts the
+// occupied voxels within inflate_m; query(): 0 free or unknown, 1 occupied, 2 within inflate_m of an occupied voxel.
+// Voxels freed by clearing take their keep-out with them.
+struct LogOdds
+{
+  double hit = 0.85, miss = -0.4, min = -2.0, max = 3.5;  // OctoMap defaults: P 0.7 / 0.4, clamp 0.12 / 0.97
+};
+
 class VoxelMap
 {
 public:
-  bool ready() const { return !v_.empty(); }
-  void init(const Eigen::Vector3d &lo, const Eigen::Vector3d &hi, double res, double inflate, int hit_count);
+  bool ready() const { return !lo_.empty(); }
+  void init(const Eigen::Vector3d &lo, const Eigen::Vector3d &hi, double res, double inflate, int hit_count,
+            const LogOdds &l = LogOdds());
+  // One return at p (no clearing).
   void hit(const Eigen::Vector3d &p);
+  // A depth frame: hits first (each voxel once per frame), then rays clear the voxels they pass through, except
+  // the end voxel and any voxel hit in this frame.
+  void beginFrame();
+  void frameHit(const Eigen::Vector3d &p);
+  void frameRay(const Eigen::Vector3d &from, const Eigen::Vector3d &to);
   // 0 = free (sfc_gen::planPath's convention); outside the map counts as blocked.
   int query(const Eigen::Vector3d &p) const;
   // Boundary voxels of the grown region inside a box (the points FIRI keeps corridors away from), every other z.
@@ -111,12 +128,18 @@ private:
   {
     return o_ + (id.cast<double>().array() + 0.5).matrix() * res_;
   }
+  void update(const Eigen::Vector3i &id, int dq);   // add dq (quantised log-odds) and keep the growth counts
+  bool occupied(size_t a) const { return lo_[a] > occ_q_; }
   Eigen::Vector3d o_ = Eigen::Vector3d::Zero();
   double res_ = 0.1;
   Eigen::Vector3i n_ = Eigen::Vector3i::Zero();
-  std::vector<uint8_t> v_, hits_;
+  // log-odds quantised in 1/16 (int8: -8 .. 7.9), growth counts, last frame that touched the voxel
+  std::vector<int8_t> lo_;
+  std::vector<uint16_t> grow_;
+  std::vector<uint8_t> seen_;
+  uint8_t frame_ = 0;
+  int hit_q_ = 14, miss_q_ = -6, min_q_ = -32, max_q_ = 56, occ_q_ = 20;
   std::vector<Eigen::Vector3i> ball_;
-  int hit_count_ = 2;
 };
 
 // A reference sampled every dt from t0: position, velocity, acceleration, clamped at the ends (at rest after).

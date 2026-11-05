@@ -12,9 +12,10 @@ avoidance_planner:
     lead_s: 0.15
     map_res: 0.1
     inflate_m: 0.8            # keep-out from any seen surface, vehicle radius included
-    hit_count: 2
+    hit_count: 2              # returns before an unknown voxel counts as occupied (log-odds, OctoMap's model)
+    clear_rays: true          # each return also clears the voxels its ray passes through
     max_range_m: 15.0
-    skip_pixel: 2
+    skip_pixel: 4             # every n-th depth pixel, returns and clearing rays
     slab_m: 1.0               # plans stay within +- this of the goal altitude
     rrt_timeout_s: 0.02
     rrt_retry_timeout_s: 0.1  # when the first route search stops short of the local goal

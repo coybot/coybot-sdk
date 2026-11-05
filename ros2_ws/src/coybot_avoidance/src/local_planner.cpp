@@ -31,21 +31,45 @@ const char *to_string(Outcome o)
 
 // ---------------------------------------------------------------- VoxelMap
 
-void VoxelMap::init(const Eigen::Vector3d &lo, const Eigen::Vector3d &hi, double res, double inflate, int hit_count)
+void VoxelMap::init(const Eigen::Vector3d &lo, const Eigen::Vector3d &hi, double res, double inflate, int hit_count,
+                    const LogOdds &l)
 {
   res_ = res;
   o_ = lo;
   n_ = ((hi - lo) / res).cast<int>();
-  v_.assign(size_t(n_.prod()), 0);
-  hits_.assign(v_.size(), 0);
-  hit_count_ = hit_count;
+  const size_t N = size_t(n_.prod());
+  lo_.assign(N, 0);
+  grow_.assign(N, 0);
+  seen_.assign(N, 0);
+  frame_ = 0;
+  const auto q = [](double x) { return int(std::lround(x * 16.0)); };
+  hit_q_ = q(l.hit), miss_q_ = q(l.miss), min_q_ = std::max(-128, q(l.min)), max_q_ = std::min(127, q(l.max));
+  occ_q_ = q((std::max(hit_count, 1) - 0.5) * l.hit);
   const int k = int(std::ceil(inflate / res));
   ball_.clear();
   for (int i = -k; i <= k; i++)
     for (int j = -k; j <= k; j++)
-      for (int l = -k; l <= k; l++)
-        if (Eigen::Vector3d(i, j, l).norm() * res <= inflate + 1e-9)
-          ball_.emplace_back(i, j, l);
+      for (int m = -k; m <= k; m++)
+        if (Eigen::Vector3d(i, j, m).norm() * res <= inflate + 1e-9)
+          ball_.emplace_back(i, j, m);
+}
+
+void VoxelMap::update(const Eigen::Vector3i &id, int dq)
+{
+  const size_t a = at(id);
+  const bool was = occupied(a);
+  lo_[a] = int8_t(std::clamp(int(lo_[a]) + dq, min_q_, max_q_));
+  const bool now = occupied(a);
+  if (was == now)
+    return;
+  for (const auto &d : ball_)
+  {
+    const Eigen::Vector3i q = id + d;
+    if (!in(q))
+      continue;
+    uint16_t &g = grow_[at(q)];
+    g = now ? uint16_t(g + 1) : uint16_t(g > 0 ? g - 1 : 0);
+  }
 }
 
 void VoxelMap::hit(const Eigen::Vector3d &p)
@@ -53,17 +77,71 @@ void VoxelMap::hit(const Eigen::Vector3d &p)
   if (!ready() || !p.allFinite())
     return;
   const Eigen::Vector3i id = idx(p);
+  if (in(id))
+    update(id, hit_q_);
+}
+
+void VoxelMap::beginFrame()
+{
+  if (++frame_ == 0)  // the stamp wrapped: forget old stamps so they cannot match this frame
+  {
+    std::fill(seen_.begin(), seen_.end(), uint8_t(0));
+    frame_ = 1;
+  }
+}
+
+void VoxelMap::frameHit(const Eigen::Vector3d &p)
+{
+  if (!ready() || !p.allFinite())
+    return;
+  const Eigen::Vector3i id = idx(p);
   if (!in(id))
     return;
   const size_t a = at(id);
-  if (v_[a] == 1 || ++hits_[a] < hit_count_)
+  if (seen_[a] == frame_)
     return;
-  v_[a] = 1;
-  for (const auto &d : ball_)
+  seen_[a] = frame_;
+  update(id, hit_q_);
+}
+
+void VoxelMap::frameRay(const Eigen::Vector3d &from, const Eigen::Vector3d &to)
+{
+  if (!ready() || !from.allFinite() || !to.allFinite())
+    return;
+  // Amanatides & Woo voxel traversal from the camera to the end voxel (exclusive)
+  const Eigen::Vector3d d = to - from;
+  const double len = d.norm();
+  if (len < 1e-6)
+    return;
+  Eigen::Vector3i id = idx(from);
+  const Eigen::Vector3i end = idx(to);
+  Eigen::Vector3i step;
+  Eigen::Vector3d tmax, tdelta;
+  for (int i = 0; i < 3; i++)
   {
-    const Eigen::Vector3i q = id + d;
-    if (in(q) && v_[at(q)] == 0)
-      v_[at(q)] = 2;
+    step(i) = d(i) > 0 ? 1 : (d(i) < 0 ? -1 : 0);
+    const double bound = o_(i) + (id(i) + (step(i) > 0 ? 1 : 0)) * res_;
+    tmax(i) = step(i) != 0 ? (bound - from(i)) / d(i) : INFINITY;
+    tdelta(i) = step(i) != 0 ? res_ / std::abs(d(i)) : INFINITY;
+  }
+  for (int guard = 0; guard < 4 * int(len / res_) + 8 && id != end; guard++)
+  {
+    if (in(id))
+    {
+      const size_t a = at(id);
+      if (seen_[a] != frame_)
+      {
+        seen_[a] = frame_;
+        update(id, miss_q_);
+      }
+    }
+    int k = 0;
+    if (tmax(1) < tmax(k)) k = 1;
+    if (tmax(2) < tmax(k)) k = 2;
+    if (tmax(k) > 1.0)
+      break;
+    id(k) += step(k);
+    tmax(k) += tdelta(k);
   }
 }
 
@@ -72,7 +150,10 @@ int VoxelMap::query(const Eigen::Vector3d &p) const
   if (!p.allFinite())
     return 1;
   const Eigen::Vector3i id = idx(p);
-  return in(id) ? int(v_[at(id)]) : 1;
+  if (!in(id))
+    return 1;
+  const size_t a = at(id);
+  return occupied(a) ? 1 : (grow_[a] > 0 ? 2 : 0);
 }
 
 void VoxelMap::surface(const Eigen::Vector3d &lo, const Eigen::Vector3d &hi, std::vector<Eigen::Vector3d> &pts) const
@@ -85,12 +166,12 @@ void VoxelMap::surface(const Eigen::Vector3d &lo, const Eigen::Vector3d &hi, std
       for (int x = a(0); x <= b(0); x++)
       {
         const Eigen::Vector3i id(x, y, z);
-        if (v_[at(id)] == 0)
+        if (!occupied(at(id)) && grow_[at(id)] == 0)
           continue;
         for (const auto &d : nb)
         {
           const Eigen::Vector3i q = id + Eigen::Vector3i(d[0], d[1], d[2]);
-          if (in(q) && v_[at(q)] == 0)
+          if (in(q) && !occupied(at(q)) && grow_[at(q)] == 0)
           {
             pts.push_back(centre(id));
             break;
@@ -105,7 +186,7 @@ template <class T> void put(std::ostream &os, const T &x) { os.write(reinterpret
 template <class T> bool get(std::istream &is, T &x) { return bool(is.read(reinterpret_cast<char *>(&x), sizeof(T))); }
 void putV(std::ostream &os, const Eigen::Vector3d &v) { for (int i = 0; i < 3; i++) put(os, v(i)); }
 bool getV(std::istream &is, Eigen::Vector3d &v) { bool ok = true; for (int i = 0; i < 3; i++) ok = ok && get(is, v(i)); return ok; }
-const uint32_t kMagic = 0x43415631;  // "CAV1"
+const uint32_t kMagic = 0x43415632;  // "CAV2": log-odds map
 }  // namespace
 
 void VoxelMap::save(std::ostream &os) const
@@ -114,28 +195,47 @@ void VoxelMap::save(std::ostream &os) const
   putV(os, o_);
   put(os, res_);
   for (int i = 0; i < 3; i++) put(os, int32_t(n_(i)));
-  put(os, int32_t(hit_count_));
-  put(os, uint64_t(v_.size()));
-  os.write(reinterpret_cast<const char *>(v_.data()), std::streamsize(v_.size()));
+  for (int v : {hit_q_, miss_q_, min_q_, max_q_, occ_q_}) put(os, int32_t(v));
+  put(os, int32_t(ball_.size()));
+  for (const auto &b : ball_) for (int i = 0; i < 3; i++) put(os, int8_t(b(i)));
+  put(os, uint64_t(lo_.size()));
+  os.write(reinterpret_cast<const char *>(lo_.data()), std::streamsize(lo_.size()));
 }
 
 bool VoxelMap::load(std::istream &is)
 {
   uint32_t m = 0;
-  int32_t n[3], hc;
+  int32_t n[3], q[5], nb;
   uint64_t sz;
   if (!get(is, m) || m != kMagic || !getV(is, o_) || !get(is, res_))
     return false;
-  for (int i = 0; i < 3; i++)
-    if (!get(is, n[i]))
-      return false;
-  if (!get(is, hc) || !get(is, sz))
-    return false;
+  for (int i = 0; i < 3; i++) if (!get(is, n[i])) return false;
+  for (int i = 0; i < 5; i++) if (!get(is, q[i])) return false;
+  if (!get(is, nb)) return false;
+  ball_.resize(size_t(nb));
+  for (auto &b : ball_)
+    for (int i = 0; i < 3; i++) { int8_t x; if (!get(is, x)) return false; b(i) = x; }
+  if (!get(is, sz)) return false;
   n_ = Eigen::Vector3i(n[0], n[1], n[2]);
-  hit_count_ = hc;
-  v_.resize(sz);
-  hits_.assign(sz, 0);
-  return bool(is.read(reinterpret_cast<char *>(v_.data()), std::streamsize(sz))) && size_t(n_.prod()) == sz;
+  hit_q_ = q[0], miss_q_ = q[1], min_q_ = q[2], max_q_ = q[3], occ_q_ = q[4];
+  lo_.resize(sz);
+  if (!is.read(reinterpret_cast<char *>(lo_.data()), std::streamsize(sz)) || size_t(n_.prod()) != sz)
+    return false;
+  grow_.assign(sz, 0);
+  seen_.assign(sz, 0);
+  frame_ = 0;
+  for (int z = 0; z < n_(2); z++)
+    for (int y = 0; y < n_(1); y++)
+      for (int x = 0; x < n_(0); x++)
+      {
+        const Eigen::Vector3i id(x, y, z);
+        if (!occupied(at(id)))
+          continue;
+        for (const auto &d : ball_)
+          if (in(id + d))
+            grow_[at(id + d)]++;
+      }
+  return true;
 }
 
 // ---------------------------------------------------------------- Reference
@@ -231,20 +331,38 @@ void LocalPlanner::insertDepth(const DepthView &d)
   if (!map_.ready() || !have_goal_ || d.data == nullptr)
     return;
   const double z_lo = goal_(2) - P_.slab_m - 0.5, z_hi = goal_(2) + P_.slab_m + 0.5;
+  const auto depth = [&](int r, int c) {
+    const uint8_t *row = d.data + size_t(r) * d.step;
+    return d.float32 ? double(reinterpret_cast<const float *>(row)[c])
+                     : 1e-3 * double(reinterpret_cast<const uint16_t *>(row)[c]);
+  };
+  const auto world = [&](int r, int c, double z) {
+    return Eigen::Vector3d(d.R_world_cam * Eigen::Vector3d((c - d.cx) * z / d.fx, (r - d.cy) * z / d.fy, z) +
+                           d.t_world_cam);
+  };
+  // Every skip_pixel-th pixel with a valid return within range and the altitude slab: the return marks its voxel,
+  // and its ray clears the voxels it passes through (hits first, so a voxel hit in this frame is not also cleared).
+  // A zero (invalid) pixel says nothing. Rays and returns must come from the same pixels: with rays from fewer
+  // pixels than returns, noisy returns outnumber the clearing and phantoms stay (unit test NoisyWall...).
+  map_.beginFrame();
+  thread_local std::vector<Eigen::Vector3d> ends;
+  ends.clear();
   const int k = std::max(1, P_.skip_pixel);
   for (int r = 0; r < d.height; r += k)
     for (int c = 0; c < d.width; c += k)
     {
-      const uint8_t *row = d.data + size_t(r) * d.step;
-      const double z = d.float32 ? double(reinterpret_cast<const float *>(row)[c])
-                                 : 1e-3 * double(reinterpret_cast<const uint16_t *>(row)[c]);
+      const double z = depth(r, c);
       if (!std::isfinite(z) || z < 0.2 || z >= P_.max_range_m)
         continue;
-      const Eigen::Vector3d pw = d.R_world_cam * Eigen::Vector3d((c - d.cx) * z / d.fx, (r - d.cy) * z / d.fy, z) +
-                                 d.t_world_cam;
-      if (pw(2) >= z_lo && pw(2) <= z_hi)
-        map_.hit(pw);
+      const Eigen::Vector3d pw = world(r, c, z);
+      if (pw(2) < z_lo || pw(2) > z_hi)
+        continue;
+      map_.frameHit(pw);
+      ends.push_back(pw);
     }
+  if (P_.clear_rays)
+    for (const auto &e : ends)
+      map_.frameRay(d.t_world_cam, e);
 }
 
 double LocalPlanner::blockedAhead(const Reference &r, double t) const

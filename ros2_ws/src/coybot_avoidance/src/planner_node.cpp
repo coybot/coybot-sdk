@@ -45,6 +45,7 @@ public:
     p.map_res_m = declare_parameter("map_res", p.map_res_m);
     p.inflate_m = declare_parameter("inflate_m", p.inflate_m);
     p.hit_count = int(declare_parameter("hit_count", int64_t(p.hit_count)));
+    p.clear_rays = declare_parameter("clear_rays", p.clear_rays);
     p.max_range_m = declare_parameter("max_range_m", p.max_range_m);
     p.skip_pixel = int(declare_parameter("skip_pixel", int64_t(p.skip_pixel)));
     p.slab_m = declare_parameter("slab_m", p.slab_m);

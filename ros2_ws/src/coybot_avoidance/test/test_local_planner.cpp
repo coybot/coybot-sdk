@@ -6,6 +6,7 @@
 // reference says). Units: m, s.
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <random>
@@ -304,4 +305,89 @@ TEST(Bench, DenseForests)
                     f.last.c_str());
     }
   std::printf("BENCH %d of %d arrived\n", ok, n);
+}
+
+TEST(VoxelMap, RaysClearAPhantomButNotATrunk)
+{
+  coybot_avoidance::VoxelMap m;
+  m.init(Vector3d(0, -5, 0), Vector3d(20, 5, 5), 0.1, 0.8, 2);
+  const Vector3d cam(0.5, 0, 2.5), phantom(6.05, 0.05, 2.55), trunk(10.05, 0.05, 2.55);
+  m.hit(phantom);
+  m.hit(phantom);                                   // two stray returns: occupied, with its keep-out
+  ASSERT_EQ(m.query(phantom), 1);
+  ASSERT_EQ(m.query(phantom + Vector3d(0, 0.5, 0)), 2);
+  for (int f = 0; f < 4; f++)                       // frames that see the trunk behind it, through it
+  {
+    m.beginFrame();
+    m.frameHit(trunk);
+    m.frameRay(cam, trunk);
+  }
+  EXPECT_EQ(m.query(phantom), 0) << "the phantom is cleared";
+  EXPECT_EQ(m.query(phantom + Vector3d(0, 0.5, 0)), 0) << "and its keep-out with it";
+  EXPECT_EQ(m.query(trunk), 1) << "the trunk stays";
+  EXPECT_EQ(m.query(trunk - Vector3d(0.5, 0, 0)), 2) << "with its keep-out";
+}
+
+namespace
+{
+// Frames of a flat wall at wall_m, depth noise sigma_m, through insertDepth (W x H image, 60 deg wide; returns, and
+// rays if clear, from every skip-th pixel).
+// Returns the share of voxels blocked in front of the wall, 1.5 m .. wall_m - 1.5 m ahead, in the altitude slab.
+double phantomShare(bool clear, double wall_m, double sigma_m, int frames, int W = 160, int H = 120,
+                    double *ms_per_frame = nullptr, int skip = 2)
+{
+  Params P;
+  P.clear_rays = clear;
+  P.skip_pixel = skip;
+  LocalPlanner pl(P);
+  pl.setGoal(Vector3d(30, 0, 2.5), Vector3d(0, 0, 2.5));
+  const double f = (W / 2.0) / std::tan(M_PI / 6);
+  std::mt19937 rng(7);
+  std::normal_distribution<float> n(0.0f, float(sigma_m));
+  std::vector<float> img(size_t(W * H));
+  coybot_avoidance::DepthView d;
+  d.width = W, d.height = H, d.step = sizeof(float) * W, d.float32 = true;
+  d.fx = d.fy = f, d.cx = W / 2.0, d.cy = H / 2.0;
+  d.R_world_cam << 0, 0, 1, -1, 0, 0, 0, -1, 0;    // optical (x right, y down, z forward) -> world (x forward)
+  d.t_world_cam = Vector3d(0, 0, 2.5);
+  double busy = 0.0;
+  for (int k = 0; k < frames; k++)
+  {
+    for (int r = 0; r < H; r++)
+      for (int c = 0; c < W; c++)
+      {
+        const double ray_x = std::sqrt(1 + std::pow((c - d.cx) / f, 2) + std::pow((r - d.cy) / f, 2));
+        img[size_t(r * W + c)] = float(wall_m) + n(rng);   // depth = z along the optical axis: flat wall
+        (void)ray_x;
+      }
+    d.data = reinterpret_cast<const uint8_t *>(img.data());
+    const auto t0 = std::chrono::steady_clock::now();
+    pl.insertDepth(d);
+    busy += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  }
+  if (ms_per_frame)
+    *ms_per_frame = 1e3 * busy / frames;
+  int blocked = 0, total = 0;
+  for (double x = 1.5; x < wall_m - 1.5; x += 0.1)
+    for (double y = -0.5; y <= 0.5; y += 0.1)
+      for (double z = 2.0; z <= 3.0; z += 0.1)
+      {
+        total++;
+        blocked += pl.map().query(Vector3d(x, y, z)) != 0;
+      }
+  return double(blocked) / total;
+}
+}  // namespace
+
+TEST(VoxelMap, NoisyWallLeavesNoPhantomsWithClearing)
+{
+  const double without = phantomShare(false, 8.0, 0.5, 30), with = phantomShare(true, 8.0, 0.5, 30);
+  std::printf("blocked in front of a noisy wall: %.1f %% without clearing, %.1f %% with\n", 100 * without, 100 * with);
+  double ms4 = 0, ms2 = 0;
+  const double share4 = phantomShare(true, 8.0, 0.5, 10, 640, 480, &ms4, 4);
+  phantomShare(true, 8.0, 0.5, 10, 640, 480, &ms2, 2);
+  std::printf("640 x 480 frame: %.1f ms every 4th pixel (blocked %.1f %%), %.1f ms every 2nd\n", ms4, 100 * share4, ms2);
+  EXPECT_LT(share4, 0.01);
+  EXPECT_GT(without, 0.05) << "the test must produce phantoms when nothing clears them";
+  EXPECT_LT(with, 0.01);
 }

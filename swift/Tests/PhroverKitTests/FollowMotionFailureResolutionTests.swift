@@ -2,6 +2,20 @@ import XCTest
 @testable import PhroverKit
 
 final class FollowMotionFailureResolutionTests: XCTestCase {
+    func testPursuitFreshnessFailuresHaveDistinctMessagesAndStopFailureWins() {
+        for (cause, text) in [(FollowMotionFailureCause.pursuitDepthRefreshTimeout, "600 ms"),
+                              (.pursuitAuthorizationExpired, "authorization expired"),
+                              (.pursuitRecoveryExhausted, "attempts exhausted")] {
+            let context = FollowMotionOperationContext(request: nil, controllerOperationID: 1,
+                purpose: .followGoal, profile: nil, failureCause: cause)
+            var resolution = FollowMotionFailureResolution(.init(context: context,
+                reason: .depthUnavailable(.staleRawDepth), stopOutcome: .confirmed, source: .result))
+            XCTAssertTrue(resolution.message.contains(text))
+            resolution.consume(.init(context: context, reason: .commandFailed, stopOutcome: .failed, source: .confirmation))
+            XCTAssertEqual(resolution.message, "Motor stop could not be confirmed. Motion is blocked.")
+        }
+    }
+
     func testReadyProbeBoundsAndSourceRejectionsHaveDistinctMessages() {
         for cause in [FollowMotionFailureCause.readyProbeLateralDeviation, .readyProbeHeadingDeviation,
                       .readyProbeTravelLimit, .readyProbeExpired] {

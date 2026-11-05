@@ -12,12 +12,14 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
             let fixture = Fixture()
             fixture.mappedRecovery = true
             var started: Double?
+            var preparationDelayed = false
             var observationExpiredWhileStopped = false
             var injectedFault = false
             var sequence: UInt64 = 100
             fixture.recoveryDepth = { command in
-                if started == nil {
-                    started = fixture.clock.now
+                if !preparationDelayed {
+                    preparationDelayed = true
+                    started = started ?? fixture.clock.now
                     // Reproduce the map/preparation delay while keeping the
                     // same original detector observation and its capture time.
                     fixture.clock.advance(to: fixture.clock.now + 0.334)
@@ -29,6 +31,11 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
                     requiredStoppingDistance: 0.3, motionClass: .classify(command), speedLimit: nil)
             }
             fixture.readyTick = { duration in
+                // Baseline collection now shares the original stopped refresh
+                // budget. Anchor this scenario at recovery entry, not first depth read.
+                if started == nil, fixture.coordinator.state == .recoveringReadyPath {
+                    started = fixture.clock.now
+                }
                 let elapsed = max(0.001, Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18)
                 fixture.controllerTime = fixture.controllerTime.addingTimeInterval(elapsed)
                 fixture.clock.advance(to: fixture.clock.now + elapsed)

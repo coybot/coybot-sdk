@@ -4,6 +4,168 @@ import RoverNav
 
 @MainActor
 final class ReadyPathRecoveryTests: XCTestCase {
+    func testDelayedCoastMustSettleBeforeAnotherProbe() async {
+        let f = ProbeFixture()
+        var coastChecks = 0
+        f.onWait = {
+            if f.commands.count == 1 {
+                coastChecks += 1
+                // Several post-stop captures still show forward motion.
+                f.position.x = min(0.031, 0.01 + Double(coastChecks) * 0.004)
+            }
+        }
+        let result = await f.run()
+        XCTAssertEqual(result, .clear)
+        XCTAssertEqual(f.commands.count, 1, "Do not issue a second pulse while the first is still settling")
+        XCTAssertTrue(f.stages.contains("pulse_settled"))
+        XCTAssertEqual(f.commands.first?.left, 0.12)
+    }
+
+    func testObservedPulseTooLargeForRemainingAllowanceCannotSendAgain() async {
+        let f = ProbeFixture()
+        f.step = 0.025
+        let result = await f.run()
+        XCTAssertEqual(result, .failed(.stalled))
+        XCTAssertEqual(f.commands.count, 1)
+        XCTAssertTrue(f.stages.contains("pulse_response_unfit"))
+    }
+
+    func testContinuingMotionOrCachedFramesCannotClaimSettledProbe() async {
+        for cached in [false, true] {
+            let f = ProbeFixture()
+            var frame: UInt64?
+            f.onWait = {
+                guard f.commands.count == 1 else { return }
+                if cached {
+                    if frame == nil { frame = f.sequence }
+                    f.sequence = frame!
+                } else {
+                    f.position.x += 0.001
+                }
+            }
+            let result = await f.run()
+            XCTAssertEqual(result, .failed(.stalled))
+            XCTAssertEqual(f.commands.count, 1)
+            XCTAssertFalse(f.stages.contains("pulse_settled"))
+            XCTAssertLessThan(f.time, 11)
+        }
+    }
+
+    func testRecordedTravelOvershootDuringSettlingRemainsHardFailure() async {
+        let f = ProbeFixture()
+        f.onWait = { if f.commands.count == 1 { f.position.x = 0.074075251508784426 } }
+        let result = await f.run()
+        XCTAssertEqual(result, .failed(.stalled))
+        XCTAssertEqual(f.commands.count, 1)
+        XCTAssertFalse(f.stages.contains("clear"))
+    }
+
+    func testCachedIdentityCannotEstablishBaseline() async {
+        let f = ProbeFixture()
+        f.onWait = { f.sequence = 1 }
+        let result = await f.run()
+        XCTAssertEqual(result, .failed(.stalled))
+        XCTAssertTrue(f.commands.isEmpty)
+        XCTAssertLessThan(f.time, 10.33)
+    }
+
+    func testStoppedBaselineHandlesHeadingWrapWithoutInventingHalfTurn() async {
+        let f = ProbeFixture()
+        f.yaw = .pi - 0.002
+        var count = 0
+        f.onWait = {
+            count += 1
+            f.yaw = count.isMultiple(of: 2) ? .pi - 0.001 : -.pi + 0.001
+        }
+        f.onEmit = { stage, fields in
+            if stage == "baseline_accepted" {
+                guard case .number(let yaw)? = fields["baseline_yaw_rad"] else { return XCTFail("Missing baseline heading") }
+                XCTAssertLessThan(abs(abs(yaw) - .pi), 0.01)
+                f.allowed = false
+            }
+        }
+        let result = await f.run()
+        XCTAssertEqual(result, .cancelled)
+        XCTAssertTrue(f.commands.isEmpty)
+        XCTAssertTrue(f.stages.contains("baseline_accepted"))
+    }
+
+    func testMedianBaselineRejectsBiasFromOneSmallOutlier() async {
+        let f = ProbeFixture()
+        var samples = 0
+        f.onWait = {
+            if f.commands.isEmpty {
+                samples += 1
+                f.position.y = samples == 1 ? 0.003 : 0
+            }
+        }
+        f.onEmit = { stage, fields in
+            if stage == "baseline_accepted" {
+                XCTAssertEqual(fields["baseline_z"], .number(0))
+                XCTAssertEqual(fields["baseline_sample_count"], .number(3))
+            }
+        }
+        let result = await f.run()
+        XCTAssertEqual(result, .clear)
+        XCTAssertTrue(f.stages.contains("baseline_accepted"))
+        XCTAssertEqual(f.stages.filter { $0 == "baseline_accepted" }.count, 1, "Never re-anchor after probe motion")
+    }
+
+    func testLateralRecheckRequiresThreeDistinctSettledInBoundsSamples() async {
+        for persistent in [false, true] {
+            let f = ProbeFixture()
+            var injected = false
+            var rechecking = false
+            var checks = 0
+            f.onWait = {
+                guard f.commands.count == 1 else { return }
+                if !injected {
+                    injected = true
+                    f.position.y = 0.010037304579
+                } else if rechecking {
+                    checks += 1
+                    if !persistent { f.position.y = 0 }
+                }
+            }
+            f.onEmit = { stage, fields in
+                if stage == "ready_recovery_pose_recheck" { rechecking = true }
+                if stage == "pose_recheck_recovered" {
+                    XCTAssertEqual(f.commands.count, 1)
+                    XCTAssertEqual(fields["sample_count"], .number(3))
+                }
+            }
+            let result = await f.run()
+            XCTAssertTrue(injected)
+            XCTAssertGreaterThanOrEqual(checks, 3)
+            XCTAssertEqual(result, persistent ? .failed(.stalled) : .clear)
+            if persistent { XCTAssertEqual(f.commands.count, 1) }
+            XCTAssertEqual(f.stages.contains("pose_recheck_recovered"), !persistent)
+        }
+    }
+
+    func testUnstableStoppedBaselineCannotSendProbe() async {
+        let f = ProbeFixture()
+        var reads = 0
+        f.onWait = {
+            if f.commands.isEmpty {
+                reads += 1
+                f.position.y = reads.isMultiple(of: 2) ? -0.006 : 0.006
+            }
+        }
+        let result = await f.run()
+        XCTAssertEqual(result, .failed(.stalled))
+        XCTAssertTrue(f.commands.isEmpty)
+        XCTAssertGreaterThanOrEqual(reads, 3)
+    }
+
+    func testStoppedBaselineMustPrecedeFirstPulse() async {
+        let f = ProbeFixture()
+        let result = await f.run()
+        XCTAssertEqual(result, .clear)
+        XCTAssertGreaterThanOrEqual(f.firstPulseTime ?? 0, 10.1)
+        XCTAssertTrue(f.stages.contains("baseline_accepted"))
+    }
+
     func testProbeCompletionNeverOverridesHardBoundsSourceOrDeadline() {
         let authority = ReadyPathRecovery.PulseAuthority(stage: .probe, origin: .init(position: .zero, yaw: 0),
             generation: 7, maximumAlong: 0.05, expiresAt: 11, command: .init(left: 0.25, right: 0.25))
@@ -41,13 +203,13 @@ final class ReadyPathRecoveryTests: XCTestCase {
         let fixture = ProbeFixture()
         // Device recovery failed at 271.521 ms against the unchanged 250 ms limit.
         fixture.rawDepthTimestamp = 10 - 0.27152120834216475
-        fixture.freshDepthAt = 10.1
+        fixture.freshDepthAt = 10.25
         fixture.onWait = {
-            if fixture.time < 10.1 { XCTAssertTrue(fixture.commands.isEmpty) }
+            if fixture.time < 10.25 { XCTAssertTrue(fixture.commands.isEmpty) }
         }
         let result = await fixture.run()
         XCTAssertEqual(result, .clear)
-        XCTAssertGreaterThanOrEqual(fixture.firstPulseTime ?? 0, 10.1)
+        XCTAssertGreaterThanOrEqual(fixture.firstPulseTime ?? 0, 10.25)
         XCTAssertGreaterThan(fixture.depthReads, fixture.commands.count)
         XCTAssertEqual(fixture.stages.filter { $0 == "depth_wait_started" }.count, 1)
         XCTAssertEqual(fixture.stages.filter { $0 == "depth_wait_recovered" }.count, 1)
@@ -76,7 +238,7 @@ final class ReadyPathRecoveryTests: XCTestCase {
         for delayProvider in [false, true] {
             let fixture = ProbeFixture()
             fixture.rawDepthTimestamp = 9.7
-            fixture.freshDepthAt = delayProvider ? 10.05 : 10.6
+            fixture.freshDepthAt = delayProvider ? 10.20 : 10.6
             fixture.onDepth = {
                 if delayProvider, fixture.depthReads == 2 { fixture.time = 10.61 }
             }
@@ -294,6 +456,7 @@ private final class ProbeFixture {
     var firstPulseTime: Double?
     var onWait: (() -> Void)?
     var stages: [String] = []
+    var onEmit: ((String, [String: FollowDiagnosticValue]) -> Void)?
     var onDepth: (() -> Void)?
     var unavailableReason: DepthSafetyUnavailableReason?
     var waitGate: FollowDiagnosticSuspension?
@@ -339,6 +502,6 @@ private final class ProbeFixture {
                 self.sequence += 1
                 self.onWait?()
                 if let gate = self.waitGate { await gate.suspend() }
-            }, emit: { stage, _ in self.stages.append(stage) }))
+            }, emit: { stage, fields in self.stages.append(stage); self.onEmit?(stage, fields) }))
     }
 }

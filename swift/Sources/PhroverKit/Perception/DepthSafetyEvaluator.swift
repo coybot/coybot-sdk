@@ -91,19 +91,27 @@ enum DepthSafetyEvaluator {
         var depthValues = [Float](repeating: .nan, count: width * height)
         var validSamples = 0
         var projectedSamples: [ProjectedSample] = []
-        projectedSamples.reserveCapacity(width * height / 2)
+        projectedSamples.reserveCapacity(width * height)
         var cells = Set<DepthSafetyCell>()
         cells.reserveCapacity(width * height / 8)
 
+        // Intrinsics are constant for this capture. Preserve the original Double
+        // arithmetic and Float projection, but avoid two divisions per pixel.
+        let xRays = (0..<width).map { (Double($0) - cx) / fx }
+        let yRays = (0..<height).map { -(Double($0) - cy) / fy }
+        let minimumForward = -geometry.length / 2
         for row in 0..<height {
+            let sourceRow = values.advanced(by: row * stride)
+            let outputRow = row * width
+            let yRay = yRays[row]
             for column in 0..<width {
-                let raw = values[row * stride + column]
-                depthValues[row * width + column] = raw
+                let raw = sourceRow[column]
+                depthValues[outputRow + column] = raw
                 let depth = Double(raw)
                 guard depth > 0.05, depth.isFinite else { continue }
                 validSamples += 1
-                let xCamera = (Double(column) - cx) / fx * depth
-                let yCamera = -(Double(row) - cy) / fy * depth
+                let xCamera = xRays[column] * depth
+                let yCamera = yRay * depth
                 let cameraPoint = SIMD4<Float>(Float(xCamera), Float(yCamera), Float(-depth), 1)
                 let world4 = cameraTransform * cameraPoint
                 let relative = SIMD3<Double>(
@@ -114,7 +122,7 @@ enum DepthSafetyEvaluator {
                 let lateral = simd_dot(relative, roverRight)
                 let vertical = relative.y
                 let forward = simd_dot(relative, roverForward)
-                guard forward >= -geometry.length / 2,
+                guard forward >= minimumForward,
                       forward <= 4.0,
                       abs(lateral) <= 3.0 else { continue }
                 projectedSamples.append(ProjectedSample(
@@ -201,13 +209,15 @@ enum DepthSafetyEvaluator {
         for index in bins.keys {
             let cluster = (index - 1...index + 1).flatMap { bins[$0] ?? [] }
             guard cluster.count >= minimumSupport else { continue }
-            let forwardValues = cluster.map(\.forward)
-            let lateralValues = cluster.map(\.lateral)
-            guard let minimumForward = forwardValues.min(),
-                  let maximumForward = forwardValues.max(),
-                  let minimumLateral = lateralValues.min(),
-                  let maximumLateral = lateralValues.max(),
-                  maximumForward - minimumForward >= minimumGroundPlaneForwardSpan,
+            var minimumForward = Double.infinity, maximumForward = -Double.infinity
+            var minimumLateral = Double.infinity, maximumLateral = -Double.infinity
+            for sample in cluster {
+                minimumForward = min(minimumForward, sample.forward)
+                maximumForward = max(maximumForward, sample.forward)
+                minimumLateral = min(minimumLateral, sample.lateral)
+                maximumLateral = max(maximumLateral, sample.lateral)
+            }
+            guard maximumForward - minimumForward >= minimumGroundPlaneForwardSpan,
                   maximumLateral - minimumLateral >= minimumGroundPlaneLateralSpan else { continue }
             if cluster.count > bestCluster.count {
                 bestCluster = cluster

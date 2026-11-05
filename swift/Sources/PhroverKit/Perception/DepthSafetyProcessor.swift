@@ -17,7 +17,8 @@ final class DepthSafetyProcessor {
 
     private let evaluate: @Sendable (Input) -> DepthSafetySnapshot
     private let didProcess: @MainActor (DepthSafetySnapshot) -> Void
-    private var pending: (input: Input, generation: UInt64)?
+    private var pending: (input: Input, generation: UInt64, submitted: Double)?
+    private var lastTimingLog = -Double.infinity
     private var task: Task<Void, Never>?
     private var generation: UInt64 = 0
     private var memory = DepthVisibilityMemory()
@@ -41,15 +42,17 @@ final class DepthSafetyProcessor {
         // and an in-flight pre-loss projection cannot repopulate memory.
         guard input.trackingNormal else { invalidate(); return }
         // Bound retained camera buffers to the running capture and the newest waiter.
-        pending = (input, generation)
+        pending = (input, generation, ProcessInfo.processInfo.systemUptime)
         guard task == nil else { return }
         task = Task { [self] in
             defer { task = nil }
             while let job = pending {
                 pending = nil
                 let evaluate = evaluate
-                let snapshot = await Task.detached(priority: .userInitiated) {
-                    evaluate(job.input)
+                let (snapshot, started, finished) = await Task.detached(priority: .userInitiated) {
+                    let started = ProcessInfo.processInfo.systemUptime
+                    let result = evaluate(job.input)
+                    return (result, started, ProcessInfo.processInfo.systemUptime)
                 }.value
                 // Resets, interruptions and missing raw depth revoke old results, even
                 // if their native computation could not be cancelled mid-frame.
@@ -57,6 +60,17 @@ final class DepthSafetyProcessor {
                 var delivered = snapshot
                 memory.attach(to: &delivered)
                 didProcess(delivered)
+                let published = ProcessInfo.processInfo.systemUptime
+                if published - lastTimingLog >= 1 {
+                    lastTimingLog = published
+                    RuntimeFileLog.append("depth_pipeline_timing", fields: [
+                        "source_timestamp_s": String(job.input.timestamp),
+                        "capture_to_submit_s": String(job.submitted - job.input.timestamp),
+                        "submit_to_worker_s": String(started - job.submitted),
+                        "projection_s": String(finished - started),
+                        "worker_to_publish_s": String(published - finished),
+                        "capture_to_publish_s": String(published - job.input.timestamp)])
+                }
             }
         }
     }

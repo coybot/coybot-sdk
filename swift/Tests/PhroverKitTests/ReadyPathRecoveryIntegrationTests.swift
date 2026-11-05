@@ -4,6 +4,22 @@ import RoverNav
 
 @MainActor
 final class ReadyPathRecoveryIntegrationTests: XCTestCase {
+    func testProbeTimingReportsHostStopEvidenceWithoutClaimingMotorDuration() async {
+        let f = RecoveryControllerFixture()
+        let result = await f.run()
+        XCTAssertEqual(result.result, .arrived)
+        let timings = f.events.filter { $0["event"] as? String == "follow_ready.probe_pulse_timing" }
+        XCTAssertFalse(timings.isEmpty)
+        for timing in timings where timing["stage"] as? String == "probe" {
+            XCTAssertEqual(timing["wheel_left"] as? Double, 0.12)
+            XCTAssertEqual(timing["wheel_right"] as? Double, 0.12)
+            XCTAssertEqual(timing["requested_host_budget_s"] as? Double, 0.02)
+            XCTAssertEqual(timing["physical_motor_duration_confidence"] as? String, "unknown")
+            XCTAssertNotNil(timing["stop_ack_uptime_s"] as? Double)
+        }
+        XCTAssertTrue(f.events.contains { $0["reason"] as? String == "pulse_settled" })
+    }
+
     func testHardSourceVetoCannotBecomeRecoverableObstacleAfterPoseReturnsInBounds() async {
         let fixture = RecoveryControllerFixture()
         var injected = false

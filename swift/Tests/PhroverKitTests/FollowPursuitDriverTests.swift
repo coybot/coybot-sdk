@@ -263,6 +263,7 @@ final class FollowPursuitDriverTests: XCTestCase {
             } else {
                 f.arrival = Vec2(0, 5)
                 XCTAssertTrue(f.controller.updateFollowGoal(f.arrival))
+                f.clock.value += 0.5
             }
             f.planGate.release()
             let result = await task.value
@@ -341,7 +342,130 @@ final class FollowPursuitDriverTests: XCTestCase {
         XCTAssertTrue(f.commands.isEmpty)
     }
 
-    func testHardDepthFaultAndPostMovementStalenessNeverUseStartupWait() async {
+    func testControllerRecoversMovingStaleDepthWithoutTerminalFailureEvidence() async {
+        let f = ControllerFixture()
+        f.arrival = .zero
+        f.afterSend = {
+            if f.commands.count == 1 {
+                f.freshAt = f.clock.value + 0.3
+                f.arrival = Vec2(5, 0)
+            }
+        }
+        let result = await f.run()
+        XCTAssertEqual(result.result, .arrived)
+        XCTAssertNil(result.failure)
+        XCTAssertEqual(result.stopOutcome, .confirmed)
+        XCTAssertEqual(f.commands.count, 2)
+        XCTAssertGreaterThanOrEqual(f.stops, 3)
+    }
+
+    func testRawDepthRefreshCannotResumeAfterSourceResetCancellationOrObstacle() async {
+        for fault in ["source", "cancel", "obstacle"] {
+            let f = Fixture()
+            f.depthProvider = { _ in f.observation(age: f.commands.isEmpty ? 0.01 : 0.254) }
+            f.onStop = {
+                switch fault {
+                case "source": f.generation += 1
+                case "cancel": f.allowed = false
+                default: f.clearance = 0.1
+                }
+            }
+            let result = await f.driver.run()
+            XCTAssertEqual(f.commands.count, 1)
+            XCTAssertEqual(result, fault == "source" ? .failed(.trackingLost) :
+                (fault == "cancel" ? .cancelled : .failed(.obstacle)))
+        }
+    }
+
+    func testMovingRawDepthStalenessStopsAndRecoversWithFreshMargin() async {
+        let f = Fixture()
+        var staleUntil = Double.infinity
+        f.depthProvider = { _ in
+            f.observation(age: f.commands.count == 1 && f.time < staleUntil ? 0.254045542 : 0.01)
+        }
+        f.onSend = { _ in
+            if f.commands.count == 1 { staleUntil = f.time + 0.3 }
+            else {
+                XCTAssertEqual(f.stops, 1)
+                XCTAssertGreaterThanOrEqual(f.time, staleUntil)
+                f.position = Vec2(5, 0)
+            }
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertEqual(f.commands.count, 2)
+        XCTAssertTrue(f.events.contains("raw_depth_refresh_started"))
+        XCTAssertTrue(f.events.contains("depth_wait_recovered"))
+        XCTAssertNil(f.driver.failureCause)
+    }
+
+    func testMeasuredAdmissionCostRaisesReserveBeforeAnotherSend() async {
+        let f = Fixture()
+        var freshAt = 0.0
+        f.depthProvider = { _ in
+            f.observation(age: f.commands.count == 1 && f.time < freshAt ? 0.19 : 0.01)
+        }
+        f.onSend = { _ in
+            if f.commands.count == 1 {
+                f.time += 0.06
+                f.sendAdmissionDuration = 0.06
+                freshAt = f.time + 0.3
+            } else {
+                XCTAssertGreaterThanOrEqual(f.time, freshAt)
+                XCTAssertEqual(f.stops, 1)
+                f.position = Vec2(5, 0)
+            }
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertEqual(f.commands.count, 2)
+        XCTAssertTrue(f.events.contains("freshness_margin_wait"))
+    }
+
+    func testStartupGoalChurnIsThrottledAndNeverSendsObsoletePlan() async {
+        let f = Fixture()
+        var starts: [Double] = []
+        f.planProvider = { _, goal in
+            starts.append(f.time)
+            _ = f.driver.updateGoal(Vec2(goal.x + 0.1, 0))
+            return .init(path: [goal])
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .failed(.noPath))
+        XCTAssertTrue(f.commands.isEmpty)
+        XCTAssertGreaterThan(starts.count, 1)
+        for (a, b) in zip(starts, starts.dropFirst()) { XCTAssertGreaterThanOrEqual(b - a, 0.5) }
+        XCTAssertLessThanOrEqual(starts.count, 4)
+    }
+
+    func testRecordedPublishedDepthAgesCanStartPursuit() async {
+        for age in [0.15713395868, 0.186346167, 0.190] {
+            let f = Fixture()
+            f.depthProvider = { _ in
+                f.time += 0.004 // Recorded motion-depth evaluation cost.
+                return f.observation(age: age)
+            }
+            f.onSend = { _ in f.position = Vec2(5, 0) }
+            let result = await f.driver.run()
+            XCTAssertEqual(result, .arrived, "Recorded age \(age) should not require a 100 ms reserve")
+            XCTAssertEqual(f.commands.count, 1)
+            XCTAssertEqual(f.stops, 0)
+        }
+    }
+
+    func testInsufficientFreshnessMarginWaitsStoppedAndTimesOut() async {
+        let f = Fixture()
+        f.depthProvider = { _ in f.observation(age: 0.239) }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .failed(.depthUnavailable(.staleRawDepth)))
+        XCTAssertTrue(f.commands.isEmpty)
+        XCTAssertEqual(f.stops, 1)
+        XCTAssertEqual(f.driver.failureCause, .pursuitDepthRefreshTimeout)
+        XCTAssertLessThan(f.time, 10.7)
+        XCTAssertFalse(f.events.contains("depth_wait_recovered"))
+    }
+
+    func testHardDepthFaultAndPersistentPostMovementStalenessFailSafely() async {
         for failure in [DepthSafetyUnavailableReason.invalidCalibration, .malformedDepth, .blindSweptVolume] {
             let f = Fixture()
             f.depthProvider = { _ in .unavailable(failure, sampleAge: 0.01, motionClass: .forward) }
@@ -355,6 +479,8 @@ final class FollowPursuitDriverTests: XCTestCase {
         let result = await f.driver.run()
         XCTAssertEqual(result, .failed(.depthUnavailable(.staleRawDepth)))
         XCTAssertEqual(f.commands.count, 1)
+        XCTAssertEqual(f.stops, 1)
+        XCTAssertEqual(f.driver.failureCause, .pursuitDepthRefreshTimeout)
         XCTAssertFalse(f.events.contains("depth_wait_started"))
     }
 
@@ -390,6 +516,7 @@ final class FollowPursuitDriverTests: XCTestCase {
         await wait { gate.entered }
         XCTAssertTrue(f.commands.isEmpty)
         XCTAssertTrue(f.driver.updateGoal(Vec2(0, 5)))
+        f.time += 0.5
         gate.release()
         let result = await task.value
         XCTAssertEqual(result, .arrived)
@@ -568,6 +695,8 @@ final class FollowPursuitDriverTests: XCTestCase {
         var planProvider: (@MainActor (Vec2, Vec2) async -> FollowPursuitPlan?)?
         var depthProvider: ((WheelCommand) -> DepthSafetyObservation)?
         var onSend: ((WheelCommand) -> Void)?
+        var onStop: (() -> Void)?
+        var sendAdmissionDuration = 0.0
         var acknowledgement: (@MainActor () async -> Date?)?
         func observation(age: Double) -> DepthSafetyObservation {
             .init(state: .clear, clearance: 5, supportCount: 0, sampleAge: age,
@@ -591,13 +720,14 @@ final class FollowPursuitDriverTests: XCTestCase {
             XCTAssertLessThan(self.time, expiry)
             self.commands.append(command)
             self.onSend?(command)
-        }, stop: { self.stops += 1 }, sleep: { duration in
+        }, stop: { self.stops += 1; self.onStop?() }, sleep: { duration in
             if self.autoAdvance {
                 self.time += Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
             }
             self.sequence += 1
             await Task.yield()
-        }, publishPath: { self.paths.append($0) }, moving: {}, emit: { name, _ in self.events.append(name) }))
+        }, publishPath: { self.paths.append($0) }, moving: {}, emit: { name, _ in self.events.append(name) },
+            admissionDuration: { self.sendAdmissionDuration }))
         }
     }
 }

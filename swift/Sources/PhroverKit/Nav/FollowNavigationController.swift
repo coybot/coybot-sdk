@@ -475,6 +475,7 @@ final class FollowNavigationController {
     private func runPlannedPursuit(to goal: Vec2, owner: UInt,
                                    planner: @escaping @MainActor (Vec2, Vec2) async -> FollowPursuitPlan?) async -> NavigationResult {
         let evidence = FollowMotionTaskScope.evidence
+        var admissionDuration: Double?
         func owned() -> Bool {
             operationGeneration == owner && evidence?.fenced != true && !stopUnconfirmed &&
                 activeFollowEvidence === evidence && recoveryAuthorized
@@ -486,6 +487,8 @@ final class FollowNavigationController {
                 self.recordDepthObservation(result, disposition: "pursuit")
                 return result
             }, send: { command, expiry in
+                admissionDuration = nil
+                let transportEntry = self.transportUptime()
                 guard owned(), let driver = self.pursuitDriver else { throw FollowTurnBurstTransportDenial.fenced }
                 let revision = driver.revision
                 let source = self.readFollowPose()
@@ -539,6 +542,7 @@ final class FollowNavigationController {
                     await self.sendFollowBurstCommand(command)
                 }
                 evidence?.recordCommandReceipt(result.receipt)
+                admissionDuration = transport.attempts.first.map { max(0, $0.entryUptime - transportEntry) }
                 if let error = result.failure {
                     let denial = error as? FollowTurnBurstTransportDenial
                     let unsent = (denial == .expired || denial == .fenced || denial == .cancelled) &&
@@ -554,7 +558,7 @@ final class FollowNavigationController {
                 self.diagnosticEmitter?.emit(.init(event: "follow_pursuit." + stage, context: .init(
                     sessionGeneration: evidence?.context.request?.sessionGeneration,
                     operationID: evidence?.context.controllerOperationID, purpose: "followGoal", phase: "following"), payload: fields))
-            }))
+            }, admissionDuration: { admissionDuration }))
         pursuitDriver = driver
         state = .planning
         let task = Task { await driver.run() }
@@ -565,7 +569,7 @@ final class FollowNavigationController {
         // owner's cleanup obligation. Only an actual replacement owns its stop.
         guard operationGeneration == owner, activeFollowEvidence === evidence, evidence?.fenced != true else { return .cancelled }
         if stopUnconfirmed { finish(.failed(.commandFailed)); return .failed(.commandFailed) }
-        if case .failed(let failure) = result { evidence?.recordFailure(failure) }
+        if case .failed(let failure) = result { evidence?.recordFailure(failure, cause: driver.failureCause) }
         do { try await confirmStop() } catch { return .failed(.commandFailed) }
         guard operationGeneration == owner, activeFollowEvidence === evidence, evidence?.fenced != true else { return .cancelled }
         finish(result)
@@ -934,9 +938,25 @@ final class FollowNavigationController {
                     if self.readyRecoveryPulse?.id == authority.id { self.readyRecoveryPulse = nil; self.readyRecoveryTerminal = nil }
                 }
                 do {
-                    let result = try await self.executeFollowTurnBurst(authority.command, requestedBudget: authority.budget,
-                        purpose: .followReady, sendValidUntil: min(authority.expiresAt, observationDeadline,
-                            self.sourceNow() + RoverConfig.commsWatchdogTimeout - date.timeIntervalSince(ack)))
+                     let result = try await self.executeFollowTurnBurst(authority.command, requestedBudget: authority.budget,
+                         purpose: .followReady, sendValidUntil: min(authority.expiresAt, observationDeadline,
+                             self.sourceNow() + RoverConfig.commsWatchdogTimeout - date.timeIntervalSince(ack)))
+                    let returnedAt = self.sourceNow()
+                    let stoppedPose = self.readFollowPose()
+                    self.diagnosticEmitter?.emit(.init(event: "follow_ready.probe_pulse_timing", context: .init(
+                        operationID: evidence?.context.controllerOperationID, purpose: "followReady", phase: "recoveringReadyPath"), payload: [
+                            "authority_id": .string(authority.id.uuidString), "stage": .string(authority.stage.rawValue),
+                            "wheel_left": .number(authority.command.left), "wheel_right": .number(authority.command.right),
+                            "requested_host_budget_s": .number(authority.budget),
+                            "send_entry_uptime_s": .number(result.send.sendEntryUptime),
+                            "send_response_uptime_s": .number(result.send.responseUptime),
+                            "send_host_duration_s": .number(result.send.responseUptime - result.send.sendEntryUptime),
+                            "stop_ack_uptime_s": result.confirmedStopFence.map { .number($0.acknowledgementUptime) } ?? .null,
+                            "pulse_return_uptime_s": .number(returnedAt),
+                            "pose_at_return_timestamp_s": stoppedPose.sourceTimestamp.map { .number($0) } ?? .null,
+                            "pose_at_return_x": stoppedPose.pose.map { .number($0.position.x) } ?? .null,
+                            "pose_at_return_z": stoppedPose.pose.map { .number($0.position.y) } ?? .null,
+                            "physical_motor_duration_confidence": .string("unknown")]))
                     guard owned() else { return .cancelled }
                     guard result.confirmedStopFence != nil else { return .failed(.commandFailed) }
                     if case .rejected(let reason)? = self.readyRecoveryTerminal?.decision { return .failed(reason.failure) }

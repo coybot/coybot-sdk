@@ -21,9 +21,12 @@ plan), and live-goal updates. A job has a fixed one-second deadline. Results fro
 replaced goals, owners or AR generations cannot authorize motion. Initial planning
 and admission share a two-second outer limit, so goal churn cannot wait forever.
 
-After first movement, planning starts are spaced at least 500 ms apart. Goal
+Planning starts, including startup and stopped refresh, are spaced at least 500 ms apart. Goal
 updates still coalesce to the newest revision; safety checks and driving continue
 while a replan is throttled or pending.
+Periodic rebuilding is suppressed during stopped refresh when the existing plan
+already matches the current goal. Goal changes still require a matching plan;
+the original startup and worker deadlines are not extended.
 
 Only the exact current goal revision can commit a plan. Before first movement,
 the source must be healthy/fresh, the path endpoint must match the requested goal,
@@ -57,7 +60,8 @@ deadline. Fresh depth at or after that deadline cannot authorize a command.
 The original 250 ms raw-depth age limit remains in force.
 
 Hard depth faults and hazards do not get this grace. After motion has begun,
-stale depth remains a stop/failure; it never permits continuing on cached evidence.
+missing or stale raw depth requests an immediate confirmed stop before entering
+the bounded refresh window; it never permits continuing on cached evidence.
 The existing `astral_compatible`/`full_volume` policy selection is preserved.
 
 An expired command authorization is distinct from a stale depth observation.
@@ -69,6 +73,27 @@ is never extended. The fixed 600 ms refresh window includes stop time and cannot
 be renewed by repeated expiry; at most two expiry recoveries are allowed per
 pursuit operation. Uncertain sends, failed stops, source faults and hazards still
 terminate. The original startup and progress deadlines remain in force.
+
+Raw-depth and command-expiry recovery share the two-recovery limit. Before a
+replacement send, both pose and depth must be captured after the confirmed stop.
+The sending reserve is `max(20 ms, max(observed admission time, current depth
+assessment time) + 10 ms)`, measured after evaluation. Production admission time
+runs from sender entry to the recorded HTTP attempt, excluding response/ACK
+latency. Only successful sends teach this budget; an unsent scheduling stall
+does not permanently demand a reserve larger than the entire depth lifetime.
+The 20 ms cold-start reserve and 10 ms allowance are explicit heuristics, not
+latency guarantees. Otherwise the rover stays stopped and waits within the
+same 600 ms window. Transport admission
+still enforces the original expiry. `depth_wait_recovered` is emitted only after
+a successful send, rather than before the transport attempt.
+
+Depth ingestion precomputes the intrinsic ray factors per row/column and avoids
+temporary per-cluster extrema arrays. All original depth pixels, Float world
+transforms, height thresholds and collision cells are preserved. The device
+timing events remain necessary to measure the benefit under real sensor load.
+
+Terminal causes distinguish a fresh-depth/margin timeout, command-authorization
+expiry, and exhausted recovery attempts. Stop failure retains highest priority.
 
 Retargeting after an unsuccessful send is allowed without another stop only when
 the receipt and captured attempt history both prove zero HTTP attempts. An
@@ -88,6 +113,13 @@ owner responsible for its cleanup stop.
 - `follow_pursuit.authorization_expired`: original command deadline, evaluation
   time, zero-attempt evidence and fixed recovery deadline.
 - `follow_pursuit.depth_refresh_stop_confirmed`: expiry recovery has confirmed stop.
+- `follow_pursuit.raw_depth_refresh_started`, `freshness_margin_wait`: raw-depth
+  recovery and the available/required sending margin.
+- `depth_pipeline_timing` (at most once per second): source timestamp,
+  capture-to-submit, submit-to-worker, projection, worker-to-publication and total
+  capture-to-publication times. Worker-to-publication includes actor scheduling,
+  memory attachment and delivery. These measurements locate publication delays;
+  the existing device trace alone does not identify the upstream bottleneck.
 - `follow_pursuit.drive_tick`: committed/requested goal, revisions, pending worker,
   wheels and original depth expiry, at most twice per second.
 

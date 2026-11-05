@@ -110,6 +110,17 @@ struct FollowMotionFailureResolution {
                 ? "Camera pose is stale. Motion stopped; wait for fresh camera frames."
                 : "AR tracking lost. Wait for tracking to recover."
         case .depthUnavailable(let reason):
+            if context.purpose == .followGoal {
+                switch context.failureCause {
+                case .pursuitDepthRefreshTimeout:
+                    return "Following stopped: fresh depth with enough sending margin did not arrive within 600 ms. Restart following after depth recovers."
+                case .pursuitAuthorizationExpired:
+                    return "Following stopped: command authorization expired and stopped recovery could not complete. Restart following."
+                case .pursuitRecoveryExhausted:
+                    return "Following stopped: depth recovery attempts exhausted. Wait for stable depth delivery and restart following."
+                default: break
+                }
+            }
             if let description = context.failureCause?.searchClearanceDescription {
                 return "Search rotation stopped: \(description). Check the turning space and restart following."
             }

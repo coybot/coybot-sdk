@@ -279,3 +279,66 @@ probe events carry the same pose metrics. Geometry failures receive floor-check
 messages; `trackingLost` is reserved for invalid pose-source evidence in this path.
 Limits remain 3 cm probe goal, 5 cm maximum travel, 1 cm lateral deviation and
 0.05 rad heading deviation. Physical rover acceptance remains pending.
+
+### Stable stopped probe baseline and confirmation
+
+Before the first probe, collect three distinct, normal-tracking pose captures
+after entry's confirmed stop. Capture times must be at least 50 ms apart, within
+a fixed 300 ms collection window. The position baseline is the component-wise
+median; yaw uses wrapped offsets from the initial heading. Every sample must be
+within 4 mm and 0.01 rad of that baseline. The median may not shift more than
+5 mm or 0.01 rad from the initial pose. These are conservative stability gates,
+not a claim about ARKit measurement accuracy. Failure reports “pose unstable for
+floor check.” Baseline collection consumes the original startup/probe budgets.
+
+The baseline is frozen once probing starts. A backward/lateral violation observed
+in the stopped geometry loop collects three newer samples, at least 50 ms apart,
+within 300 ms and the original stage deadline. All must meet the original movement
+limits to continue. Persistent or mixed in/out readings fail. Tracking faults,
+owner changes, failed stops and active-pulse/transport vetoes remain terminal.
+No nonzero pulse occurs while collecting confirmation samples.
+
+`baseline_accepted`, `baseline_unstable`, `stopped_pose_timeout` and
+`pose_recheck_recovered` reasons in `follow_ready.path_recovery` record sample
+counts, capture span, median pose and maximum variation. Geometry records include
+both backward-limit and lateral-limit flags, even when only one is the primary
+failure reason.
+
+Physical calibration still requires a rigidly mounted phone: record stationary
+baseline variation, then compare repeated controlled straight drives with the
+configured body-forward axis and available wheel telemetry. Do not infer a
+mounting correction from one failed probe or re-anchor after movement. The
+November 4 trace (10.028 mm then 10.037 mm lateral displacement) establishes a
+persistent AR-measured boundary violation, not whether the chassis really slid.
+
+### Probe response and measured settling
+
+The November 4 16:15 PST run accepted a stable baseline, then measured 11.66 mm
+before pulse two and 74.08 mm afterward. Both motor and stop requests were
+acknowledged. Those acknowledgements do not establish physical motor duration.
+
+Probe and straight return wheel commands now use magnitude 0.12 rather than
+0.25; turning and the main ready signal retain their existing settings. The
+requested host pulse remains 20 ms. Firmware-timed motor execution is not assumed.
+
+After each translation pulse's confirmed stop, the controller polls fresh
+same-generation poses. Three distinct samples spaced at least 50 ms apart must
+be within 2 mm and 0.005 rad of the newest pose, with at least 150 ms elapsed
+since stop return. The sliding window is bounded to 600 ms and the original
+stage deadline. Cached frames or ongoing movement cannot authorize another pulse.
+Travel/heading violations remain hard failures during settling. Existing stopped
+backward/lateral corroboration runs before subsequent motion.
+
+After a settled forward pulse, retain its largest observed displacement from its
+pre-send pose. Another pulse requires room for 1.5 times the largest response
+plus 5 mm, inside the original 50 mm limit. These conservative allowances are
+heuristics, not a proof of physical stopping distance. An unfit response fails
+explicitly instead of issuing another pulse. The 30 mm completion goal, fixed
+origin, stage deadlines and maximum pulse count remain unchanged.
+
+`follow_ready.probe_pulse_timing` reports send entry/response, stop acknowledgement,
+return time and pose capture time, explicitly labeling physical motor duration
+unknown. `pulse_settle_sample`, `pulse_settled`, `pulse_response_fits` and
+`pulse_response_unfit` reasons report settling and remaining-travel decisions.
+Physical verification must check low-speed motion, delayed coast and stop response;
+AR estimates alone cannot distinguish all chassis motion from pose-estimation error.

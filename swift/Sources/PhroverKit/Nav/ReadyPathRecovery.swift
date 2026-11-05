@@ -33,7 +33,7 @@ enum ReadyPathRecovery {
             case permitted, goalReached, rejected(Rejection)
         }
         enum Rejection: Equatable {
-            case source(String), commandMismatch, invalidClock, expired, invalidGeometry
+            case source(String), commandMismatch, invalidClock, expired, invalidGeometry, unstablePose, unsettledMotion, pulseResponseLimit
             case backwardLimit, travelLimit, lateralLimit, headingLimit, scanTranslationLimit, scanTurnLimit, unearnedProgress
 
             var code: String {
@@ -43,6 +43,9 @@ enum ReadyPathRecovery {
                 case .invalidClock: return "invalid_clock"
                 case .expired: return "authorization_expired"
                 case .invalidGeometry: return "invalid_geometry"
+                case .unstablePose: return "unstable_pose"
+                case .unsettledMotion: return "motion_not_settled"
+                case .pulseResponseLimit: return "pulse_response_exceeds_remaining_travel"
                 case .backwardLimit: return "backward_limit"
                 case .travelLimit: return "travel_limit"
                 case .lateralLimit: return "lateral_limit"
@@ -67,6 +70,9 @@ enum ReadyPathRecovery {
                 case .headingLimit, .scanTurnLimit: return .readyProbeHeadingDeviation
                 case .scanTranslationLimit: return .readyProbeScanTranslation
                 case .unearnedProgress: return .readyPreSendPoseShift
+                case .unstablePose: return .readyProbePoseUnstable
+                case .unsettledMotion: return .readyProbeSettleTimeout
+                case .pulseResponseLimit: return .readyProbeResponseLimit
                 case .commandMismatch, .invalidClock, .invalidGeometry: return .readyProbeInvalidGeometry
                 }
             }
@@ -140,6 +146,8 @@ enum ReadyPathRecovery {
                 "ready_recovery_origin_yaw_rad": number(origin.yaw), "ready_recovery_pose_x": number(sample.pose?.position.x),
                 "ready_recovery_pose_z": number(sample.pose?.position.y), "ready_recovery_pose_yaw_rad": number(sample.pose?.yaw),
                 "ready_recovery_along_m": number(along), "ready_recovery_lateral_m": number(lateral),
+                "ready_recovery_backward_limit_exceeded": along.map { .bool($0 < -0.005) } ?? .null,
+                "ready_recovery_lateral_limit_exceeded": lateral.map { .bool(abs($0) > 0.01) } ?? .null,
                 "ready_recovery_heading_change_rad": number(heading), "ready_recovery_deadline_s": number(expiresAt),
                 "ready_probe_goal_m": .number(0.03), "ready_probe_maximum_m": .number(0.05),
                 "ready_probe_lateral_limit_m": .number(0.01), "ready_probe_heading_limit_rad": .number(0.05)]
@@ -149,16 +157,18 @@ enum ReadyPathRecovery {
     static func run(start: NavigationPoseSample, environment: Environment) async -> Outcome {
         enum Abort: Error { case failed(NavigationFailure), cancelled }
         let began = environment.uptime()
-        guard began.isFinite, let origin = start.pose, let generation = start.frameID?.generation,
-              start.rejection(at: began, requireEnriched: true) == nil else { return .failed(.trackingLost) }
+        guard began.isFinite, let initialOrigin = start.pose, let generation = start.frameID?.generation,
+               start.rejection(at: began, requireEnriched: true) == nil else { return .failed(.trackingLost) }
+        var origin = initialOrigin
         let deadline = began + 12
-        let forward = WheelCommand(left: 0.25, right: 0.25)
+        let forward = WheelCommand(left: 0.12, right: 0.12)
+        var maximumForwardPulseTravel = 0.0
         var pulses = 0
         var forwardPulses = 0
         var latestStopSource: ARFrameID?
         var latestStopTime: Double?
 
-        let envelope = PulseAuthority(stage: .probe, origin: origin, generation: generation,
+        var envelope = PulseAuthority(stage: .probe, origin: origin, generation: generation,
             maximumAlong: 0.05, expiresAt: deadline, command: forward)
         func reject(_ reason: PulseAuthority.Rejection, sample: NavigationPoseSample, boundary: String,
                     authority: PulseAuthority? = nil) -> Abort {
@@ -201,9 +211,65 @@ enum ReadyPathRecovery {
             }
             return value
         }
-        func geometry(_ sample: NavigationPoseSample) async throws -> Double {
+        // Only called while entry or the previous pulse is confirmed stopped.
+        // Distinct identities AND capture times are required; polling a cached
+        // frame cannot provide independent corroboration.
+        func stoppedSamples(after first: NavigationPoseSample, afterTime: Double,
+                            until limit: Double) async throws -> [NavigationPoseSample] {
+            var samples: [NavigationPoseSample] = []
+            var previous = first
+            for _ in 0..<30 {
+                try active()
+                guard environment.uptime() < limit else { break }
+                await environment.wait(.milliseconds(20))
+                try active()
+                guard environment.uptime() < limit else { break }
+                let sample = environment.pose()
+                if let reason = sample.rejection(at: environment.uptime(), expectedGeneration: generation, requireEnriched: true) {
+                    throw reject(.source(reason), sample: sample, boundary: "stopped_pose_samples")
+                }
+                guard sample.frameID!.sequence > previous.frameID!.sequence,
+                      sample.sourceTimestamp! > max(afterTime, previous.sourceTimestamp!) else { continue }
+                if let last = samples.last, sample.sourceTimestamp! - last.sourceTimestamp! < 0.05 { continue }
+                samples.append(sample)
+                previous = sample
+                if samples.count == 3 { return samples }
+            }
+            environment.emit("stopped_pose_timeout", ["sample_count": .number(Double(samples.count)),
+                "stopped_pose_deadline_s": .number(limit), "evaluated_at_s": .number(environment.uptime())])
+            throw reject(environment.uptime() >= began + 3 ? .expired : .unstablePose,
+                sample: environment.pose(), boundary: "stopped_pose_timeout")
+        }
+
+        func establishBaseline() async throws {
+            let samples = try await stoppedSamples(after: start, afterTime: began,
+                until: min(began + 0.3, began + FollowReadyAdmission.recoveryRefreshLimit))
+            let poses = samples.map { $0.pose! }
+            func median(_ values: [Double]) -> Double { values.sorted()[values.count / 2] }
+            let position = Vec2(median(poses.map { $0.position.x }), median(poses.map { $0.position.y }))
+            let yaw = initialOrigin.yaw + median(poses.map {
+                atan2(sin($0.yaw - initialOrigin.yaw), cos($0.yaw - initialOrigin.yaw))
+            })
+            let spread = poses.map { $0.position.distance(to: position) }.max()!
+            let yawSpread = poses.map { abs(atan2(sin($0.yaw - yaw), cos($0.yaw - yaw))) }.max()!
+            let stable = spread <= 0.004 && yawSpread <= 0.01 &&
+                position.distance(to: initialOrigin.position) <= 0.005 &&
+                abs(atan2(sin(yaw - initialOrigin.yaw), cos(yaw - initialOrigin.yaw))) <= 0.01
+            environment.emit(stable ? "baseline_accepted" : "baseline_unstable", [
+                "baseline_sample_count": .number(Double(samples.count)),
+                "baseline_capture_span_s": .number(samples.last!.sourceTimestamp! - samples.first!.sourceTimestamp!),
+                "baseline_deadline_s": .number(began + 0.3),
+                "baseline_max_deviation_m": .number(spread), "baseline_max_heading_deviation_rad": .number(yawSpread),
+                "baseline_position_limit_m": .number(0.004), "baseline_heading_limit_rad": .number(0.01),
+                "baseline_x": .number(position.x), "baseline_z": .number(position.y), "baseline_yaw_rad": .number(yaw)])
+            guard stable else { throw reject(.unstablePose, sample: samples.last!, boundary: "baseline") }
+            origin = Pose2D(position: position, yaw: yaw)
+            envelope = PulseAuthority(stage: .probe, origin: origin, generation: generation,
+                maximumAlong: 0.05, expiresAt: deadline, command: forward)
+        }
+        func geometry(_ sample: NavigationPoseSample, stageDeadline: Double? = nil) async throws -> Double {
             var evaluated = sample
-            var decision = envelope.assessment(forward, sample: evaluated, now: environment.uptime())
+            let decision = envelope.assessment(forward, sample: evaluated, now: environment.uptime())
             if case .rejected(let reason) = decision,
                reason == .backwardLimit || reason == .lateralLimit {
                 environment.emit("ready_recovery_pose_recheck", envelope.diagnosticFields(
@@ -211,12 +277,17 @@ enum ReadyPathRecovery {
                         "ready_recovery_boundary": .string("loop_geometry"),
                         "ready_recovery_recheck_reason": .string(reason.code)
                     ]) { _, new in new })
-                await environment.wait(.milliseconds(20))
-                evaluated = try await fresh()
-                decision = envelope.assessment(forward, sample: evaluated, now: environment.uptime())
-                if case .rejected(let confirmed) = decision {
-                    throw reject(confirmed, sample: evaluated, boundary: "loop_geometry_recheck")
+                let samples = try await stoppedSamples(after: sample,
+                    afterTime: max(latestStopTime ?? began, sample.sourceTimestamp!),
+                    until: min(environment.uptime() + 0.3, stageDeadline ?? began + 3))
+                for confirmedSample in samples {
+                    let assessment = envelope.assessment(forward, sample: confirmedSample, now: environment.uptime())
+                    if case .rejected(let confirmed) = assessment {
+                        throw reject(confirmed, sample: confirmedSample, boundary: "loop_geometry_recheck")
+                    }
                 }
+                evaluated = samples.last!
+                environment.emit("pose_recheck_recovered", ["sample_count": .number(Double(samples.count))])
             } else if case .rejected(let reason) = decision {
                 throw reject(reason, sample: evaluated, boundary: "loop_geometry")
             }
@@ -295,6 +366,59 @@ enum ReadyPathRecovery {
                 return observation
             }
         }
+        func settle(_ authority: PulseAuthority, before: NavigationPoseSample) async throws {
+            let stoppedAt = latestStopTime!
+            let limit = min(authority.expiresAt, stoppedAt + 0.6)
+            var samples: [NavigationPoseSample] = []
+            var lastFrame = latestStopSource!
+            var lastTimestamp = stoppedAt
+            var peakTravel = 0.0
+            for _ in 0..<30 {
+                try active()
+                guard environment.uptime() < limit else { break }
+                await environment.wait(.milliseconds(20))
+                try active()
+                guard environment.uptime() < limit else { break }
+                let sample = environment.pose(), time = environment.uptime()
+                if let reason = sample.rejection(at: time, expectedGeneration: generation, requireEnriched: true) {
+                    throw reject(.source(reason), sample: sample, boundary: "pulse_settle", authority: authority)
+                }
+                // Travel and heading limits remain hard even while stopped.
+                peakTravel = max(peakTravel, sample.pose!.position.distance(to: before.pose!.position))
+                if case .rejected(let reason) = authority.assessment(authority.command, sample: sample, now: time),
+                   reason != .backwardLimit && reason != .lateralLimit {
+                    throw reject(reason, sample: sample, boundary: "pulse_settle", authority: authority)
+                }
+                guard sample.frameID!.sequence > lastFrame.sequence, sample.sourceTimestamp! > lastTimestamp else { continue }
+                if let last = samples.last, sample.sourceTimestamp! - last.sourceTimestamp! < 0.05 { continue }
+                lastFrame = sample.frameID!; lastTimestamp = sample.sourceTimestamp!
+                samples.append(sample)
+                if samples.count > 3 { samples.removeFirst() }
+                let current = sample.pose!
+                let spread = samples.map { $0.pose!.position.distance(to: current.position) }.max()!
+                let yawSpread = samples.map { abs(atan2(sin($0.pose!.yaw - current.yaw), cos($0.pose!.yaw - current.yaw))) }.max()!
+                var fields = authority.diagnosticFields(sample: sample, now: time,
+                    decision: authority.assessment(authority.command, sample: sample, now: time))
+                fields["settle_elapsed_s"] = .number(time - stoppedAt)
+                fields["settle_deadline_s"] = .number(limit)
+                fields["settle_position_spread_m"] = .number(spread)
+                fields["settle_heading_spread_rad"] = .number(yawSpread)
+                fields["settle_sample_count"] = .number(Double(samples.count))
+                environment.emit("pulse_settle_sample", fields)
+                guard samples.count == 3, time - stoppedAt >= 0.15,
+                      spread <= 0.002, yawSpread <= 0.005 else { continue }
+                let travel = current.position.distance(to: before.pose!.position)
+                if authority.stage == .probe { maximumForwardPulseTravel = max(maximumForwardPulseTravel, peakTravel) }
+                fields["observed_pulse_travel_m"] = .number(travel)
+                fields["observed_pulse_peak_travel_m"] = .number(peakTravel)
+                fields["maximum_forward_pulse_travel_m"] = .number(maximumForwardPulseTravel)
+                environment.emit("pulse_settled", fields)
+                return
+            }
+            throw reject(environment.uptime() >= authority.expiresAt ? .expired : .unsettledMotion,
+                sample: environment.pose(), boundary: "pulse_settle_timeout", authority: authority)
+        }
+
         func pulse(_ authority: PulseAuthority) async throws -> PulseResult {
             try active()
             let sample = environment.pose(), time = environment.uptime()
@@ -326,10 +450,12 @@ enum ReadyPathRecovery {
             pulses += 1
             latestStopSource = environment.pose().frameID
             latestStopTime = environment.uptime()
-            await environment.wait(.milliseconds(150))
+            if authority.stage == .scan { await environment.wait(.milliseconds(150)) }
+            else { try await settle(authority, before: sample) }
             return result
         }
         do {
+            try await establishBaseline()
             var travelled = 0.0
             let probeDeadline = min(deadline, began + 3)
             let probeEnvelope = PulseAuthority(stage: .probe, origin: origin, generation: generation,
@@ -361,6 +487,16 @@ enum ReadyPathRecovery {
                 guard environment.uptime() < probeDeadline else {
                     throw reject(.expired, sample: environment.pose(), boundary: "probe_deadline", authority: probeEnvelope)
                 }
+                if forwardPulses > 0 {
+                    let allowance = 0.05 - travelled
+                    let predicted = maximumForwardPulseTravel * 1.5 + 0.005
+                    environment.emit(predicted > allowance ? "pulse_response_unfit" : "pulse_response_fits", [
+                        "observed_maximum_pulse_travel_m": .number(maximumForwardPulseTravel),
+                        "reserved_pulse_travel_m": .number(predicted), "remaining_travel_m": .number(allowance)])
+                    guard predicted <= allowance else {
+                        throw reject(.pulseResponseLimit, sample: environment.pose(), boundary: "next_probe_budget", authority: probeEnvelope)
+                    }
+                }
                 let entered = try await pulse(.init(stage: .probe, origin: origin, generation: generation,
                     maximumAlong: 0.05, expiresAt: probeDeadline, command: forward))
                 if entered == .recheck { continue }
@@ -378,9 +514,9 @@ enum ReadyPathRecovery {
                 _ = try depth() // Unknown live sensing stops the whole recovery.
                 _ = try await pulse(.init(stage: .backtrack, origin: origin, generation: generation,
                     maximumAlong: travelled, expiresAt: returnDeadline,
-                    command: .init(left: -0.25, right: -0.25)))
+                    command: .init(left: -0.12, right: -0.12)))
                 let previous = travelled
-                travelled = try await geometry(try await fresh())
+                travelled = try await geometry(try await fresh(), stageDeadline: returnDeadline)
                 guard travelled < previous else { throw Abort.failed(.stalled) }
             }
             let scanOrigin = try await fresh().pose!

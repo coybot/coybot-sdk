@@ -32,12 +32,16 @@ add_executable(avoidance_planner src/planner_node.cpp)
 target_link_libraries(avoidance_planner local_planner)
 ament_target_dependencies(avoidance_planner rclcpp nav_msgs sensor_msgs geometry_msgs std_msgs trajectory_msgs tf2_ros)
 
-install(TARGETS avoidance_planner DESTINATION lib/${PROJECT_NAME})
+# Offline replay of a saved planning problem (diagnosis; see planner_node's dump_dir).
+add_executable(replay_plan test/replay_plan.cpp)
+target_link_libraries(replay_plan local_planner)
+
+install(TARGETS avoidance_planner replay_plan DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
-  ament_add_gtest(test_local_planner test/test_local_planner.cpp TIMEOUT 300)
+  ament_add_gtest(test_local_planner test/test_local_planner.cpp TIMEOUT 900)
   target_link_libraries(test_local_planner local_planner)
 endif()
 

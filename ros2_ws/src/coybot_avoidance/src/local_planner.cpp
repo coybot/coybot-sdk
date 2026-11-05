@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <istream>
+#include <ostream>
 
 // sfc_gen.hpp (with geo_utils.hpp) first: gcopter.hpp uses geo_utils without including it.
 #include "gcopter/sfc_gen.hpp"
@@ -97,6 +99,45 @@ void VoxelMap::surface(const Eigen::Vector3d &lo, const Eigen::Vector3d &hi, std
       }
 }
 
+namespace
+{
+template <class T> void put(std::ostream &os, const T &x) { os.write(reinterpret_cast<const char *>(&x), sizeof(T)); }
+template <class T> bool get(std::istream &is, T &x) { return bool(is.read(reinterpret_cast<char *>(&x), sizeof(T))); }
+void putV(std::ostream &os, const Eigen::Vector3d &v) { for (int i = 0; i < 3; i++) put(os, v(i)); }
+bool getV(std::istream &is, Eigen::Vector3d &v) { bool ok = true; for (int i = 0; i < 3; i++) ok = ok && get(is, v(i)); return ok; }
+const uint32_t kMagic = 0x43415631;  // "CAV1"
+}  // namespace
+
+void VoxelMap::save(std::ostream &os) const
+{
+  put(os, kMagic);
+  putV(os, o_);
+  put(os, res_);
+  for (int i = 0; i < 3; i++) put(os, int32_t(n_(i)));
+  put(os, int32_t(hit_count_));
+  put(os, uint64_t(v_.size()));
+  os.write(reinterpret_cast<const char *>(v_.data()), std::streamsize(v_.size()));
+}
+
+bool VoxelMap::load(std::istream &is)
+{
+  uint32_t m = 0;
+  int32_t n[3], hc;
+  uint64_t sz;
+  if (!get(is, m) || m != kMagic || !getV(is, o_) || !get(is, res_))
+    return false;
+  for (int i = 0; i < 3; i++)
+    if (!get(is, n[i]))
+      return false;
+  if (!get(is, hc) || !get(is, sz))
+    return false;
+  n_ = Eigen::Vector3i(n[0], n[1], n[2]);
+  hit_count_ = hc;
+  v_.resize(sz);
+  hits_.assign(sz, 0);
+  return bool(is.read(reinterpret_cast<char *>(v_.data()), std::streamsize(sz))) && size_t(n_.prod()) == sz;
+}
+
 // ---------------------------------------------------------------- Reference
 
 void Reference::eval(double t, Eigen::Vector3d &pp, Eigen::Vector3d &vv, Eigen::Vector3d &aa) const
@@ -119,6 +160,56 @@ void Reference::eval(double t, Eigen::Vector3d &pp, Eigen::Vector3d &vv, Eigen::
 // ---------------------------------------------------------------- LocalPlanner
 
 LocalPlanner::LocalPlanner(const Params &p) : P_(p) {}
+
+void LocalPlanner::save(std::ostream &os, double now, const State &odom) const
+{
+  map_.save(os);
+  putV(os, goal_);
+  put(os, now);
+  putV(os, odom.p);
+  putV(os, odom.v);
+  put(os, cur_.t0);
+  put(os, cur_.dt);
+  put(os, uint64_t(cur_.p.size()));
+  for (size_t i = 0; i < cur_.p.size(); i++)
+    putV(os, cur_.p[i]), putV(os, cur_.v[i]), putV(os, cur_.a[i]);
+}
+
+bool LocalPlanner::load(std::istream &is, double &now, State &odom)
+{
+  uint64_t n = 0;
+  if (!map_.load(is) || !getV(is, goal_) || !get(is, now) || !getV(is, odom.p) || !getV(is, odom.v) ||
+      !get(is, cur_.t0) || !get(is, cur_.dt) || !get(is, n))
+    return false;
+  cur_.p.resize(n), cur_.v.resize(n), cur_.a.resize(n);
+  for (size_t i = 0; i < n; i++)
+    if (!getV(is, cur_.p[i]) || !getV(is, cur_.v[i]) || !getV(is, cur_.a[i]))
+      return false;
+  have_goal_ = true;
+  done_ = false;
+  return true;
+}
+
+bool LocalPlanner::replan(double now, Reference &out, std::string &why, PlanDebug &dbg, bool stuck)
+{
+  last_ok_t_ = stuck ? now - P_.escape_after_s - 1.0 : now;
+  escape_.clear();
+  const double ts = now + P_.lead_s;
+  Eigen::Vector3d p, v, a;
+  cur_.eval(ts, p, v, a);
+  dbg = PlanDebug();
+  dbg_ = &dbg;
+  bool ok = plan(p, v, a, ts, out, why, false);
+  if (!ok && stuck)
+  {
+    std::string why_e;
+    ok = plan(p, v, a, ts, out, why_e, true);
+    if (!ok)
+      why += "; escape: " + why_e;
+  }
+  dbg_ = nullptr;
+  return ok;
+}
 
 void LocalPlanner::setGoal(const Eigen::Vector3d &goal, const Eigen::Vector3d &start)
 {
@@ -181,6 +272,8 @@ StepResult LocalPlanner::step(double now, const State &odom)
     return res;
   }
   const double ts = now + P_.lead_s;
+  if (!std::isfinite(last_ok_t_))
+    last_ok_t_ = now;
   Eigen::Vector3d p, v, a;
   if (cur_.ok())
     cur_.eval(ts, p, v, a);
@@ -201,9 +294,18 @@ StepResult LocalPlanner::step(double now, const State &odom)
     return res;
   }
   Reference r;
-  if (plan(p, v, a, ts, r, res.detail))
+  bool ok = plan(p, v, a, ts, r, res.detail, false);
+  if (!ok && ts - P_.lead_s - last_ok_t_ >= P_.escape_after_s)
+  {
+    std::string why_e;
+    ok = plan(p, v, a, ts, r, why_e, true);  // dead end: a local goal along a route to the goal itself
+    if (!ok)
+      res.detail += "; escape: " + why_e;
+  }
+  if (ok)
   {
     cur_ = r;
+    last_ok_t_ = now;
     braking_ = false;
     res.outcome = Outcome::Plan;
     return res;
@@ -256,15 +358,76 @@ bool LocalPlanner::roomy(const Eigen::Vector3d &q) const
   return true;
 }
 
+bool LocalPlanner::escapeGoal(const Eigen::Vector3d &p, const Eigen::Vector3d &ps, double ts, Eigen::Vector3d &lg)
+{
+  // reuse the last escape route for escape_hold_s while it is still clear; otherwise search a new one
+  bool blocked = escape_.empty() || ts - escape_t_ >= P_.escape_hold_s;
+  for (size_t i = 1; i < escape_.size() && !blocked; i++)  // the map grew since: still clear?
+  {
+    const double L = (escape_[i] - escape_[i - 1]).norm();
+    for (double s = 0.0; s <= L && !blocked; s += map_.resolution())
+      blocked = map_.query(escape_[i - 1] + (escape_[i] - escape_[i - 1]) * (L > 1e-9 ? s / L : 0.0)) != 0;
+  }
+  if (blocked && map_.query(ps) == 0)
+  {
+    const double res = map_.resolution();
+    Eigen::Vector3d lo = map_.origin() + Eigen::Vector3d::Constant(res), hi = map_.origin() + map_.extent() -
+                                                                              Eigen::Vector3d::Constant(res);
+    lo(2) = goal_(2) - P_.slab_m;
+    hi(2) = goal_(2) + P_.slab_m;
+    std::vector<Eigen::Vector3d> route;
+    escape_.clear();
+    if (std::isfinite(sfc_gen::planPath<VoxelMap>(ps, goal_, lo, hi, &map_, P_.escape_timeout_s, route)) &&
+        route.size() >= 2 && (route.back() - goal_).norm() < 0.5 * res + 1e-6)
+    {
+      escape_ = route;
+      escape_t_ = ts;
+    }
+  }
+  else if (blocked)
+    escape_.clear();
+  if (escape_.empty())
+    return false;
+  // local goal: horizon_m along the escape route from its point nearest the vehicle, back to a roomy one
+  size_t k = 0;
+  double best = INFINITY;
+  for (size_t i = 0; i < escape_.size(); i++)
+    if ((escape_[i] - p).norm() < best)
+      best = (escape_[i] - p).norm(), k = i;
+  std::vector<Eigen::Vector3d> ahead;
+  double s = 0.0;
+  ahead.push_back(escape_[k]);
+  for (size_t i = k + 1; i < escape_.size() && s < P_.horizon_m; i++)
+  {
+    const double L = (escape_[i] - escape_[i - 1]).norm();
+    for (double u = 0.1; u <= L && s + u <= P_.horizon_m; u += 0.1)
+      ahead.push_back(escape_[i - 1] + (escape_[i] - escape_[i - 1]) * (u / L));
+    s += L;
+  }
+  for (int i = int(ahead.size()) - 1; i >= 0; i--)
+    if ((ahead[i] - p).head<2>().norm() > 1.0 && roomy(ahead[i]))
+    {
+      lg = ahead[i];
+      if (dbg_)
+        dbg_->escape = escape_;
+      return true;
+    }
+  return false;
+}
+
 bool LocalPlanner::plan(const Eigen::Vector3d &p, const Eigen::Vector3d &v, const Eigen::Vector3d &a, double ts,
-                        Reference &out, std::string &why)
+                        Reference &out, std::string &why, bool escape)
 {
   const double alt = goal_(2);
   Eigen::Vector3d d = goal_ - p;
   d(2) = 0.0;
   Eigen::Vector3d lg = d.norm() > P_.horizon_m ? Eigen::Vector3d(p + d.normalized() * P_.horizon_m) : goal_;
   lg(2) = alt;
-  if (!roomy(lg))
+  Eigen::Vector3d pe = p;
+  pe(2) = std::clamp(pe(2), alt - P_.slab_m + 0.05, alt + P_.slab_m - 0.05);
+  if (escape && !escapeGoal(p, pe, ts, lg))
+    return why = "no route to the goal", false;
+  if (!escape && !roomy(lg))
   {
     // nearest roomy point: back along the line, then sideways
     const Eigen::Vector3d u = d.norm() > 1e-6 ? Eigen::Vector3d(d.normalized()) : Eigen::Vector3d::UnitX();
@@ -285,6 +448,8 @@ bool LocalPlanner::plan(const Eigen::Vector3d &p, const Eigen::Vector3d &v, cons
       return why = "no free local goal", false;
   }
   const double res = map_.resolution();
+  if (dbg_)
+    dbg_->start = p, dbg_->local_goal = lg;
   Eigen::Vector3d lo = p.cwiseMin(lg) - Eigen::Vector3d(6, 6, 0), hi = p.cwiseMax(lg) + Eigen::Vector3d(6, 6, 0);
   lo(2) = alt - P_.slab_m;
   hi(2) = alt + P_.slab_m;
@@ -294,9 +459,45 @@ bool LocalPlanner::plan(const Eigen::Vector3d &p, const Eigen::Vector3d &v, cons
   ps(2) = std::clamp(ps(2), lo(2) + 0.05, hi(2) - 0.05);
   if (map_.query(ps) != 0)
     return why = "start inside the grown map", false;
+  // OMPL counts an approximate solution as solved, so planPath can return a route that stops short of the local
+  // goal. A corridor along it cannot reach the goal, and GCOPTER, asked to end there, leaves free space (round S2:
+  // the vehicle stuck in dense forest, every plan meeting the map at the same place).
   std::vector<Eigen::Vector3d> route;
-  if (!std::isfinite(sfc_gen::planPath<VoxelMap>(ps, lg, lo, hi, &map_, P_.rrt_timeout_s, route)) || route.size() < 2)
-    return why = "no route", false;
+  const auto reaches = [&]() { return route.size() >= 2 && (route.back() - lg).norm() < 0.5 * res + 1e-6; };
+  const auto search = [&](double timeout) {
+    route.clear();
+    return std::isfinite(sfc_gen::planPath<VoxelMap>(ps, lg, lo, hi, &map_, timeout, route));
+  };
+  if (!search(P_.rrt_timeout_s) || !reaches())
+  {
+    const std::vector<Eigen::Vector3d> first = route;
+    if (!(P_.rrt_retry_timeout_s > 0.0 && search(P_.rrt_retry_timeout_s) && reaches()))
+    {
+      if (route.size() < 2)
+        route = first;
+      // walk back along the partial route to the furthest roomy point more than 1 m away
+      bool usable = false;
+      Eigen::Vector3d q;
+      int seg = -1;
+      for (int i = int(route.size()) - 1; P_.partial_route_goal && i >= 1 && !usable; i--)
+      {
+        const double L = (route[i] - route[i - 1]).norm();
+        for (double s = L; s >= 0.0 && !usable; s -= 0.1)
+        {
+          q = route[i - 1] + (route[i] - route[i - 1]) * (L > 1e-9 ? s / L : 0.0);
+          usable = (q - p).head<2>().norm() > 1.0 && roomy(q);
+          seg = i;
+        }
+      }
+      if (!usable)
+        return why = route.size() < 2 ? "no route" : "route stops short of the local goal", false;
+      route.resize(size_t(seg) + 1);  // the corridor follows the route up to that point
+      route.back() = q;
+      lg = q;
+      if (dbg_)
+        dbg_->local_goal = lg;
+    }
+  }
   std::vector<Eigen::Vector3d> pts;
   map_.surface(lo - Eigen::Vector3d::Constant(1.0), hi + Eigen::Vector3d::Constant(1.0), pts);
   for (int sx : {-1, 1})  // FIRI needs at least one point: far corners, outside every box
@@ -305,6 +506,8 @@ bool LocalPlanner::plan(const Eigen::Vector3d &p, const Eigen::Vector3d &v, cons
   std::vector<Eigen::MatrixX4d> hpolys;
   sfc_gen::convexCover(route, pts, lo, hi, 7.0, 3.0, hpolys);
   sfc_gen::shortCut(hpolys);
+  if (dbg_)
+    dbg_->route = route, dbg_->corridor = hpolys;
   if (hpolys.empty())
     return why = "no corridor", false;
   Eigen::Matrix3d ini, fin;
@@ -323,13 +526,33 @@ bool LocalPlanner::plan(const Eigen::Vector3d &p, const Eigen::Vector3d &v, cons
       h.col(3).array() += P_.corridor_margin_m;  // inside: A x + b <= 0
     }
     std::string why_m;
-    if (optimise(shrunk, ini, fin, ts, out, why_m))
+    if (record(optimise(shrunk, ini, fin, ts, out, why_m), P_.corridor_margin_m, out, why_m))
       return true;
-    if (!optimise(hpolys, ini, fin, ts, out, why))
+    if (!record(optimise(hpolys, ini, fin, ts, out, why), 0.0, out, why))
       return why = why_m + " (with margin); " + why + " (without)", false;
     return true;
   }
-  return optimise(hpolys, ini, fin, ts, out, why);
+  return record(optimise(hpolys, ini, fin, ts, out, why), 0.0, out, why);
+}
+
+bool LocalPlanner::record(bool ok, double margin, const Reference &r, const std::string &why) const
+{
+  if (dbg_)
+  {
+    PlanDebug::Attempt at;
+    at.margin = margin;
+    at.why = ok ? "" : why;
+    if (ok || why.rfind("optimiser", 0) != 0)  // a failed setup or optimisation leaves r stale
+      at.ref = r;
+    for (size_t i = 0; !ok && i < r.p.size(); i++)
+      if (map_.query(r.p[i]) != 0 && i > 0)
+      {
+        at.bad_sample = int(i);
+        break;
+      }
+    dbg_->attempts.push_back(at);
+  }
+  return ok;
 }
 
 bool LocalPlanner::optimise(const std::vector<Eigen::MatrixX4d> &hpolys, const Eigen::Matrix3d &ini,

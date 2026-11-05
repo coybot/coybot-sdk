@@ -17,6 +17,11 @@ avoidance_planner:
     skip_pixel: 2
     slab_m: 1.0               # plans stay within +- this of the goal altitude
     rrt_timeout_s: 0.02
+    rrt_retry_timeout_s: 0.1  # when the first route search stops short of the local goal
+    partial_route_goal: true  # then aim for the end of the partial route (if roomy)
+    escape_after_s: 1.0       # no plan this long: also try a local goal on a route to the goal across the map
+    escape_timeout_s: 0.3
+    escape_hold_s: 8.0        # that route is reused this long while clear
     check_dt_s: 0.02
     min_plan_s: 0.3
     goal_margin_m: 0.3

@@ -6,8 +6,11 @@
 // Each step():
 //   start     = the current reference at now + lead_s (stitched), or the odometry for the first plan;
 //   local goal = horizon_m along the straight line to the goal, moved to the nearest point with goal_margin_m of
-//               free space around it if needed;
-//   route     = OMPL InformedRRT* in a box around start and local goal (GCOPTER's sfc_gen::planPath);
+//               free space around it if needed; when that fails after escape_after_s without a plan, horizon_m
+//               along a route to the goal searched across the whole map;
+//   route     = OMPL InformedRRT* in a box around start and local goal (GCOPTER's sfc_gen::planPath). OMPL
+//               reports a partial route as solved; a route that stops short of the local goal is searched
+//               again for longer, and then the local goal moves to its end (if roomy) or there is no plan;
 //   corridor  = FIRI convex polytopes along the route (sfc_gen::convexCover + shortCut), each face moved
 //               inward by corridor_margin_m (FIRI keeps voxel centres out; the check rejects whole voxels);
 //   trajectory = GCOPTER_PolytopeSFC, ending at rest at the local goal, within speed, tilt, body-rate and thrust;
@@ -25,7 +28,9 @@
 #pragma once
 
 #include <Eigen/Eigen>
+#include <cmath>
 #include <cstdint>
+#include <iosfwd>
 #include <string>
 #include <vector>
 
@@ -44,6 +49,14 @@ struct Params
   int skip_pixel = 2;             // use every n-th depth pixel in each direction
   double slab_m = 1.0;            // plans stay within +- slab_m of the goal altitude
   double rrt_timeout_s = 0.02;
+  double rrt_retry_timeout_s = 0.1;  // second route search when the first does not reach the local goal
+  bool partial_route_goal = true;    // if neither does, aim for the end of the partial route (if roomy)
+  // Escape from dead ends: after escape_after_s without a new plan, when the usual plan fails, try once more with a
+  // local goal along a route to the goal itself searched across the whole map (escape_timeout_s); that route is
+  // reused for escape_hold_s while it stays clear.
+  double escape_after_s = 1.0;
+  double escape_timeout_s = 0.3;
+  double escape_hold_s = 8.0;
   double check_dt_s = 0.02;
   double min_plan_s = 0.3;        // shorter plans are rejected (degenerate near the goal)
   double goal_margin_m = 0.3;     // free space required around a local goal
@@ -81,6 +94,9 @@ public:
   // Boundary voxels of the grown region inside a box (the points FIRI keeps corridors away from), every other z.
   void surface(const Eigen::Vector3d &lo, const Eigen::Vector3d &hi, std::vector<Eigen::Vector3d> &pts) const;
   const Eigen::Vector3d &origin() const { return o_; }
+  // Binary snapshot of the grid (for offline replay of a planning problem).
+  void save(std::ostream &os) const;
+  bool load(std::istream &is);
   Eigen::Vector3d extent() const { return n_.cast<double>() * res_; }
   double resolution() const { return res_; }
 
@@ -141,6 +157,22 @@ enum class Outcome
 };
 const char *to_string(Outcome o);
 
+// What one planning attempt produced, for offline diagnosis (filled only when LocalPlanner::debug is set).
+struct PlanDebug
+{
+  Eigen::Vector3d start = Eigen::Vector3d::Zero(), local_goal = Eigen::Vector3d::Zero();
+  std::vector<Eigen::Vector3d> route, escape;    // escape: the route to the goal, when escaping
+  std::vector<Eigen::MatrixX4d> corridor;          // as FIRI built it (before any margin)
+  struct Attempt
+  {
+    double margin = 0.0;
+    std::string why;                               // empty when it passed
+    Reference ref;
+    int bad_sample = -1;                           // index into ref.p where it met the map, if it did
+  };
+  std::vector<Attempt> attempts;
+};
+
 struct StepResult
 {
   Outcome outcome = Outcome::Idle;
@@ -165,17 +197,29 @@ public:
   // The reference to follow (valid after a Plan or Brake outcome).
   const Reference &reference() const { return cur_; }
   const VoxelMap &map() const { return map_; }
+  // Snapshot of the planning problem at time now (map, goal, reference, odometry) and its replay: plan once from
+  // the snapshot's start state without changing anything, filling dbg.
+  void save(std::ostream &os, double now, const State &odom) const;
+  bool load(std::istream &is, double &now, State &odom);
+  // stuck: as if no plan had passed for longer than escape_after_s (so the escape search runs).
+  bool replan(double now, Reference &out, std::string &why, PlanDebug &dbg, bool stuck);
   const Params &params() const { return P_; }
 
 private:
   bool roomy(const Eigen::Vector3d &q) const;
   bool plan(const Eigen::Vector3d &p, const Eigen::Vector3d &v, const Eigen::Vector3d &a, double ts, Reference &out,
-            std::string &why);
+            std::string &why, bool escape);
   bool optimise(const std::vector<Eigen::MatrixX4d> &hpolys, const Eigen::Matrix3d &ini, const Eigen::Matrix3d &fin,
                 double ts, Reference &out, std::string &why) const;
   double blockedAhead(const Reference &r, double t) const;
+  bool record(bool ok, double margin, const Reference &r, const std::string &why) const;
 
   Params P_;
+  PlanDebug *dbg_ = nullptr;
+  double last_ok_t_ = -INFINITY;               // last time a plan passed (or the first step)
+  std::vector<Eigen::Vector3d> escape_;         // route to the goal, while escaping
+  double escape_t_ = -INFINITY;
+  bool escapeGoal(const Eigen::Vector3d &p, const Eigen::Vector3d &ps, double ts, Eigen::Vector3d &lg);
   VoxelMap map_;
   Reference cur_;
   Eigen::Vector3d goal_ = Eigen::Vector3d::Zero();

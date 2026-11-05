@@ -14,6 +14,7 @@
 //                             rotations are identity, the follower chooses yaw)
 //        status              (std_msgs/String, one per planning cycle: "plan", "keep: why", "brake: why", ...)
 #include <deque>
+#include <fstream>
 #include <memory>
 #include <mutex>
 
@@ -48,6 +49,11 @@ public:
     p.skip_pixel = int(declare_parameter("skip_pixel", int64_t(p.skip_pixel)));
     p.slab_m = declare_parameter("slab_m", p.slab_m);
     p.rrt_timeout_s = declare_parameter("rrt_timeout_s", p.rrt_timeout_s);
+    p.rrt_retry_timeout_s = declare_parameter("rrt_retry_timeout_s", p.rrt_retry_timeout_s);
+    p.partial_route_goal = declare_parameter("partial_route_goal", p.partial_route_goal);
+    p.escape_after_s = declare_parameter("escape_after_s", p.escape_after_s);
+    p.escape_timeout_s = declare_parameter("escape_timeout_s", p.escape_timeout_s);
+    p.escape_hold_s = declare_parameter("escape_hold_s", p.escape_hold_s);
     p.check_dt_s = declare_parameter("check_dt_s", p.check_dt_s);
     p.min_plan_s = declare_parameter("min_plan_s", p.min_plan_s);
     p.goal_margin_m = declare_parameter("goal_margin_m", p.goal_margin_m);
@@ -73,6 +79,7 @@ public:
     base_frame_ = declare_parameter("base_frame", std::string("base_link"));
     camera_frame_ = declare_parameter("camera_frame", std::string(""));
     output_dt_ = declare_parameter("output_dt_s", 0.02);
+    dump_dir_ = declare_parameter("dump_dir", std::string(""));  // diagnosis: snapshot when stuck (empty = off)
     const double hz = declare_parameter("plan_hz", 10.0);
     planner_ = std::make_unique<LocalPlanner>(p);
 
@@ -253,11 +260,39 @@ private:
     std_msgs::msg::String st;
     st.data = std::string(to_string(r.outcome)) + (r.detail.empty() ? "" : ": " + r.detail);
     status_pub_->publish(st);
-    if (r.outcome == Outcome::Brake || r.outcome == Outcome::Arrived)
-      RCLCPP_INFO(get_logger(), "%s", st.data.c_str());
-    else if (r.outcome != Outcome::Plan && r.detail != "final approach")
-      RCLCPP_DEBUG(get_logger(), "%s", st.data.c_str());
+    // Log every brake and arrival, and every change of outcome with how long the previous one lasted, so a stuck
+    // vehicle says why without a line per cycle. Repeats of the same non-plan outcome are logged once a second.
+    const double t = now().seconds();
+    const bool changed = r.outcome != last_outcome_;
+    if (r.outcome == Outcome::Brake || r.outcome == Outcome::Arrived || (changed && r.outcome != Outcome::Plan) ||
+        (r.outcome != Outcome::Plan && r.detail != "final approach" && t - last_log_s_ >= 1.0))
+    {
+      RCLCPP_INFO(get_logger(), "%s (%d cycles of %s before)", st.data.c_str(), same_count_, to_string(last_outcome_));
+      last_log_s_ = t;
+    }
+    same_count_ = changed ? 1 : same_count_ + 1;
+    last_outcome_ = r.outcome;
+    // Diagnosis: after 2 s without a new plan, save the planning problem once per episode (at most 5 per run)
+    // for offline replay (replay_plan).
+    if (r.outcome == Outcome::Plan || r.outcome == Outcome::Arrived)
+      dumped_episode_ = false;
+    else if (!dump_dir_.empty() && r.detail != "final approach" && same_count_ >= 20 && !dumped_episode_ &&
+             dumps_ < 5)
+    {
+      const std::string path = dump_dir_ + "/stuck_" + std::to_string(++dumps_) + ".bin";
+      std::ofstream os(path, std::ios::binary);
+      planner_->save(os, t, s);
+      dumped_episode_ = true;
+      RCLCPP_INFO(get_logger(), "saved the planning problem to %s", path.c_str());
+    }
   }
+
+  Outcome last_outcome_ = Outcome::Idle;
+  std::string dump_dir_;
+  int dumps_ = 0;
+  bool dumped_episode_ = false;
+  int same_count_ = 0;
+  double last_log_s_ = 0.0;
 
   std::mutex mu_;
   std::unique_ptr<LocalPlanner> planner_;

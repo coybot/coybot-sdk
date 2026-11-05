@@ -243,3 +243,27 @@ TEST(LocalPlanner, StopsWhenTheWayIsShut)
   EXPECT_LT(s.v.norm(), 0.05);
   EXPECT_LT(x_max, wall_x - P.inflate_m + P.map_res_m) << brakes << " brakes";
 }
+
+TEST(LocalPlanner, GetsOutOfADeadEnd)
+{
+  // A U of trunks opening towards the start, straight across the line to the goal: the straight-line local goal
+  // sits behind its back wall. The vehicle has to leave the pocket and go round.
+  Params P;
+  std::vector<Trunk> trunks;
+  for (double y = -4.0; y <= 4.0 + 1e-9; y += 0.5)
+    trunks.push_back({20.0, y, 0.2});            // back wall
+  for (double x = 12.0; x < 20.0; x += 0.5)
+  {
+    trunks.push_back({x, -4.0, 0.2});            // side walls
+    trunks.push_back({x, 4.0, 0.2});
+  }
+  int arrived = 0;
+  for (int k = 0; k < 3; k++)
+  {
+    LocalPlanner pl(P);
+    const auto f = fly(pl, trunks, Vector3d(0, 0, 2.5), Vector3d(40, 0, 2.5), 90.0);
+    arrived += f.arrived;
+    EXPECT_GT(f.min_clearance, P.inflate_m - 0.2) << "try " << k;
+  }
+  EXPECT_GE(arrived, 2) << "of 3 tries";
+}

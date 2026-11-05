@@ -310,6 +310,31 @@ bool LocalPlanner::plan(const Eigen::Vector3d &p, const Eigen::Vector3d &v, cons
   Eigen::Matrix3d ini, fin;
   ini << p, v, a;
   fin << lg, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero();
+  // FIRI keeps the corridor off voxel centres; the check rejects any sample inside a voxel, and GCOPTER's corridor
+  // constraint is a penalty. Moving each face inward gives the trajectory room; without it, plans near trunks met
+  // the map partway along again and again (round G2: the drone stuck). The unshrunk corridor is the fallback.
+  if (P_.corridor_margin_m > 0.0)
+  {
+    std::vector<Eigen::MatrixX4d> shrunk = hpolys;
+    for (auto &h : shrunk)
+    {
+      const Eigen::ArrayXd n = h.leftCols<3>().rowwise().norm();
+      h.array().colwise() /= n;
+      h.col(3).array() += P_.corridor_margin_m;  // inside: A x + b <= 0
+    }
+    std::string why_m;
+    if (optimise(shrunk, ini, fin, ts, out, why_m))
+      return true;
+    if (!optimise(hpolys, ini, fin, ts, out, why))
+      return why = why_m + " (with margin); " + why + " (without)", false;
+    return true;
+  }
+  return optimise(hpolys, ini, fin, ts, out, why);
+}
+
+bool LocalPlanner::optimise(const std::vector<Eigen::MatrixX4d> &hpolys, const Eigen::Matrix3d &ini,
+                            const Eigen::Matrix3d &fin, double ts, Reference &out, std::string &why) const
+{
   Eigen::VectorXd mag(5), pen(5), phy(6);
   mag << P_.max_vel, P_.max_bodyrate, P_.max_tilt_rad, P_.thrust_min_n, P_.thrust_max_n;
   for (int i = 0; i < 5; i++)

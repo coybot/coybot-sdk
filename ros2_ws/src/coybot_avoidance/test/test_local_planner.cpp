@@ -156,15 +156,16 @@ TEST(LocalPlanner, OpenSpaceArrivesAndStops)
 
 TEST(LocalPlanner, ForestReachesGoalWithClearance)
 {
+  for (double spacing : {5.0, 3.5})
   for (unsigned seed : {1u, 2u, 3u})
     for (double v : {4.0, 8.0})
     {
       Params P;
       P.max_vel = v;
       LocalPlanner pl(P);
-      const auto trunks = forest(seed, 5.0);
+      const auto trunks = forest(seed, spacing);
       const auto f = fly(pl, trunks, Vector3d(0, 0, 2.5), Vector3d(70, 0, 2.5), 90.0);
-      EXPECT_TRUE(f.arrived) << "seed " << seed << " at " << v << " m/s, ended at " << f.end.transpose();
+      EXPECT_TRUE(f.arrived) << "spacing " << spacing << " m, seed " << seed << " at " << v << " m/s, ended at " << f.end.transpose();
       // keep-out 0.8 m in 0.1 m voxels: the centre can come to within a voxel diagonal of it
       EXPECT_GT(f.min_clearance, P.inflate_m - 0.2) << "seed " << seed << " at " << v << " m/s";
     }

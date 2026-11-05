@@ -51,6 +51,7 @@ public:
     p.check_dt_s = declare_parameter("check_dt_s", p.check_dt_s);
     p.min_plan_s = declare_parameter("min_plan_s", p.min_plan_s);
     p.goal_margin_m = declare_parameter("goal_margin_m", p.goal_margin_m);
+    p.corridor_margin_m = declare_parameter("corridor_margin_m", p.corridor_margin_m);
     p.final_approach_m = declare_parameter("final_approach_m", p.final_approach_m);
     p.arrive_m = declare_parameter("arrive_m", p.arrive_m);
     p.brake_acc = declare_parameter("brake_acc", p.brake_acc);

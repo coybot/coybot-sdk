@@ -20,6 +20,7 @@ avoidance_planner:
     check_dt_s: 0.02
     min_plan_s: 0.3
     goal_margin_m: 0.3
+    corridor_margin_m: 0.15   # corridor faces moved inward (0 = off); falls back to 0 if that fails
     final_approach_m: 1.5
     arrive_m: 0.3
     brake_acc: 3.0            # m/s^2

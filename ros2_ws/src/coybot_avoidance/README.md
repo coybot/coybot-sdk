@@ -42,6 +42,9 @@ Run the bridge at 50 Hz with the planner, because the planner matches each depth
 
 - `max_vel`: speed cap (m/s).
 - `inflate_m`: keep-out distance from any seen surface, vehicle radius included.
+- `corridor_margin_m`: how far each corridor face is moved inward before GCOPTER runs. The corridor keeps
+  only voxel centres out, but the check rejects whole voxels. With the margin off, plans near trunks failed
+  again and again and the drone got stuck. If a plan fails with the margin, it is retried without.
 - `horizon_m`: how far ahead the local goal is.
 - `slab_m`: how far plans may move from the goal altitude.
 - `brake_acc`, `brake_latency_s`, `brake_margin_m`: the stopping-distance rule.

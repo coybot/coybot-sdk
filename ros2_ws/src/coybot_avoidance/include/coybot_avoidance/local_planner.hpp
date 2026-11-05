@@ -8,10 +8,12 @@
 //   local goal = horizon_m along the straight line to the goal, moved to the nearest point with goal_margin_m of
 //               free space around it if needed;
 //   route     = OMPL InformedRRT* in a box around start and local goal (GCOPTER's sfc_gen::planPath);
-//   corridor  = FIRI convex polytopes along the route (sfc_gen::convexCover + shortCut);
+//   corridor  = FIRI convex polytopes along the route (sfc_gen::convexCover + shortCut), each face moved
+//               inward by corridor_margin_m (FIRI keeps voxel centres out; the check rejects whole voxels);
 //   trajectory = GCOPTER_PolytopeSFC, ending at rest at the local goal, within speed, tilt, body-rate and thrust;
 //   check     = sampled every check_dt_s against the grown map, rejected if it meets it, is not finite, is shorter
-//               than min_plan_s or exceeds the speed cap by 10 %.
+//               than min_plan_s or exceeds the speed cap by 10 %; on failure retried once with the unshrunk
+//               corridor.
 // No valid plan: keep the current reference while it is clear; if it meets the map nearer than the stopping
 // distance v^2 / (2 brake_acc) + v brake_latency_s + brake_margin_m, replace it with a straight stop at brake_acc.
 //
@@ -45,6 +47,8 @@ struct Params
   double check_dt_s = 0.02;
   double min_plan_s = 0.3;        // shorter plans are rejected (degenerate near the goal)
   double goal_margin_m = 0.3;     // free space required around a local goal
+  double corridor_margin_m = 0.15; // corridor faces moved inward by this before GCOPTER (0 = off); retried
+                                  // without it if that fails
   double final_approach_m = 1.5;  // no replanning this close to the goal when the reference already ends there
   double arrive_m = 0.3;
   double brake_acc = 3.0;         // m/s^2
@@ -167,6 +171,8 @@ private:
   bool roomy(const Eigen::Vector3d &q) const;
   bool plan(const Eigen::Vector3d &p, const Eigen::Vector3d &v, const Eigen::Vector3d &a, double ts, Reference &out,
             std::string &why);
+  bool optimise(const std::vector<Eigen::MatrixX4d> &hpolys, const Eigen::Matrix3d &ini, const Eigen::Matrix3d &fin,
+                double ts, Reference &out, std::string &why) const;
   double blockedAhead(const Reference &r, double t) const;
 
   Params P_;

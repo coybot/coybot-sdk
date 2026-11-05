@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>coybot_avoidance</name>
+  <version>0.1.0</version>
+  <description>Map-free obstacle avoidance for multirotors from a depth camera: GCOPTER trajectories in convex
+    corridors, checked against an online voxel map, with braking when no safe plan exists.</description>
+  <maintainer email="team@coy.bot">Coybot AI</maintainer>
+  <license>Apache-2.0</license>
+  <!-- third_party/gcopter: MIT (GCOPTER), see third_party/gcopter/README.md -->
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>trajectory_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>ompl</depend>
+  <depend>eigen</depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

@@ -15,3 +15,9 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+This product includes GCOPTER (https://github.com/ZJU-FAST-Lab/GCOPTER),
+Copyright (c) 2021 Zhepei Wang and Fei Gao, under the MIT License, with
+sdlp.hpp (Copyright (c) 1990 Michael E. Hohmeyer, 2021 Zhepei Wang) and
+quickhull.hpp (public domain, Antti Kuukka). See
+ros2_ws/src/coybot_avoidance/third_party/gcopter/.

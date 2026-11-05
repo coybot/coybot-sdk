@@ -4,18 +4,30 @@ MAVLink Bridge Node — converts ROS 2 velocity commands to MAVLink.
 
 Subscribes to Nav2 velocity commands (``/cmd_vel``) and converts them to
 MAVLink ``SET_POSITION_TARGET_LOCAL_NED`` messages for the flight
-controller. Also publishes drone state (position, velocity, odometry,
-battery) to ROS 2 topics.
+controller. Also follows planned trajectories (``/avoidance/trajectory``, from
+coybot_avoidance) with position, velocity, acceleration and yaw targets, which
+PX4 (OFFBOARD) and ArduPilot (GUIDED) both accept; putting the vehicle in that
+mode is left to the caller. Publishes drone state (position, velocity,
+odometry with attitude, battery) to ROS 2 topics.
+
+Frames: ``odom`` is x north, y west, z up (NED with y and z negated);
+``base_link`` is x forward, y left, z up. Odometry twist is in ``base_link``.
 
 See https://coy.bot/docs for details.
 """
+
+import math
 
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist, PoseStamped, TwistStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import BatteryState
+from trajectory_msgs.msg import MultiDOFJointTrajectory
 import tf2_ros
+
+from coybot_drone.trajectory_follow import (
+    MAV_FRAME_LOCAL_NED, TYPE_MASK_PVA_YAW, Follower, to_ned)
 
 
 class MAVLinkBridgeNode(Node):
@@ -23,7 +35,8 @@ class MAVLinkBridgeNode(Node):
     ROS 2 node that bridges Nav2 commands to MAVLink.
 
     Subscribes:
-    - ``/cmd_vel``: Velocity commands from Nav2.
+    - ``/cmd_vel``: Velocity commands from Nav2 (a command clears any trajectory being followed).
+    - ``trajectory_topic`` (``/avoidance/trajectory``): trajectories to follow.
 
     Publishes:
     - ``/mavlink/local_position/pose``
@@ -42,13 +55,17 @@ class MAVLinkBridgeNode(Node):
 
         self.declare_parameter("serial_port", "/dev/ttyACM0")
         self.declare_parameter("baud_rate", 115200)
-        self.declare_parameter("state_publish_rate", 10.0)
+        self.declare_parameter("state_publish_rate", 10.0)   # Hz; also the rate requested from the autopilot
+        self.declare_parameter("trajectory_topic", "/avoidance/trajectory")
+        self.declare_parameter("setpoint_rate", 20.0)        # Hz, while following a trajectory
 
         self.serial_port = self.get_parameter("serial_port").value
         self.baud_rate = self.get_parameter("baud_rate").value
         self.state_rate = self.get_parameter("state_publish_rate").value
 
         self._mavlink = None
+        self._att = (0.0, 0.0, 0.0)   # roll, pitch, yaw from ATTITUDE (NED / FRD), rad
+        self.follower = Follower()
 
         self.cmd_vel_sub = self.create_subscription(
             Twist, "/cmd_vel", self.cmd_vel_callback, 10
@@ -60,6 +77,10 @@ class MAVLinkBridgeNode(Node):
         self.battery_pub = self.create_publisher(BatteryState, "/mavlink/battery", 10)
 
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
+
+        self.traj_sub = self.create_subscription(
+            MultiDOFJointTrajectory, self.get_parameter("trajectory_topic").value, self.trajectory_callback, 10)
+        self.follow_timer = self.create_timer(1.0 / self.get_parameter("setpoint_rate").value, self.follow)
 
         state_period = 1.0 / self.state_rate
         self.state_timer = self.create_timer(state_period, self.publish_state)
@@ -114,6 +135,9 @@ class MAVLinkBridgeNode(Node):
             return
 
         self.last_cmd_time = self.get_clock().now()
+        if self.follower.has_trajectory():
+            self.get_logger().info("velocity command: trajectory dropped")
+            self.follower = Follower()
 
         vx = self._clamp(msg.linear.x, -self.MAX_LINEAR_VEL, self.MAX_LINEAR_VEL)
         vy = self._clamp(-msg.linear.y, -self.MAX_LINEAR_VEL, self.MAX_LINEAR_VEL)
@@ -141,6 +165,8 @@ class MAVLinkBridgeNode(Node):
         if mav is None:
             return
 
+        if self.follower.active(self._now_s()):
+            return
         time_since_cmd = self.get_clock().now() - self.last_cmd_time
         if time_since_cmd > self.cmd_timeout:
             try:
@@ -171,7 +197,7 @@ class MAVLinkBridgeNode(Node):
                 mav.target_system,
                 mav.target_component,
                 0,  # MAV_DATA_STREAM_ALL
-                10,
+                int(self.state_rate),
                 1,
             )
 
@@ -188,7 +214,7 @@ class MAVLinkBridgeNode(Node):
                     self._publish_odom(msg, timestamp)
 
                 elif msg_type == "ATTITUDE":
-                    pass  # could publish attitude separately
+                    self._att = (msg.roll, msg.pitch, msg.yaw)
 
                 elif msg_type == "SYS_STATUS":
                     self._publish_battery(msg, timestamp)
@@ -205,7 +231,7 @@ class MAVLinkBridgeNode(Node):
         pose.pose.position.x = msg.x
         pose.pose.position.y = -msg.y
         pose.pose.position.z = -msg.z
-        pose.pose.orientation.w = 1.0
+        pose.pose.orientation = self._orientation()
 
         self.pose_pub.publish(pose)
         self._broadcast_tf(pose, timestamp)
@@ -230,11 +256,13 @@ class MAVLinkBridgeNode(Node):
         odom.pose.pose.position.x = msg.x
         odom.pose.pose.position.y = -msg.y
         odom.pose.pose.position.z = -msg.z
-        odom.pose.pose.orientation.w = 1.0
+        odom.pose.pose.orientation = self._orientation()
 
-        odom.twist.twist.linear.x = msg.vx
-        odom.twist.twist.linear.y = -msg.vy
-        odom.twist.twist.linear.z = -msg.vz
+        # twist in base_link (REP 105): rotate the odom-frame velocity into the body
+        bx, by, bz = self._to_body(msg.vx, -msg.vy, -msg.vz)
+        odom.twist.twist.linear.x = bx
+        odom.twist.twist.linear.y = by
+        odom.twist.twist.linear.z = bz
 
         self.odom_pub.publish(odom)
 
@@ -263,6 +291,62 @@ class MAVLinkBridgeNode(Node):
         t.transform.rotation = pose.pose.orientation
 
         self.tf_broadcaster.sendTransform(t)
+
+    def _now_s(self) -> float:
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    def _rpy_odom(self):
+        """Attitude in odom / base_link (x north, y west, z up; FLU): NED/FRD with y and z negated."""
+        r, p, y = self._att
+        return r, -p, -y
+
+    def _orientation(self):
+        from geometry_msgs.msg import Quaternion
+        r, p, y = self._rpy_odom()
+        cr, sr, cp, sp, cy, sy = (math.cos(r / 2), math.sin(r / 2), math.cos(p / 2), math.sin(p / 2),
+                                  math.cos(y / 2), math.sin(y / 2))
+        return Quaternion(w=cr * cp * cy + sr * sp * sy, x=sr * cp * cy - cr * sp * sy,
+                          y=cr * sp * cy + sr * cp * sy, z=cr * cp * sy - sr * sp * cy)
+
+    def _to_body(self, x, y, z):
+        """odom-frame vector into base_link (transpose of the ZYX rotation)."""
+        r, p, yw = self._rpy_odom()
+        cr, sr, cp, sp, cy, sy = math.cos(r), math.sin(r), math.cos(p), math.sin(p), math.cos(yw), math.sin(yw)
+        R = ((cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr),
+             (sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr),
+             (-sp, cp * sr, cp * cr))
+        return tuple(R[0][i] * x + R[1][i] * y + R[2][i] * z for i in range(3))
+
+    def trajectory_callback(self, msg: MultiDOFJointTrajectory):
+        """A new plan replaces the one being followed (it starts on the current one, so the change is smooth)."""
+        try:
+            pts = msg.points
+            t = [q.time_from_start.sec + 1e-9 * q.time_from_start.nanosec for q in pts]
+            p = [(q.transforms[0].translation.x, q.transforms[0].translation.y, q.transforms[0].translation.z)
+                 for q in pts]
+            v = [(q.velocities[0].linear.x, q.velocities[0].linear.y, q.velocities[0].linear.z) for q in pts]
+            a = [(q.accelerations[0].linear.x, q.accelerations[0].linear.y, q.accelerations[0].linear.z)
+                 for q in pts]
+            self.follower.set_trajectory(msg.header.stamp.sec + 1e-9 * msg.header.stamp.nanosec, t, p, v, a)
+        except (IndexError, ValueError) as e:
+            self.get_logger().error(f"trajectory rejected: {e}")
+
+    def follow(self):
+        """Send the trajectory's current target (holding the end point for a while after it)."""
+        now = self._now_s()
+        if not self.follower.active(now):
+            return
+        mav = self._get_mavlink()
+        if mav is None:
+            return
+        sp = self.follower.setpoint(now)
+        (x, y, z), (vx, vy, vz), (ax, ay, az), yaw = to_ned(sp)
+        try:
+            mav.mav.set_position_target_local_ned_send(
+                0, mav.target_system, mav.target_component, MAV_FRAME_LOCAL_NED, TYPE_MASK_PVA_YAW,
+                x, y, z, vx, vy, vz, ax, ay, az, yaw, 0)
+        except Exception as e:
+            self.get_logger().warn(f"Failed to send trajectory target: {e}")
 
     def _clamp(self, value: float, min_val: float, max_val: float) -> float:
         return max(min_val, min(max_val, value))

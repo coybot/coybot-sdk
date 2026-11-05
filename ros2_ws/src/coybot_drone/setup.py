@@ -20,7 +20,7 @@ setup(
     zip_safe=True,
     maintainer="Coybot AI",
     maintainer_email="team@coy.bot",
-    description="ROS 2 integration for coybot-sdk: camera bridge, MAVLink bridge, Nav2 stack.",
+    description="ROS 2 integration for coybot-sdk: camera bridge, MAVLink bridge (velocity commands and trajectory following), Nav2 stack.",
     license="Apache-2.0",
     tests_require=["pytest"],
     entry_points={

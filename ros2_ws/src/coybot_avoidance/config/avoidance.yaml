@@ -1,0 +1,39 @@
+# coybot_avoidance defaults. Units: m, s, rad, kg, N. These are the values flown in the px4-traj-bench no-map
+# rounds (config/nomap/gc_v1.json) on an x500-class quadrotor (2.0 kg) with a forward depth camera.
+avoidance_planner:
+  ros__parameters:
+    world_frame: odom
+    base_frame: base_link
+    camera_frame: ""          # empty: the depth image's frame_id
+    output_dt_s: 0.02
+    plan_hz: 10.0
+    max_vel: 4.0              # m/s speed cap
+    horizon_m: 12.0
+    lead_s: 0.15
+    map_res: 0.1
+    inflate_m: 0.8            # keep-out from any seen surface, vehicle radius included
+    hit_count: 2
+    max_range_m: 15.0
+    skip_pixel: 2
+    slab_m: 1.0               # plans stay within +- this of the goal altitude
+    rrt_timeout_s: 0.02
+    check_dt_s: 0.02
+    min_plan_s: 0.3
+    goal_margin_m: 0.3
+    final_approach_m: 1.5
+    arrive_m: 0.3
+    brake_acc: 3.0            # m/s^2
+    brake_latency_s: 0.3
+    brake_margin_m: 0.5
+    max_tilt_rad: 0.40
+    max_bodyrate: 2.1         # rad/s
+    mass_kg: 2.0
+    thrust_min_n: 5.0
+    thrust_max_n: 40.0
+    weight_t: 20.0
+    chi: [10000.0, 10000.0, 10000.0, 10000.0, 100000.0]
+    smoothing_eps: 0.01
+    integral_intervs: 16
+    rel_cost_tol: 1.0e-05
+    map_margin_xy_m: 15.0
+    map_top_m: 2.5

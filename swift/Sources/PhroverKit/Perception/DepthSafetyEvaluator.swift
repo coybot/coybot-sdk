@@ -748,7 +748,6 @@ enum DepthSafetyEvaluator {
                 if planar, abs(local.x - centerLateral) > paddedReach || abs(local.z - centerForward) > paddedReach {
                     continue
                 }
-                projectionCount += 1
                 let world = worldPoint(local, in: frame.projection)
                 let relative = world - live.roverOrigin
                 let lateral = simd_dot(relative, live.roverRight)
@@ -756,9 +755,15 @@ enum DepthSafetyEvaluator {
                 let height = relative.y
                 guard hypot(lateral, forward) <= reach,
                       height >= geometry.minimumCollisionHeight,
-                      height <= geometry.maximumCollisionHeight,
-                      !sight(of: world, in: live).support.isCovered else { continue }
-                result.insert(self.cell(lateral: lateral, height: height, forward: forward))
+                      height <= geometry.maximumCollisionHeight else { continue }
+                let occupied = self.cell(lateral: lateral, height: height, forward: forward)
+                // Once any historical point retains this live-frame hazard cell,
+                // another point cannot remove it. Only skip already-retained
+                // hazards; a visible point must never hide an unseen neighbor.
+                guard !result.contains(occupied) else { continue }
+                projectionCount += 1
+                guard !sight(of: world, in: live).support.isCovered else { continue }
+                result.insert(occupied)
             }
         }
         return result

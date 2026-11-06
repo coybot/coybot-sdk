@@ -165,6 +165,19 @@ struct FollowMotionFailureResolution {
             }
             return "\(turn) stopped: observed response is too coarse for the remaining angle. \(stop)"
         case .noPath:
+            if context.purpose == .followGoal {
+                switch context.failureCause {
+                case .pursuitStartBlocked:
+                    return "Rover's starting area is blocked in the map. Clear nearby obstacles or reposition the rover, then restart following."
+                case .pursuitGoalBlocked:
+                    return "Following destination is blocked in the map. Move to a clear area and restart following."
+                case .pursuitDisconnectedPath:
+                    return "No connected route to the following destination. Clear the route and restart following."
+                case .pursuitOutsideMap:
+                    return "Following route extends outside the current map. Let the camera observe the area and restart following."
+                default: break
+                }
+            }
             if context.purpose == .followReady && context.failureCause == .readyMapUnavailable {
                 return "Ready signal waiting for a map. Let the camera observe the floor and restart following."
             }

@@ -13,6 +13,25 @@ Automated simulator tests do not establish LiDAR projection accuracy or prove th
 
 Record the tested phone, rover, build revision, pass/fail per step, and redacted runtime-log evidence here after the supervised run. Do not attach camera images or raw transcripts.
 
+## Spoken readiness in PhroverOperator
+
+The operator app supplies `stationaryReadyAnnouncement` to `FollowMeCoordinator`.
+After person validation and alignment, it confirms stop and waits for a fresh
+post-stop matched observation. It queues the phrase **“I'm ready to follow”** on
+the iPhone using on-device speech synthesis. The synthesizer manages its own audio
+session so a preceding record-only microphone session does not suppress output.
+
+This mode does not call the forward ready-motion controller, map preflight or
+floor-probe recovery. It preserves the person-clearance gate, post-stop source
+fence, and a new-frame departure baseline before waiting for the person to move.
+Normal pursuit still requires its path, depth, pose, ownership and transport
+safety checks. The cue is requested once per follow session; cancelled or failed
+stops do not announce readiness. `follow_ready.announcement_requested` records
+the request, not proof that the phone audibly played it.
+
+SDK clients that omit the announcement callback retain the legacy motion signal.
+The probe-specific acceptance sections below apply to that legacy mode.
+
 ## Pre-ready acquisition rotation policy
 
 Initial search, alignment, and reacquisition use bounded in-place turns without

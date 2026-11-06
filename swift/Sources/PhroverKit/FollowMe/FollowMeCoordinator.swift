@@ -37,7 +37,10 @@ public final class FollowMeCoordinator {
                 if state == .waitingForClearance {
                     emitReadiness("follow_ready.clearance_entered", reason: "too_close_before_send")
                 } else if oldValue == .waitingForClearance {
-                    emitReadiness("follow_ready.clearance_exited", reason: state == .signalingReady ? "first_send_authorized" : "state_transition")
+                    let reason = state == .signalingReady
+                        ? (stationaryReadyAnnouncement == nil ? "first_send_authorized" : "stationary_ready_confirmation")
+                        : "state_transition"
+                    emitReadiness("follow_ready.clearance_exited", reason: reason)
                 }
             }
         }
@@ -99,6 +102,8 @@ public final class FollowMeCoordinator {
     private var alignmentSourceWaiter: CheckedContinuation<Void, Never>?
     private var departureBaseline: Double?
     private var readySignalAttempted = false
+    private let stationaryReadyAnnouncement: (@MainActor (String) -> Void)?
+    private var stationaryReadyPending = false
     private var readySignalRecoveryAttempts = 0
     private var readySignalInterruptedByStalePerception = false
     private var readyPathRecoveryAttempts = 0
@@ -169,7 +174,9 @@ public final class FollowMeCoordinator {
     }
 
     public init(perception: any FollowMePerception, motion: any FollowMeMotion,
-                clock: any FollowMeClock, configuration: FollowMeConfiguration = .init(),
+                 stationaryReadyAnnouncement: (@MainActor (String) -> Void)? = nil,
+                 clock: any FollowMeClock,
+                 configuration: FollowMeConfiguration = .init(),
                 eventSink: @escaping @MainActor (String, [String: String]) -> Void = {
                     RuntimeFileLog.append($0, fields: $1)
                 }) {
@@ -177,6 +184,7 @@ public final class FollowMeCoordinator {
         self.motion = motion
         self.clock = clock
         self.config = configuration
+        self.stationaryReadyAnnouncement = stationaryReadyAnnouncement
         self.tracker = FollowTargetTracker(configuration: configuration)
         self.eventSink = eventSink
         self.failureEmitter = FollowDiagnosticEmitter(streamID: "follow-coordinator-\(UUID().uuidString)",
@@ -217,6 +225,7 @@ public final class FollowMeCoordinator {
         alignmentConfirmedAfter = nil
         departureBaseline = nil
         readySignalAttempted = false
+        stationaryReadyPending = false
         readySignalRecoveryAttempts = 0
         readySignalInterruptedByStalePerception = false
         readyPathRecoveryAttempts = 0
@@ -801,6 +810,27 @@ public final class FollowMeCoordinator {
                         _ = await finish(.failed("Person too close during ready signal. Step back and start following again."))
                         return
                     }
+                    if stationaryReadyPending, let announce = stationaryReadyAnnouncement {
+                        guard canScan, matchedFrameClearsNewestStop(batch),
+                              let pose = batch.pose else { return }
+                        let heading = atan2(selected.position.y - pose.position.y, selected.position.x - pose.position.x)
+                        guard abs(normalizeAngle(heading - pose.yaw)) <= config.alignmentAngularTolerance else {
+                            stationaryReadyPending = false
+                            state = .aligning
+                            align(generation: token)
+                            return
+                        }
+                        stationaryReadyPending = false
+                        readySignalAttempted = true
+                        readySignalSucceeded = true
+                        readySignalConfirmedAfter = batch.frameID
+                        readySignalCompletionTime = clock.now
+                        searchClearance?.revoke()
+                        announce("I'm ready to follow")
+                        emitReadiness("follow_ready.announcement_requested", reason: "stationary_spoken_confirmation")
+                        emitReadiness("follow_ready.completed", reason: "stationary_stop_confirmed_new_frame_required")
+                        return
+                    }
                     if readySignalSucceeded, let confirmed = readySignalConfirmedAfter,
                        matchedFrameClearsNewestStop(batch),
                        confirmed.generation == batch.frameID.generation, batch.frameID.sequence > confirmed.sequence,
@@ -1276,6 +1306,16 @@ public final class FollowMeCoordinator {
               pose.position.distance(to: locked.position) >= config.minimumHoldDistance + 0.12 else {
             if let locked, !(await restoreRecovery(locked, phase: .waitingForClearance)) { return }
             state = .waitingForClearance
+            return
+        }
+        if stationaryReadyAnnouncement != nil {
+            // The app's spoken confirmation replaces the entire ready-motion
+            // request, including map probing. Require confirmed stop and a fresh
+            // post-stop match before queuing speech in the frame processor.
+            guard await confirmStop(generation: token), generation == token, canScan else { return }
+            stationaryReadyPending = true
+            state = .signalingReady
+            emitReadiness("follow_ready.stationary_wait", reason: "fresh_post_stop_match_required")
             return
         }
         operation &+= 1

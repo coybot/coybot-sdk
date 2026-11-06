@@ -14,7 +14,11 @@ public final class SpeechOut: NSObject, AVSpeechSynthesizerDelegate {
         synth.delegate = self
     }
 
-    public func speak(_ text: String, language: String = "en-US") {
+    public func speak(_ text: String, language: String = "en-US", useIndependentAudioSession: Bool = false) {
+        // A finalized voice command may leave the app's inactive session in
+        // record-only mode. Readiness speech can let the synthesizer manage its
+        // own output session without changing microphone capture configuration.
+        synth.usesApplicationAudioSession = !useIndependentAudioSession
         let utterance = AVSpeechUtterance(string: text)
         utterance.voice = AVSpeechSynthesisVoice(language: language)
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate

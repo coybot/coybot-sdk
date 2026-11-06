@@ -44,7 +44,7 @@ final class DepthSafetyProcessor {
         // Bound retained camera buffers to the running capture and the newest waiter.
         pending = (input, generation, ProcessInfo.processInfo.systemUptime)
         guard task == nil else { return }
-        task = Task { [self] in
+        task = Task(priority: .userInitiated) { [self] in
             defer { task = nil }
             while let job = pending {
                 pending = nil

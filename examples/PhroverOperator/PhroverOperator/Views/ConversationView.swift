@@ -222,8 +222,11 @@ struct ConversationView: View {
             let followClock = SystemFollowClock()
             let follow = FollowMeCoordinator(
                 perception: ARFollowMePerceptionSource(ar: ar, detector: detector),
-                motion: NavigationFollowMeMotion(navigation: nav), clock: followClock,
-                configuration: .continuous
+                motion: NavigationFollowMeMotion(navigation: nav),
+                stationaryReadyAnnouncement: { text in
+                    speechOut.stopSpeaking()
+                    speechOut.speak(text, useIndependentAudioSession: true)
+                }, clock: followClock, configuration: .continuous
             )
             guard let agent else { return }
             let router = OperatorCommandRouter(mission: agent, follow: follow,

@@ -6,6 +6,61 @@ import simd
 
 @MainActor
 final class FollowReadyAdmissionIntegrationTests: XCTestCase {
+    func testSpokenReadinessConfirmsStopAndNeverInvokesReadyMovementOrMapProbe() async {
+        let f = Fixture()
+        f.mappedRecovery = true
+        var announcements: [String] = []
+        f.stationaryAnnouncement = { announcements.append($0) }
+        await f.acquire()
+        f.send(2, range: 1.6)
+        await drain()
+        XCTAssertTrue(announcements.isEmpty, "The admitted frame predates the new stop")
+        await f.fresh(3, range: 1.6)
+        await f.fresh(4, range: 1.6)
+        await f.fresh(5, range: 1.6)
+        XCTAssertEqual(announcements, ["I'm ready to follow"])
+        XCTAssertEqual(f.coordinator.state, .waitingForMovement)
+        XCTAssertEqual(f.commands, 0)
+        XCTAssertEqual(f.plans, 0)
+        XCTAssertFalse(f.records.contains { $0["event"] as? String == "follow_ready.recovery_started" })
+        XCTAssertTrue(f.records.contains { $0["event"] as? String == "follow_ready.announcement_requested" })
+        _ = await f.coordinator.stop()
+    }
+
+    func testSpokenReadinessDoesNotAnnounceAfterFailedStopOrCancellation() async {
+        for cancel in [false, true] {
+            let f = Fixture()
+            var announcements: [String] = []
+            f.stationaryAnnouncement = { announcements.append($0) }
+            await f.acquire()
+            if !cancel { f.failStop = true }
+            f.send(2, range: 1.6)
+            await drain()
+            if cancel { _ = await f.coordinator.stop() }
+            await f.fresh(3, range: 1.6)
+            await f.fresh(4, range: 1.6)
+            XCTAssertTrue(announcements.isEmpty)
+            XCTAssertEqual(f.commands, 0)
+            f.failStop = false
+            _ = await f.coordinator.stop()
+        }
+    }
+
+    func testSpokenReadinessRequiresHealthyPostStopPerception() async {
+        let f = Fixture()
+        var announcements: [String] = []
+        f.stationaryAnnouncement = { announcements.append($0) }
+        await f.acquire()
+        f.send(2, range: 1.6)
+        await drain()
+        f.clock.advance(to: f.clock.now + 0.301)
+        f.send(3, range: 1.6, tracking: .limited)
+        await drain()
+        XCTAssertTrue(announcements.isEmpty)
+        XCTAssertEqual(f.commands, 0)
+        _ = await f.coordinator.stop()
+    }
+
     func testRealReacquisitionRefreshPreservesEpisodeDeadlineAndHardFaults() async {
         enum Scenario: CaseIterable { case fresh, episodeDeadline, trackingFault }
         for scenario in Scenario.allCases {
@@ -1266,6 +1321,7 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
 
     @MainActor
     private final class Fixture {
+        var stationaryAnnouncement: (@MainActor (String) -> Void)?
         let perception = FollowPerceptionFake()
         let clock = ManualFollowClock()
         var feedback = AdmissionSuspension()
@@ -1334,7 +1390,8 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
             var config = FollowMeConfiguration()
             config.stationaryPauseSeconds = stationaryPauseSeconds
             return FollowMeCoordinator(perception: perception, motion: NavigationFollowMeMotion(navigation: controller),
-                clock: clock, configuration: config, eventSink: { [self] in record($0, fields: $1) })
+                stationaryReadyAnnouncement: stationaryAnnouncement, clock: clock, configuration: config,
+                eventSink: { [self] in record($0, fields: $1) })
         }()
         func record(_ event: String, fields: [String: String]) {
             if event == "follow_state" { states.append(fields) }

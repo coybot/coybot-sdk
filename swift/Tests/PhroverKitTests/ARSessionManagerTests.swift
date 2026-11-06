@@ -192,6 +192,33 @@ final class ARSessionManagerTests: XCTestCase {
         }
     }
 
+    func testMountedFloorReferenceRequiresRecentNormalDepthHistory() async throws {
+        let ar = ARSessionManager()
+        ar.resetForTesting()
+        var camera = matrix_identity_float4x4
+        camera.columns.3.y = 0.30
+        let image = makeImage(), depth = makeDepth(2)
+        for timestamp in [10.0, 10.12, 10.24] {
+            ar.ingestForTesting(image: image, timestamp: timestamp, cameraTransform: camera,
+                intrinsics: matrix_identity_float3x3, imageResolution: CGSize(width: 8, height: 6),
+                depthMap: depth, trackingQuality: .normal)
+            let done = expectation(description: "depth published \(timestamp)")
+            let remove = ar.observeDepthSafety { snapshot in if snapshot?.timestamp == timestamp { done.fulfill() } }
+            ar.enqueueDepthSafety(rawDepthMap: depth, intrinsics: matrix_identity_float3x3,
+                cameraTransform: camera, timestamp: timestamp)
+            await fulfillment(of: [done], timeout: 2)
+            remove()
+        }
+        XCTAssertEqual(try XCTUnwrap(ar.mountedFloorReference(at: 10.25)), 0, accuracy: 0.001)
+        XCTAssertNil(ar.mountedFloorReference(at: 10.6))
+        ar.ingestForTesting(image: image, timestamp: 10.26, cameraTransform: camera,
+            intrinsics: matrix_identity_float3x3, imageResolution: CGSize(width: 8, height: 6),
+            depthMap: depth, trackingQuality: .limited)
+        XCTAssertNil(ar.mountedFloorReference(at: 10.27))
+        ar.resetForTesting()
+        XCTAssertNil(ar.mountedFloorReference(at: 10.28))
+    }
+
     func testTrackingLossRevokesPublishedDepthUntilNewNormalProjectionCompletes() async throws {
         let entered = expectation(description: "new normal projection started")
         let published = expectation(description: "new normal projection published")

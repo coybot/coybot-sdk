@@ -4,6 +4,8 @@ import RoverNav
 struct FollowPursuitPlan: Sendable {
     let path: [Vec2]
     var map: Costmap? = nil
+    var rejection: PathPlanningFailure? = nil
+    var diagnostics: [String: String] = [:]
 
     func joined(from position: Vec2) -> Self? {
         guard let map else { return self }
@@ -35,6 +37,8 @@ final class FollowPursuitDriver {
         let acknowledgement: @MainActor () async -> Date?
         let clearance: @MainActor () -> Double
         let depth: @MainActor (WheelCommand) -> DepthSafetyObservation
+        /// Must check fresh depth for the exact (possibly speed-limited) command
+        /// at transport admission, within the supplied original expiry.
         let send: @MainActor (WheelCommand, Double) async throws -> Void
         let stop: @MainActor () async throws -> Void
         let sleep: @MainActor (Duration) async -> Void
@@ -42,6 +46,7 @@ final class FollowPursuitDriver {
         let moving: @MainActor () -> Void
         let emit: @MainActor (String, [String: FollowDiagnosticValue]) -> Void
         var admissionDuration: @MainActor () -> Double? = { nil }
+        var depthNotificationsEnabled = false
     }
 
     private final class Job {
@@ -63,6 +68,43 @@ final class FollowPursuitDriver {
     private let guardLayer = ObstacleGuard()
     private var job: Job?
     private var active = true
+    private var depthRevision: UInt64 = 0
+    private var depthWaiter: (id: UUID, continuation: CheckedContinuation<Void, Never>)?
+
+    func depthPublished() {
+        depthRevision &+= 1
+        wakeDepthWaiter()
+    }
+
+    private func wakeDepthWaiter(id: UUID? = nil) {
+        guard let waiter = depthWaiter, id == nil || waiter.id == id else { return }
+        depthWaiter = nil
+        waiter.continuation.resume()
+    }
+
+    private func waitForDepth(after revision: UInt64, seconds: Double) async {
+        guard owned, seconds > 0 else { return }
+        guard environment.depthNotificationsEnabled else {
+            await environment.sleep(.seconds(seconds)); return
+        }
+        guard depthRevision == revision else { return }
+        let id = UUID()
+        var timer: Task<Void, Never>?
+        defer { timer?.cancel() }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard owned, depthRevision == revision else { continuation.resume(); return }
+                depthWaiter = (id, continuation)
+                timer = Task { [weak self, environment] in
+                    await environment.sleep(.seconds(seconds))
+                    guard !Task.isCancelled else { return }
+                    self?.wakeDepthWaiter(id: id)
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in self?.wakeDepthWaiter(id: id) }
+        }
+    }
     private var lastPlanStarted = -Double.infinity
     private(set) var revision: UInt64 = 0
     private(set) var goal: Vec2
@@ -85,6 +127,7 @@ final class FollowPursuitDriver {
 
     func inhibit() {
         active = false; acceptingGoals = false
+        wakeDepthWaiter()
         job?.task?.cancel(); job = nil
     }
 
@@ -130,8 +173,21 @@ final class FollowPursuitDriver {
         var approach = 0.0
         var lastDiagnostic = -Double.infinity
         var maximumAdmissionDuration = 0.0
+        var healthySince: Double?
+        var lastHealthySend: Double?
+        var lastHealthyCapture: Double?
+        var healthySends = 0
+        var refreshCaptureCount = 0
+        var refreshFirstCapture: Double?
+        var refreshLastCapture: Double?
+
+        func resetHealthyDelivery() {
+            healthySince = nil; lastHealthySend = nil; lastHealthyCapture = nil; healthySends = 0
+        }
 
         func recoverExpiredCommand(expiry: Double, rawDepth: Bool = false) async -> NavigationFailure? {
+            resetHealthyDelivery()
+            refreshCaptureCount = 0; refreshFirstCapture = nil; refreshLastCapture = nil
             guard expiryRecoveries < 2 else {
                 failureCause = .pursuitRecoveryExhausted
                 return .depthUnavailable(.staleRawDepth)
@@ -173,6 +229,18 @@ final class FollowPursuitDriver {
                 if job.completed {
                     self.job = nil
                     if job.revision == revision {
+                        if let rejected = job.result?.rejection {
+                            switch rejected {
+                            case .startBlocked: failureCause = .pursuitStartBlocked
+                            case .goalBlocked: failureCause = .pursuitGoalBlocked
+                            case .noConnectedPath: failureCause = .pursuitDisconnectedPath
+                            case .startOutsideMap, .goalOutsideMap: failureCause = .pursuitOutsideMap
+                            }
+                            var fields = (job.result?.diagnostics ?? [:]).mapValues { FollowDiagnosticValue.string($0) }
+                            fields["planning_rejection"] = .string(rejected.rawValue)
+                            environment.emit("planning_rejected", fields)
+                            return .failed(.noPath)
+                        }
                         guard job.source.frameID?.generation == generation,
                               let result = job.result, !result.path.isEmpty,
                               result.path.allSatisfy({ $0.x.isFinite && $0.y.isFinite }),
@@ -233,14 +301,16 @@ final class FollowPursuitDriver {
             var unavailable: DepthSafetyUnavailableReason?
             var depthExpiry = -Double.infinity
             let assessmentStarted = environment.uptime()
-            depthAssessment: for attempt in 0..<2 {
+            let observedDepthRevision = depthRevision
+            do {
                 let readStarted = environment.uptime()
                 let observation = environment.depth(safeCommand)
                 depthExpiry = readStarted + DepthSafetyEvaluator.maximumRawDepthAge - observation.sampleAge
                 switch guardLayer.evaluate(command: safeCommand, depthSafety: observation) {
                 case .allow(let limited, _):
-                    if limited == safeCommand { break depthAssessment }
-                    guard attempt == 0 else { return .failed(.obstacle) }
+                    // ObstacleGuard scales both wheels proportionally. Do not
+                    // spend a second full evaluation here: transport must still
+                    // validate this exact command against current depth before HTTP.
                     safeCommand = limited
                 case .stopDepth(let rejected):
                     switch rejected.state {
@@ -248,11 +318,11 @@ final class FollowPursuitDriver {
                     case .stop, .caution: return .failed(.obstacle)
                     case .clear: unavailable = .malformedDepth
                     }
-                    break depthAssessment
                 }
             }
             if unavailable == nil, !depthExpiry.isFinite || environment.uptime() >= depthExpiry { unavailable = .staleRawDepth }
             if let unavailable {
+                refreshCaptureCount = 0; refreshFirstCapture = nil; refreshLastCapture = nil
                 if sent, refreshAfter == nil, unavailable == .staleRawDepth || unavailable == .missingRawDepth {
                     if let failure = await recoverExpiredCommand(expiry: depthExpiry, rawDepth: true) { return .failed(failure) }
                     continue
@@ -267,7 +337,9 @@ final class FollowPursuitDriver {
                     environment.emit("depth_wait_started", ["deadline_s": .number(refreshDeadline!), "reason": .string(unavailable.rawValue)])
                 }
                 guard owned else { return .cancelled }
-                await environment.sleep(.milliseconds(20)); continue
+                await waitForDepth(after: observedDepthRevision,
+                    seconds: min(0.02, max(0, (refreshDeadline ?? .infinity) - environment.uptime())))
+                continue
             }
             // Leave enough time for transport admission. While refreshing, require
             // raw depth captured after the confirmed stop, not just a new pose.
@@ -276,12 +348,32 @@ final class FollowPursuitDriver {
                 max(maximumAdmissionDuration, environment.uptime() - assessmentStarted) + 0.01)
             let captureTime = depthExpiry - DepthSafetyEvaluator.maximumRawDepthAge
             if remaining < requiredMargin || refreshAfter.map({ captureTime <= $0.time }) == true {
+                refreshCaptureCount = 0; refreshFirstCapture = nil; refreshLastCapture = nil
                 if refreshAfter == nil {
                     if let failure = await recoverExpiredCommand(expiry: depthExpiry, rawDepth: true) { return .failed(failure) }
                 }
                 environment.emit("freshness_margin_wait", ["remaining_s": .number(remaining),
-                    "required_s": .number(requiredMargin), "observed_admission_s": .number(maximumAdmissionDuration)])
-                await environment.sleep(.milliseconds(20)); continue
+                    "required_s": .number(requiredMargin), "observed_admission_s": .number(maximumAdmissionDuration),
+                    "depth_capture_s": .number(captureTime),
+                    "confirmed_stop_s": refreshAfter.map { .number($0.time) } ?? .null,
+                    "waiting_for_post_stop_depth": .bool(refreshAfter.map { captureTime <= $0.time } ?? false)])
+                await waitForDepth(after: observedDepthRevision,
+                    seconds: min(0.02, max(0, (refreshDeadline ?? .infinity) - environment.uptime())))
+                continue
+            }
+            if refreshAfter != nil {
+                if refreshLastCapture.map({ captureTime > $0 + 1e-6 }) ?? true {
+                    refreshFirstCapture = refreshFirstCapture ?? captureTime
+                    refreshLastCapture = captureTime
+                    refreshCaptureCount += 1
+                }
+                guard refreshCaptureCount >= 3, captureTime - refreshFirstCapture! >= 0.06 else {
+                    environment.emit("depth_stability_wait", ["capture_count": .number(Double(refreshCaptureCount)),
+                        "capture_span_s": .number(captureTime - refreshFirstCapture!),
+                        "deadline_s": .number(refreshDeadline!)])
+                    await waitForDepth(after: observedDepthRevision, seconds: min(0.02, max(0, refreshDeadline! - environment.uptime())))
+                    continue
+                }
             }
             guard owned else { return .cancelled }
             let sendRevision = revision
@@ -341,10 +433,30 @@ final class FollowPursuitDriver {
             sent = true
             movementActive = true
             if refreshDeadline != nil { environment.emit("depth_wait_recovered", [:]) }
+            let completedAt = environment.uptime()
+            if refreshDeadline == nil, safeCommand.left != 0 || safeCommand.right != 0, completedAt < depthExpiry,
+               depthExpiry - sendStarted >= requiredMargin + 0.02,
+               lastHealthyCapture.map({ captureTime > $0 + 1e-6 }) ?? true {
+                if let previous = lastHealthySend, completedAt - previous > 0.3 { resetHealthyDelivery() }
+                healthySince = healthySince ?? completedAt
+                lastHealthySend = completedAt
+                lastHealthyCapture = captureTime
+                healthySends += 1
+                if expiryRecoveries > 0, healthySends >= 10, completedAt - healthySince! >= 2 {
+                    environment.emit("recovery_budget_replenished", ["healthy_send_count": .number(Double(healthySends)),
+                        "healthy_duration_s": .number(completedAt - healthySince!),
+                        "previous_recovery_count": .number(Double(expiryRecoveries))])
+                    expiryRecoveries = 0
+                    resetHealthyDelivery()
+                }
+            } else { resetHealthyDelivery() }
             refreshDeadline = nil
             refreshAfter = nil
             failureCause = nil
-            await environment.sleep(.milliseconds(100))
+            // New publication wakes the control loop; missing publication cannot
+            // postpone its next check past the original command validity deadline.
+            await waitForDepth(after: observedDepthRevision,
+                seconds: min(0.1, max(0, expiry - environment.uptime())))
         }
         return .cancelled
     }

@@ -877,6 +877,21 @@ final class DepthSafetyEvaluatorTests: XCTestCase {
         XCTAssertLessThanOrEqual(result.clearance, 0.30)
     }
 
+    func testRepeatedHistoricalHazardsNeedOnlyOneLiveProjectionPerRetainedCell() throws {
+        let box = Set((-1...1).map { DepthSafetyCell(lateralIndex: $0, heightIndex: 1, forwardIndex: 25) })
+        let history = try (1...20).map { try rememberedFrame(back: 0.8, age: Double($0) * 0.1, cells: box) }
+        let command = WheelCommand(left: 0.25, right: 0.25)
+        let single = DepthSafetyEvaluator.evaluate(liveNearBlindSnapshot(history: [history[0]]),
+            command: command, now: 10.05, boundedReadyMotion: true)
+        let repeated = DepthSafetyEvaluator.evaluate(liveNearBlindSnapshot(history: history),
+            command: command, now: 10.05, boundedReadyMotion: true)
+        XCTAssertEqual(repeated.state, .stop)
+        XCTAssertEqual(repeated.clearance, single.clearance)
+        XCTAssertEqual(repeated.rememberedHazardCellCount, single.rememberedHazardCellCount)
+        XCTAssertEqual(repeated.rememberedProjectionCount, single.rememberedProjectionCount)
+        XCTAssertEqual(repeated.rememberedProjectionCount, 3)
+    }
+
     func testRememberedObstacleIsDroppedWhereLiveDepthNowSeesPastIt() throws {
         // Same box higher up, where the live camera sees through to the 3 m wall.
         let moved = Set((-1...1).map { DepthSafetyCell(lateralIndex: $0, heightIndex: 6, forwardIndex: 25) })

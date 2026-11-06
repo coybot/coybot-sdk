@@ -2,6 +2,16 @@ import XCTest
 @testable import PhroverKit
 
 final class FollowMotionFailureResolutionTests: XCTestCase {
+    func testBlockedStartMessageRetainsStopFailurePriority() {
+        let context = FollowMotionOperationContext(request: nil, controllerOperationID: 1,
+            purpose: .followGoal, profile: nil, failureCause: .pursuitStartBlocked)
+        var resolution = FollowMotionFailureResolution(.init(context: context, reason: .noPath,
+            stopOutcome: .confirmed, source: .result))
+        XCTAssertTrue(resolution.message.contains("starting area is blocked in the map"))
+        resolution.consume(.init(context: context, reason: .commandFailed, stopOutcome: .failed, source: .confirmation))
+        XCTAssertEqual(resolution.message, "Motor stop could not be confirmed. Motion is blocked.")
+    }
+
     func testPursuitFreshnessFailuresHaveDistinctMessagesAndStopFailureWins() {
         for (cause, text) in [(FollowMotionFailureCause.pursuitDepthRefreshTimeout, "600 ms"),
                               (.pursuitAuthorizationExpired, "authorization expired"),

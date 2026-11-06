@@ -1,9 +1,203 @@
 import XCTest
 import RoverNav
+import simd
 @testable import PhroverKit
 
 @MainActor
 final class FollowPursuitDriverTests: XCTestCase {
+    func testBlockedPlanningFailureReachesControllerWithoutSendingMotion() async {
+        let f = ControllerFixture()
+        f.planningFailure = .startBlocked
+        let result = await f.run()
+        XCTAssertEqual(result.result, .failed(.noPath))
+        XCTAssertEqual(result.context.failureCause, .pursuitStartBlocked)
+        XCTAssertEqual(result.stopOutcome, .confirmed)
+        XCTAssertTrue(f.commands.isEmpty)
+    }
+
+    func testCopiedLocalMeshTransformsOffActorAndPreservesStride() async {
+        var values: [Float] = [1, 2, 3, 999, 4, 5, 6, 999]
+        var transform = matrix_identity_float4x4
+        transform.columns.3 = SIMD4(10, 20, 30, 1)
+        let captured = CostmapBuilder.LocalMeshSnapshot(bytes: values.withUnsafeBytes { Data($0) },
+            stride: 16, count: 2, transform: transform)
+        values[0] = 100
+        let points = await Task.detached {
+            XCTAssertFalse(Thread.isMainThread)
+            return captured.worldVertices()
+        }.value
+        XCTAssertEqual(points, [SIMD3<Float>(11, 22, 33), SIMD3<Float>(14, 25, 36)])
+        let truncated = CostmapBuilder.LocalMeshSnapshot(bytes: Data(), stride: 16, count: 2, transform: transform)
+        XCTAssertTrue(truncated.worldVertices().isEmpty)
+    }
+
+    func testDepthPublicationAndCancellationWakePendingControlWait() async {
+        for cancel in [false, true] {
+            let f = Fixture()
+            f.notifications = true
+            let gate = FollowDiagnosticSuspension()
+            f.waitHandler = { _ in
+                if f.commands.count == 1 { await gate.suspend() }
+                else { f.time += 0.02; await Task.yield() }
+            }
+            f.onSend = { _ in if f.commands.count == 2 { f.allowed = false } }
+            let task = Task { await f.driver.run() }
+            await wait { gate.entered }
+            XCTAssertEqual(f.commands.count, 1)
+            if cancel { task.cancel() }
+            else { f.time += 0.033; f.sequence += 1; f.driver.depthPublished() }
+            let result = await task.value
+            gate.release()
+            XCTAssertEqual(result, .cancelled)
+            XCTAssertEqual(f.commands.count, cancel ? 1 : 2)
+        }
+    }
+
+    func testDepthPublishedDuringSendIsNotLostBeforeWaitRegistration() async {
+        let f = Fixture()
+        f.notifications = true
+        f.waitHandler = { _ in
+            XCTAssertTrue(f.commands.isEmpty, "An already-published update must bypass the post-send wait")
+            f.time += 0.02
+            await Task.yield()
+        }
+        f.onSend = { _ in
+            if f.commands.count == 1 { f.driver.depthPublished() }
+            else { f.allowed = false }
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .cancelled)
+        XCTAssertEqual(f.commands.count, 2)
+    }
+
+    func testNoPublicationStillWakesAtDepthDeadlineAndChecksSafety() async {
+        let f = Fixture()
+        f.notifications = true
+        f.depthProvider = { _ in f.observation(age: 0.19) }
+        let gate = FollowDiagnosticSuspension()
+        var waitSeconds = 0.0
+        f.waitHandler = { duration in
+            if f.commands.count == 1 {
+                waitSeconds = Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
+                await gate.suspend()
+            } else { f.time += 0.02; await Task.yield() }
+        }
+        let task = Task { await f.driver.run() }
+        await wait { gate.entered }
+        XCTAssertGreaterThan(waitSeconds, 0)
+        XCTAssertLessThanOrEqual(waitSeconds, 0.061)
+        f.time += waitSeconds
+        f.clearance = 0.1
+        gate.release()
+        let result = await task.value
+        XCTAssertEqual(result, .failed(.obstacle))
+        XCTAssertEqual(f.commands.count, 1)
+    }
+
+    func testRecoveryRequiresSeveralPostStopDepthCapturesBeforeResuming() async {
+        let f = Fixture()
+        var recovering = false
+        var captureTimes: Set<Double> = []
+        f.depthProvider = { _ in
+            if f.commands.count == 1, !recovering {
+                recovering = true
+                return f.observation(age: 0.3)
+            }
+            if recovering { captureTimes.insert(f.time - 0.01) }
+            return f.observation(age: 0.01)
+        }
+        f.onSend = { _ in
+            if f.commands.count == 2 {
+                XCTAssertGreaterThanOrEqual(captureTimes.count, 3)
+                XCTAssertGreaterThanOrEqual(captureTimes.max()! - captureTimes.min()!, 0.06)
+                XCTAssertEqual(f.stops, 1)
+                f.position = Vec2(5, 0)
+            }
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertTrue(f.events.contains("depth_stability_wait"))
+    }
+
+    func testCautionDoesNotRepeatDriverDepthEvaluationForScaledCommand() async {
+        let f = Fixture()
+        var reads = 0
+        f.depthProvider = { _ in
+            reads += 1
+            return .init(state: .caution, clearance: 0.49, supportCount: 138, sampleAge: 0.147,
+                requiredStoppingDistance: 0.3, motionClass: .forward, speedLimit: 0.12)
+        }
+        f.onSend = { command in
+            XCTAssertLessThanOrEqual(max(abs(command.left), abs(command.right)), 0.12)
+            f.position = Vec2(5, 0)
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertEqual(reads, 1)
+    }
+
+    func testSpeedLimitedCommandStillChecksExactDepthAtTransport() async {
+        for obstacle in [false, true] {
+            let f = ControllerFixture()
+            f.caution = true
+            if obstacle { f.beforeAttempt = { f.obstacle = true } }
+            let result = await f.run()
+            XCTAssertEqual(result.result, obstacle ? .failed(.obstacle) : .arrived)
+            XCTAssertEqual(f.commands.count, obstacle ? 0 : 1)
+            XCTAssertEqual(f.depthReads, 2, "One driver check plus the exact-command transport check")
+            if let command = f.commands.first { XCTAssertLessThanOrEqual(max(abs(command.left), abs(command.right)), 0.12) }
+            XCTAssertEqual(result.stopOutcome, .confirmed)
+        }
+    }
+
+    func testSuccessfulSendsAloneCannotReplenishRecoveryBudget() async {
+        let f = Fixture()
+        var outages = 0
+        var recovering = false
+        f.depthProvider = { _ in
+            if !f.commands.isEmpty, !recovering {
+                outages += 1
+                recovering = true
+                return f.observation(age: 0.297)
+            }
+            return f.observation(age: 0.01)
+        }
+        f.onSend = { _ in recovering = false; f.position.x += 0.02 }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .failed(.depthUnavailable(.staleRawDepth)))
+        XCTAssertEqual(f.driver.failureCause, .pursuitRecoveryExhausted)
+        XCTAssertEqual(outages, 3)
+        XCTAssertFalse(f.events.contains("recovery_budget_replenished"))
+    }
+
+    func testSustainedFreshDrivingReplenishesRecoveryAllowance() async {
+        let f = Fixture()
+        let map = Costmap(width: 80, height: 80, resolution: 0.1, origin: Vec2(-1, -1))
+        f.planProvider = { _, goal in .init(path: [goal], map: map) }
+        var outages = 0
+        var recovering = false
+        f.depthProvider = { _ in
+            if !f.commands.isEmpty, !recovering,
+               outages < 2 || (outages == 2 && f.events.contains("recovery_budget_replenished")) {
+                outages += 1
+                recovering = true
+                return f.observation(age: 0.297)
+            }
+            return f.observation(age: 0.01)
+        }
+        f.onSend = { _ in
+            recovering = false
+            f.position.x += 0.02
+            if outages == 3 {
+                f.position = Vec2(5, 0)
+            } else if f.time > 14 { f.allowed = false }
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(outages, 3)
+        XCTAssertTrue(f.events.contains("recovery_budget_replenished"))
+        XCTAssertEqual(result, .arrived)
+    }
+
     func testCancelledMovingPredecessorCannotReuseAdmissionStopConfirmation() async {
         let f = ControllerFixture()
         f.autoAdvance = false
@@ -566,7 +760,7 @@ final class FollowPursuitDriverTests: XCTestCase {
         XCTAssertTrue(f.commands.isEmpty)
     }
 
-    func testCautionRechecksScaledCommandAndRetainsSpeedLimit() async {
+    func testCautionRetainsSpeedLimitWithoutDuplicateDriverRead() async {
         let f = Fixture()
         var reads = 0
         f.depthProvider = { command in
@@ -580,7 +774,7 @@ final class FollowPursuitDriverTests: XCTestCase {
         }
         let result = await f.driver.run()
         XCTAssertEqual(result, .arrived)
-        XCTAssertGreaterThanOrEqual(reads, 2)
+        XCTAssertEqual(reads, 1)
     }
 
     private func wait(_ condition: () -> Bool, file: StaticString = #filePath, line: UInt = #line) async {
@@ -602,6 +796,8 @@ final class FollowPursuitDriverTests: XCTestCase {
         var depthReads = 0
         var freshAt = 0.0
         var obstacle = false
+        var caution = false
+        var planningFailure: PathPlanningFailure?
         var position = Vec2.zero
         var arrival = Vec2(5, 0)
         var sequence: UInt64 = 1
@@ -628,8 +824,9 @@ final class FollowPursuitDriverTests: XCTestCase {
                     if clock.value < self.freshAt {
                         return .unavailable(.staleRawDepth, sampleAge: 0.30918320833006874, motionClass: .classify(command))
                     }
-                    return .init(state: .clear, clearance: 5, supportCount: 0, sampleAge: 0.01,
-                        requiredStoppingDistance: 0.3, motionClass: .classify(command), speedLimit: nil)
+                    return .init(state: self.caution ? .caution : .clear, clearance: self.caution ? 0.49 : 5,
+                        supportCount: 0, sampleAge: 0.01,
+                        requiredStoppingDistance: 0.3, motionClass: .classify(command), speedLimit: self.caution ? 0.12 : nil)
                 }, plan: { _, _ in XCTFail("Production-style pursuit must not call the synchronous planner"); return nil },
                 lastAckAt: { Date(timeIntervalSince1970: clock.value) }, sendCommand: { _ in XCTFail("Receipt sender required") },
                 stopRover: {
@@ -669,7 +866,7 @@ final class FollowPursuitDriverTests: XCTestCase {
                     if (self.holdFirstPlan && self.plannedGoals.count == 1) || self.plannedGoals.count == self.holdPlanNumber {
                         await self.planGate.suspend()
                     }
-                    return .init(path: [goal])
+                    return .init(path: self.planningFailure == nil ? [goal] : [], rejection: self.planningFailure)
                 })
         }
         func run() async -> FollowMotionResult {
@@ -697,6 +894,8 @@ final class FollowPursuitDriverTests: XCTestCase {
         var onSend: ((WheelCommand) -> Void)?
         var onStop: (() -> Void)?
         var sendAdmissionDuration = 0.0
+        var notifications = false
+        var waitHandler: ((Duration) async -> Void)?
         var acknowledgement: (@MainActor () async -> Date?)?
         func observation(age: Double) -> DepthSafetyObservation {
             .init(state: .clear, clearance: 5, supportCount: 0, sampleAge: age,
@@ -721,13 +920,14 @@ final class FollowPursuitDriverTests: XCTestCase {
             self.commands.append(command)
             self.onSend?(command)
         }, stop: { self.stops += 1; self.onStop?() }, sleep: { duration in
+            if let handler = self.waitHandler { await handler(duration); return }
             if self.autoAdvance {
                 self.time += Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
             }
             self.sequence += 1
             await Task.yield()
         }, publishPath: { self.paths.append($0) }, moving: {}, emit: { name, _ in self.events.append(name) },
-            admissionDuration: { self.sendAdmissionDuration }))
+            admissionDuration: { self.sendAdmissionDuration }, depthNotificationsEnabled: notifications))
         }
     }
 }

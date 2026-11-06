@@ -495,6 +495,22 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         return { [weak self] in self?.depthSafetyObservers.removeValue(forKey: id) }
     }
 
+    /// Corroborate configured mounting height with several recent normal-tracking
+    /// camera captures. Depth history is cleared on tracking loss/session reset.
+    func mountedFloorReference(at now: Double) -> Float? {
+        guard RoverConfig.cameraMountCalibration.validation == .valid,
+              trackingQuality == .normal, let frame = latestSnapshot,
+              frame.trackingQuality == .normal, now.isFinite,
+              now >= frame.timestamp, now - frame.timestamp <= 0.25,
+              let depth = latestDepthSafetySnapshot, depth.failureReason == nil,
+              now >= depth.timestamp, now - depth.timestamp <= 0.25 else { return nil }
+        var captures: [(time: Double, height: Double)] = [(frame.timestamp, Double(frame.cameraTransform.columns.3.y))]
+        for previous in depth.history where now >= previous.timestamp && now - previous.timestamp <= 0.5 {
+            captures.append((previous.timestamp, Double(simd_inverse(previous.projection.cameraFromWorld).columns.3.y)))
+        }
+        return LocalGroundPlane.mountedReference(captures: captures, cameraHeight: RoverConfig.cameraMountCalibration.cameraHeight)
+    }
+
     func depthSafetyObservation(
         for command: WheelCommand,
         at timestamp: TimeInterval = ProcessInfo.processInfo.systemUptime

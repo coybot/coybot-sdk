@@ -270,7 +270,10 @@ final class FollowNavigationController {
             let costmap = CostmapBuilder.build(from: ar.meshAnchors, center: start)
             return planner.plan(from: start, to: goal, in: costmap)
         }
-        makePursuitPlan = { start, goal in await CostmapBuilder.planFollowAsync(from: ar.meshAnchors, start: start, goal: goal) }
+        makePursuitPlan = { start, goal in
+            let reference = ar.mountedFloorReference(at: ProcessInfo.processInfo.systemUptime)
+            return await CostmapBuilder.planFollowAsync(from: ar.meshAnchors, start: start, goal: goal, expectedFloorY: reference)
+        }
         readySignalCostmap = { await CostmapBuilder.buildAsync(from: ar.meshAnchors, center: $0) }
         currentLastAck = { await control.lastAckAt }
         sendCommand = Self.diagnosticSender(legacy: { try await control.sendNavigation($0) },
@@ -558,12 +561,13 @@ final class FollowNavigationController {
                 self.diagnosticEmitter?.emit(.init(event: "follow_pursuit." + stage, context: .init(
                     sessionGeneration: evidence?.context.request?.sessionGeneration,
                     operationID: evidence?.context.controllerOperationID, purpose: "followGoal", phase: "following"), payload: fields))
-            }, admissionDuration: { admissionDuration }))
+            }, admissionDuration: { admissionDuration }, depthNotificationsEnabled: observeDepthSafety != nil))
         pursuitDriver = driver
+        let removePursuitDepthObserver = observeDepthSafety? { [weak driver] _ in driver?.depthPublished() }
         state = .planning
         let task = Task { await driver.run() }
         loop = task
-        defer { if pursuitDriver === driver { pursuitDriver = nil } }
+        defer { removePursuitDepthObserver?(); if pursuitDriver === driver { pursuitDriver = nil } }
         let result = await task.value
         // Loss of episode authorization ends driving, but does not remove this
         // owner's cleanup obligation. Only an actual replacement owns its stop.

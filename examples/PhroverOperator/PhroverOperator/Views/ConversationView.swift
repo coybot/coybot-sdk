@@ -158,7 +158,13 @@ struct ConversationView: View {
         }
         .padding(.horizontal)
         .padding(.top, 20)
-        .onAppear { isVisible = true }
+        .onAppear {
+            isVisible = true
+            announceDisplayedErrors()
+        }
+        .onChange(of: model.displayedErrors, initial: true) { _, _ in
+            announceDisplayedErrors()
+        }
         .task {
             guard !scripted else { return }
             if runtimeLifetime.runtimeReady {
@@ -244,6 +250,8 @@ struct ConversationView: View {
         }
         .onDisappear {
             isVisible = false
+            speechOut.stopSpeaking()
+            model.resetErrorAnnouncements()
             runtimeLifetime.invalidateRuntimeInitialization()
             runtimeLifetime.invalidateSpeechCapture()
             speechIn.stop()
@@ -252,7 +260,10 @@ struct ConversationView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             detector?.setInferenceEnabled(phase == .active)
+            if phase == .active { announceDisplayedErrors() }
             if phase != .active {
+                speechOut.stopSpeaking()
+                model.resetErrorAnnouncements()
                 runtimeLifetime.invalidateSpeechCapture()
                 speechIn.stop()
                 model.prepareToLeave()
@@ -360,6 +371,14 @@ struct ConversationView: View {
             RuntimeFileLog.append("speech_capture_ui_error", fields: [
                 "error": String(describing: error)
             ])
+        }
+    }
+
+    private func announceDisplayedErrors() {
+        guard !scripted, isVisible, scenePhase == .active else { return }
+        model.announceDisplayedErrors(cancel: { speechOut.stopSpeaking() }) { message in
+            speechOut.speak(message, useIndependentAudioSession: true)
+            RuntimeFileLog.append("operator_error.announcement_requested", fields: ["message": message])
         }
     }
 }

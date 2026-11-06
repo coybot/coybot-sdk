@@ -119,6 +119,94 @@ final class FollowPursuitDriverTests: XCTestCase {
         XCTAssertTrue(f.events.contains("depth_stability_wait"))
     }
 
+    func testRecordedStopLatencyDoesNotConsumePostStopDepthRecoveryWindow() async {
+        let f = Fixture()
+        var recoveryStarted = 0.0
+        var delivered = 0
+        // Nov 6 trace: 135 ms stop, pre-stop depth at 328 ms, then
+        // qualifying captures at 446 and 531 ms. A third at 614 ms must
+        // still be eligible: only 479 ms have elapsed since stopping.
+        let deliveries: [(at: Double, age: Double)] = [
+            (0.328, 0.211), (0.446, 0.162), (0.531, 0.163), (0.614, 0.163)
+        ]
+        f.depthProvider = { _ in
+            if f.commands.isEmpty { return f.observation(age: 0.01) }
+            return f.observation(age: delivered == 0 ? 0.219 : deliveries[delivered - 1].age)
+        }
+        f.onStop = { recoveryStarted = f.time; f.time += 0.135 }
+        f.waitHandler = { duration in
+            if f.stops == 1, delivered < deliveries.count {
+                f.time = recoveryStarted + deliveries[delivered].at
+                delivered += 1
+            } else {
+                f.time += Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
+            }
+            f.sequence += 1
+            await Task.yield()
+        }
+        f.onSend = { _ in
+            f.sendAdmissionDuration = 0.039
+            if f.commands.count == 2 {
+                XCTAssertEqual(delivered, 4, "Require all three qualifying post-stop captures")
+                XCTAssertEqual(f.stops, 1)
+                f.position = Vec2(5, 0)
+            }
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertEqual(f.commands.count, 2)
+        XCTAssertNil(f.driver.failureCause)
+    }
+
+    func testPersistentDepthOutageIsBoundedFromConfirmedStop() async {
+        let f = Fixture()
+        var stoppedAt = 0.0
+        f.depthProvider = { _ in f.observation(age: f.commands.isEmpty ? 0.01 : 0.3) }
+        f.onStop = { f.time += 0.135; stoppedAt = f.time }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .failed(.depthUnavailable(.staleRawDepth)))
+        XCTAssertEqual(f.driver.failureCause, .pursuitDepthRefreshTimeout)
+        XCTAssertEqual(f.commands.count, 1)
+        XCTAssertEqual(f.stops, 1)
+        XCTAssertGreaterThanOrEqual(f.time - stoppedAt, 0.6 - 1e-6)
+        XCTAssertLessThan(f.time - stoppedAt, 0.63)
+    }
+
+    func testUnsentExpiryDuringRecoveryCannotRenewConfirmedStopDeadline() async {
+        let f = Fixture()
+        var firstStopAt = 0.0
+        f.depthProvider = { _ in
+            f.observation(age: (f.commands.count == 1 && f.stops == 0) || f.stops == 2 ? 0.3 : 0.01)
+        }
+        f.onStop = {
+            f.time += 0.135
+            if f.stops == 1 { firstStopAt = f.time }
+        }
+        f.onSend = { _ in
+            if f.commands.count == 2 {
+                f.time = firstStopAt + 0.59
+                throw FollowPursuitSendFailure(reason: .depthUnavailable(.staleRawDepth),
+                    definitelyUnsent: true, authorizationExpired: true)
+            }
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .failed(.depthUnavailable(.staleRawDepth)))
+        XCTAssertEqual(f.commands.count, 2, "One successful send and one rejected admission; no retry send")
+        XCTAssertEqual(f.stops, 2)
+        XCTAssertLessThan(f.time - firstStopAt, 0.75, "Second stop must not renew the original deadline")
+    }
+
+    func testPostStopRecoveryCannotExtendOriginalStartupAdmissionDeadline() async {
+        let f = Fixture()
+        f.depthProvider = { _ in f.observation(age: f.stops == 0 ? 0.239 : 0.01) }
+        f.onStop = { f.time = 11.95 }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .failed(.noPath))
+        XCTAssertEqual(f.stops, 1)
+        XCTAssertTrue(f.commands.isEmpty)
+        XCTAssertLessThan(f.time, 12.03)
+    }
+
     func testCautionDoesNotRepeatDriverDepthEvaluationForScaledCommand() async {
         let f = Fixture()
         var reads = 0
@@ -891,7 +979,7 @@ final class FollowPursuitDriverTests: XCTestCase {
         var stops = 0
         var planProvider: (@MainActor (Vec2, Vec2) async -> FollowPursuitPlan?)?
         var depthProvider: ((WheelCommand) -> DepthSafetyObservation)?
-        var onSend: ((WheelCommand) -> Void)?
+        var onSend: ((WheelCommand) throws -> Void)?
         var onStop: (() -> Void)?
         var sendAdmissionDuration = 0.0
         var notifications = false
@@ -918,7 +1006,7 @@ final class FollowPursuitDriverTests: XCTestCase {
         send: { command, expiry in
             XCTAssertLessThan(self.time, expiry)
             self.commands.append(command)
-            self.onSend?(command)
+            try self.onSend?(command)
         }, stop: { self.stops += 1; self.onStop?() }, sleep: { duration in
             if let handler = self.waitHandler { await handler(duration); return }
             if self.autoAdvance {

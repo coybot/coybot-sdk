@@ -511,9 +511,11 @@ public final class FollowMeCoordinator {
         guard retained || current else { return }
         failureResolution = record
         if retained {
-            // An in-flight terminal result can enrich evidence after fencing. Explicit stale
-            // callbacks never publish UI, and no second delivery creates another stop owner.
-            if !delivery.stale {
+            // Terminal cleanup fences the failed operation before its in-flight
+            // stop returns. A real failed stop for this retained operation must
+            // escalate immediately, even while independent confirmation is pending.
+            // Other stale deliveries cannot publish or create a second stop owner.
+            if !delivery.stale || (stopTask != nil && delivery.stopOutcome == .failed) {
                 state = .failed(record.message)
                 if record.stopOutcome == .failed { stopBlocked = true }
             }

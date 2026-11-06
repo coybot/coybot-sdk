@@ -2,6 +2,16 @@ import XCTest
 @testable import PhroverKit
 
 final class FollowMotionFailureResolutionTests: XCTestCase {
+    func testCommunicationLossOnlyClaimsStoppedAfterConfirmation() {
+        for outcome in [FollowMotionStopOutcome.unknown, .pending, .confirmed, .failed] {
+            let resolution = FollowMotionFailureResolution(.init(context: .unknown, reason: .commsLost,
+                stopOutcome: outcome, source: .stream))
+            let expected = outcome == .failed ? "Motor stop could not be confirmed. Motion is blocked." :
+                (outcome == .confirmed ? "Rover communication lost. Stop confirmed." : "Rover communication lost. Attempting to stop.")
+            XCTAssertEqual(resolution.message, expected)
+        }
+    }
+
     func testBlockedStartMessageRetainsStopFailurePriority() {
         let context = FollowMotionOperationContext(request: nil, controllerOperationID: 1,
             purpose: .followGoal, profile: nil, failureCause: .pursuitStartBlocked)

@@ -1675,6 +1675,42 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         }
     }
 
+    func testFencedPulseStopTimeoutRetainsFailedEvidenceWhileCleanupIsPending() async throws {
+        let source = FollowRecoveryDiagnosticSourceFixture()
+        let pulseStop = FollowDiagnosticSuspension()
+        let cleanupStop = FollowDiagnosticSuspension()
+        var stops = 0
+        var sends = 0
+        let controller = FollowNavigationController(currentPose: { nil }, forwardClearance: { 2 },
+            plan: { _, goal in [goal] }, lastAckAt: { Date() }, sendCommand: { _ in sends += 1 },
+            stopRover: {
+                stops += 1
+                if stops == 2 { await pulseStop.suspend(); throw URLError(.timedOut) }
+                if stops == 3 { await cleanupStop.suspend() }
+            }, sleep: source.advance, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+            sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
+        let scan = Task { await NavigationFollowMeMotion(navigation: controller).perform(.scan(0.3), context:
+            .init(sessionGeneration: 9, requestToken: 901, purpose: .followScan, phase: "searching")) }
+        await pulseStop.waitUntilEntered()
+        var entered = false
+        let stop = Task { () -> Bool in
+            entered = true
+            do { try await controller.stopAndConfirm(); return true } catch { return false }
+        }
+        while !entered { await Task.yield() }
+        pulseStop.release()
+        await cleanupStop.waitUntilEntered()
+        let result = await scan.value
+        XCTAssertEqual(result.stopOutcome, .failed, "Fencing must not turn a real stop timeout into cancellation")
+        XCTAssertEqual(result.failure?.stopOutcome, .failed)
+        XCTAssertEqual(result.failure?.stale, true, "Captured evidence must retain its old ownership")
+        XCTAssertEqual(sends, 1)
+        cleanupStop.release()
+        let confirmed = await stop.value
+        XCTAssertTrue(confirmed)
+    }
+
     func testLateSuccessfulPreStopCannotClearNewerFailedIndependentStopOrSend() async throws {
         let clock = FollowDiagnosticTestClock()
         let sink = FollowDiagnosticRecordingSink()

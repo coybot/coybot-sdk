@@ -79,8 +79,10 @@ When an expired command is proven unsent (zero attempts in both the receipt and
 transport capture), pursuit confirms a new stop before re-observing. It requires
 a newer same-generation frame captured after that stop, rechecks all normal
 guards, and computes a new command with new authority. The old command's expiry
-is never extended. The fixed 600 ms refresh window includes stop time and cannot
-be renewed by repeated expiry; at most two recoveries are allowed before sustained
+is never extended. The fixed 600 ms refresh window starts at the first confirmed
+stop in that recovery, giving post-stop captures the full window to stabilize.
+Repeated expiry before a successful send cannot renew this deadline, including
+time spent confirming another stop. At most two recoveries are allowed before sustained
 healthy delivery replenishes the allowance. Uncertain sends, failed stops, source faults and hazards still
 terminate. The original startup and progress deadlines remain in force.
 

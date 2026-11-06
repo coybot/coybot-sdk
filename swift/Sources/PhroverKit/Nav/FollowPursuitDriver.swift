@@ -193,19 +193,27 @@ final class FollowPursuitDriver {
                 return .depthUnavailable(.staleRawDepth)
             }
             failureCause = rawDepth ? .pursuitDepthRefreshTimeout : .pursuitAuthorizationExpired
-            if refreshDeadline == nil {
-                refreshDeadline = min(sent ? .infinity : began + Self.initialAdmissionTimeout,
-                    environment.uptime() + Self.depthRefreshLimit)
-            }
+            let stopRequestedAt = environment.uptime()
+            let existingRecoveryDeadline = refreshAfter == nil ? nil : refreshDeadline
             expiryRecoveries += 1
             environment.emit(rawDepth ? "raw_depth_refresh_started" : "authorization_expired", ["recovery_attempt": .number(Double(expiryRecoveries)),
-                "refresh_deadline_s": .number(refreshDeadline!), "command_valid_until_s": expiry.isFinite ? .number(expiry) : .null,
+                "refresh_deadline_s": existingRecoveryDeadline.map { .number($0) } ?? .null,
+                "command_valid_until_s": expiry.isFinite ? .number(expiry) : .null,
                 "evaluated_at_s": .number(environment.uptime()), "reason": .string(rawDepth ? "raw_depth_freshness" : "command_authorization_expired"),
                 "transport_attempts": .number(0)])
             do { try await environment.stop() } catch { return .commandFailed }
             movementActive = false
             refreshAfter = (environment.pose().frameID, environment.uptime())
-            environment.emit("depth_refresh_stop_confirmed", [:])
+            // Recovery accepts only captures after this stop. Give those captures
+            // the full bounded window instead of spending it on stop transport.
+            // Startup cannot outlive its original admission deadline, and an
+            // unsent retry within this recovery cannot renew the established window.
+            refreshDeadline = existingRecoveryDeadline ?? min(sent ? .infinity : began + Self.initialAdmissionTimeout,
+                refreshAfter!.time + Self.depthRefreshLimit)
+            environment.emit("depth_refresh_stop_confirmed", [
+                "confirmed_stop_s": .number(refreshAfter!.time),
+                "stop_elapsed_s": .number(refreshAfter!.time - stopRequestedAt),
+                "refresh_deadline_s": .number(refreshDeadline!)])
             return nil
         }
 

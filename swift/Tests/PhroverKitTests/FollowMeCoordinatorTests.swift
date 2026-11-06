@@ -1967,6 +1967,44 @@ final class FollowMeCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.state, .stopped)
     }
 
+    func testFencedStopFailureEscalatesDuringPendingCleanupAndBlocksRestart() async throws {
+        let perception = FollowPerceptionFake()
+        let motion = ContextualFollowMotionFake()
+        let clock = ManualFollowClock()
+        var config = FollowMeConfiguration()
+        config.stationaryPauseSeconds = 0
+        motion.legacy.suspendRotation = true
+        let coordinator = FollowMeCoordinator(perception: perception, motion: motion, clock: clock, configuration: config)
+        _ = await coordinator.start()
+        await drain()
+        perception.send(frame(1))
+        await drain()
+        let context = FollowMotionOperationContext(request: try XCTUnwrap(motion.contexts.first),
+            controllerOperationID: 91, purpose: .followScan, profile: nil)
+        motion.legacy.suspendStop = true
+        motion.sendFailure(.init(context: context, reason: .commsLost, stopOutcome: .pending, source: .stream))
+        await drain()
+        XCTAssertEqual(coordinator.state, .failed("Rover communication lost. Attempting to stop."))
+        // Terminal cancellation fences the operation; it does not erase an
+        // actual timeout from that operation's already-running motor stop.
+        motion.resultOverride = .init(result: .cancelled, context: context,
+            failure: .init(context: context, reason: .commsLost, stopOutcome: .failed, source: .result, stale: true))
+        motion.legacy.releaseRotation()
+        await drain()
+        XCTAssertEqual(coordinator.state, .failed("Motor stop could not be confirmed. Motion is blocked."))
+        let pendingRestart = await coordinator.start()
+        XCTAssertFalse(pendingRestart)
+        motion.legacy.suspendStop = false
+        motion.legacy.releaseStop()
+        await drain()
+        XCTAssertEqual(coordinator.state, .failed("Motor stop could not be confirmed. Motion is blocked."))
+        let restarted = await coordinator.start()
+        XCTAssertFalse(restarted, "Cleanup success cannot erase a captured failed stop")
+        let confirmed = await coordinator.stop()
+        XCTAssertTrue(confirmed, "Explicit acknowledged retry may release the block")
+        XCTAssertEqual(coordinator.state, .stopped)
+    }
+
     func testCapturedSearchFailureSurvivesDetectionPhaseChangeAndOnePendingStopOwner() async throws {
         let perception = FollowPerceptionFake()
         let motion = ContextualFollowMotionFake()

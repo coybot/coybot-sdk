@@ -19,6 +19,30 @@ final class ConversationViewModel {
     private var inhibit: () -> Void
     private var submitFinalized: ((String, TimeInterval) async -> OperatorSubmission)?
     private var monotonic: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+    private var announcedErrors: Set<String> = []
+
+    /// Read the same failure sources the Talk screen displays. Following can
+    /// fail asynchronously, after the initial command submission was accepted.
+    var displayedErrors: [String] {
+        var messages: [String] = []
+        if case .failed(let message) = followState() { messages.append(message) }
+        if let errorMessage, !messages.contains(errorMessage) { messages.append(errorMessage) }
+        return messages.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    func announceDisplayedErrors(cancel: () -> Void = {}, using announce: (String) -> Void) {
+        let messages = displayedErrors
+        let current = Set(messages)
+        guard current != announcedErrors else { return }
+        announcedErrors = current
+        // Replace the whole pending error queue when the displayed set changes.
+        // Otherwise interrupting an old utterance could silently drop another
+        // still-visible error that was queued but never heard.
+        cancel()
+        for message in messages { announce(message) }
+    }
+
+    func resetErrorAnnouncements() { announcedErrors = [] }
 
     init(submit: @escaping (String) async -> OperatorSubmission = { _ in .rejected("Rover is starting. Try again.") },
          stop: @escaping () async -> OperatorSubmission = { .accepted },

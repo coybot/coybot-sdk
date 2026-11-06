@@ -5,6 +5,102 @@ import RoverNav
 
 @MainActor
 final class ConversationViewModelTests: XCTestCase {
+    func testCommunicationStopEscalationReplacesSpeechAndKeepsRetryControl() {
+        var state = FollowMeState.failed("Rover communication lost. Attempting to stop.")
+        let model = ConversationViewModel(followState: { state })
+        var queue: [String] = []
+        model.announceDisplayedErrors(cancel: { queue.removeAll() }) { queue.append($0) }
+        XCTAssertEqual(queue, ["Rover communication lost. Attempting to stop."])
+        state = .failed("Motor stop could not be confirmed. Motion is blocked.")
+        model.announceDisplayedErrors(cancel: { queue.removeAll() }) { queue.append($0) }
+        XCTAssertEqual(queue, ["Motor stop could not be confirmed. Motion is blocked."])
+        XCTAssertEqual(model.status, queue.first)
+        XCTAssertTrue(model.showsStopFollowing)
+        model.announceDisplayedErrors(cancel: { queue.removeAll() }) { queue.append($0) }
+        XCTAssertEqual(queue.count, 1)
+    }
+
+    func testFollowingErrorsAreSpokenOnceAndMoreSevereStopErrorIsAnnounced() {
+        var state = FollowMeState.following
+        let model = ConversationViewModel(followState: { state })
+        var spoken: [String] = []
+        model.announceDisplayedErrors { spoken.append($0) }
+        XCTAssertTrue(spoken.isEmpty)
+        let depthError = "Following stopped: depth did not become fresh and stable enough to send."
+        state = .failed(depthError)
+        model.announceDisplayedErrors { spoken.append($0) }
+        model.announceDisplayedErrors { spoken.append($0) }
+        XCTAssertEqual(spoken, [depthError])
+        XCTAssertEqual(model.status, depthError, "Speech must preserve the on-screen error")
+        state = .failed("Motor stop could not be confirmed. Motion is blocked.")
+        model.announceDisplayedErrors { spoken.append($0) }
+        XCTAssertEqual(spoken.last, "Motor stop could not be confirmed. Motion is blocked.")
+        XCTAssertEqual(spoken.count, 2)
+        state = .following
+        model.announceDisplayedErrors { spoken.append($0) }
+        state = .failed(depthError)
+        model.announceDisplayedErrors { spoken.append($0) }
+        XCTAssertEqual(spoken, [depthError, "Motor stop could not be confirmed. Motion is blocked.", depthError])
+    }
+
+    func testRejectedCommandsAndStopsSpeakWithoutDuplicatingFollowingError() async {
+        let message = "Rover stop could not be confirmed."
+        var state = FollowMeState.idle
+        let model = ConversationViewModel(submit: { _ in .rejected(message) },
+            stop: { .rejected(message) }, followState: { state })
+        var spoken: [String] = []
+        await model.submitFinalSpeech("follow me")
+        model.announceDisplayedErrors { spoken.append($0) }
+        state = .failed(message)
+        model.announceDisplayedErrors { spoken.append($0) }
+        await model.stopFollowing()
+        model.announceDisplayedErrors { spoken.append($0) }
+        XCTAssertEqual(spoken, [message])
+        XCTAssertEqual(model.errorMessage, message)
+        XCTAssertTrue(model.showsStopFollowing)
+    }
+
+    func testDistinctDisplayedErrorsAreBothAnnouncedAndCanRepeatAfterClearing() async {
+        var state = FollowMeState.failed("Person lost.")
+        var reject = true
+        let model = ConversationViewModel(submit: { _ in reject ? .rejected("Rover is busy.") : .accepted },
+            followState: { state })
+        var spoken: [String] = []
+        await model.submitFinalSpeech("follow me")
+        model.announceDisplayedErrors { spoken.append($0) }
+        XCTAssertEqual(spoken, ["Person lost.", "Rover is busy."])
+        reject = false
+        state = .following
+        await model.submitFinalSpeech("follow me")
+        model.announceDisplayedErrors { spoken.append($0) }
+        XCTAssertTrue(model.displayedErrors.isEmpty)
+        state = .failed("Person lost.")
+        model.announceDisplayedErrors { spoken.append($0) }
+        XCTAssertEqual(spoken, ["Person lost.", "Rover is busy.", "Person lost."])
+    }
+
+    func testErrorQueueReplacesCancelledMessagesAndClearsResolvedErrors() async {
+        var state = FollowMeState.failed("Person lost.")
+        let model = ConversationViewModel(submit: { _ in .rejected("Rover is busy.") },
+            followState: { state })
+        var queue: [String] = []
+        func refresh() {
+            model.announceDisplayedErrors(cancel: { queue.removeAll() }) { queue.append($0) }
+        }
+        refresh()
+        XCTAssertEqual(queue, ["Person lost."])
+        await model.submitFinalSpeech("follow me")
+        refresh()
+        XCTAssertEqual(queue, ["Person lost.", "Rover is busy."], "Interrupted errors must be requeued")
+        state = .stopped
+        refresh()
+        XCTAssertEqual(queue, ["Rover is busy."], "Resolved errors must leave the speech queue")
+        queue.removeAll() // View leaves / app backgrounds and cancels playback.
+        model.resetErrorAnnouncements()
+        refresh()
+        XCTAssertEqual(queue, ["Rover is busy."], "Returning can announce an interrupted error again")
+    }
+
     func testFollowSpeechImmediatelyUsesOrdinarySubmission() async {
         var submitted: [String] = []
         var stops = 0

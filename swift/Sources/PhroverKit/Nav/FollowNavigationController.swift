@@ -1521,19 +1521,24 @@ final class FollowNavigationController {
                     latch: stopUnconfirmed, outcome: "acknowledged")
             }
         } catch {
-            // Burst confirmation drains independently of the cancelled loop.
-            // Losing its captured owner still interrupts the old response; only
-            // the replacing serialized confirmation can decide the new latch.
+            // Cancellation fences motion, but does not turn a real transport
+            // timeout into a cancelled stop. Retain failed-stop evidence on its
+            // captured operation; only the current owner may change the latch.
             let interrupted = Task.isCancelled || (operationGeneration != owner && evidence?.fenced == true)
+            let transportCancelled = error is CancellationError || (error as? URLError)?.code == .cancelled
+            let stopFailed = !interrupted || !transportCancelled
+            if stopFailed {
+                evidence?.recordStop(.failed)
+                evidence?.recordFailure(.commandFailed)
+            }
             if origin == "pulse" || origin == "cleanup", operationGeneration == owner, !interrupted {
                 // An owned cleanup failure has the same stop obligation as a pulse.
                 // A stale operation cannot latch or publish over its replacement.
                 stopUnconfirmed = true
-                evidence?.recordStop(.failed)
             }
             if let evidence, let token {
                 evidence.scanTrace?.endStop(token, origin: origin, evidence: evidence, receipt: receiptCapture.receipt, latch: stopUnconfirmed,
-                    outcome: interrupted ? "cancelled" : "failed")
+                    outcome: stopFailed ? "failed" : "cancelled")
             }
             throw error
         }

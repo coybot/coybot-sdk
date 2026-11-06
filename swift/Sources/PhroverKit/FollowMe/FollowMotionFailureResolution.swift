@@ -113,7 +113,7 @@ struct FollowMotionFailureResolution {
             if context.purpose == .followGoal {
                 switch context.failureCause {
                 case .pursuitDepthRefreshTimeout:
-                    return "Following stopped: fresh depth with enough sending margin did not arrive within 600 ms. Restart following after depth recovers."
+                    return "Following stopped: depth did not become fresh and stable enough to send within the 600 ms depth recovery window. Restart following after depth recovers."
                 case .pursuitAuthorizationExpired:
                     return "Following stopped: command authorization expired and stopped recovery could not complete. Restart following."
                 case .pursuitRecoveryExhausted:
@@ -146,7 +146,10 @@ struct FollowMotionFailureResolution {
             }
             return reason.followMotionMessage
         case .obstacle: return "Obstacle detected. Motion stopped."
-        case .commsLost: return "Rover communication lost. Motion stopped."
+        case .commsLost:
+            return stopOutcome == .confirmed
+                ? "Rover communication lost. Stop confirmed."
+                : "Rover communication lost. Attempting to stop."
         case .tipping: return "Rover tipping detected. Motion stopped."
         case .stalled:
             if context.purpose == .followReady, let description = context.failureCause?.readyDescription {

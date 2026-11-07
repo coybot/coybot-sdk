@@ -41,6 +41,21 @@ final class CostmapBuilderTests: XCTestCase {
         }
     }
 
+    func testInconsistentFloorReportsSupportDeficitWithoutAcceptingThePlane() throws {
+        let vertices = recordedHeightFixture().map { point in
+            point.x > 0 ? SIMD3<Float>(point.x, -0.90, point.z) : point
+        }
+        let assessment = LocalGroundPlane.assess(vertices: vertices, center: .zero, expectedFloorY: -1.10)
+        XCTAssertNil(assessment.plane)
+        XCTAssertEqual(assessment.diagnostics["local_floor_rejection"], "inconsistent_surface")
+        let inliers = try XCTUnwrap(assessment.diagnostics["local_floor_inlier_cells"].flatMap(Int.init))
+        let required = try XCTUnwrap(assessment.diagnostics["local_floor_required_inlier_cells"].flatMap(Int.init))
+        XCTAssertGreaterThanOrEqual(inliers, 24)
+        XCTAssertLessThan(inliers, required, "The log should identify inadequate spatial support, not just a generic rejection")
+        XCTAssertNotNil(assessment.diagnostics["local_floor_reference_consistent_cells"])
+        XCTAssertNotNil(assessment.diagnostics["local_floor_seed_cells"])
+    }
+
     func testLocalPlaneDoesNotExtrapolateOrHideLocalDepression() throws {
         var vertices = recordedHeightFixture()
         vertices.append(SIMD3<Float>(2, -1.084145, 0.05))

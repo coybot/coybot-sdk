@@ -81,6 +81,9 @@ struct ConversationView: View {
                     if let message = model.errorMessage {
                         Text(message).foregroundStyle(.red)
                     }
+                    if let message = model.speechErrorMessage {
+                        Text(message).foregroundStyle(.red)
+                    }
                     if model.showsStopFollowing {
                         Button("Stop Following", role: .destructive) {
                             Task { await model.stopFollowing() }
@@ -162,16 +165,18 @@ struct ConversationView: View {
             isVisible = true
             announceDisplayedErrors()
         }
-        .onChange(of: model.displayedErrors, initial: true) { _, _ in
+        .onChange(of: model.errorAnnouncement, initial: true) { _, _ in
             announceDisplayedErrors()
         }
         .task {
             guard !scripted else { return }
+            speechOut.willSpeak = { [runtimeLifetime, speechIn] in
+                runtimeLifetime.prepareForSpeechPlayback { speechIn.stop() }
+            }
             if runtimeLifetime.runtimeReady {
                 detector?.setInferenceEnabled(scenePhase == .active)
                 if !authorized {
-                    let granted = await speechIn.requestAuthorization()
-                    if !Task.isCancelled { authorized = granted }
+                    await requestSpeechAuthorization()
                 }
                 return
             }
@@ -245,8 +250,7 @@ struct ConversationView: View {
                             submitFinalized: { text, receivedAt in
                                 await router.submit(text, finalizedTextReceivedAt: receivedAt)
                             }, monotonic: { followClock.now })
-            let granted = await speechIn.requestAuthorization()
-            if !Task.isCancelled { authorized = granted }
+            await requestSpeechAuthorization()
         }
         .onDisappear {
             isVisible = false
@@ -355,12 +359,16 @@ struct ConversationView: View {
     private func startListening() {
         guard isVisible, scenePhase == .active, runtimeLifetime.runtimeReady,
               authorized, agent != nil, speechIn.state != .listening else { return }
-        let captureEpoch = runtimeLifetime.speechEpoch
+        guard let captureEpoch = runtimeLifetime.beginSpeechCapture(playbackActive: speechOut.isSpeaking) else { return }
         do {
             try speechIn.start(onEvent: { event in
+                guard runtimeLifetime.acceptsSpeechCapture(from: captureEpoch) else { return }
                 lastCommand.reduce(event)
+                model.receiveSpeechCaptureEvent(event)
             }) { captureID, utterance in
+                guard runtimeLifetime.acceptsSpeechCapture(from: captureEpoch) else { return }
                 lastCommand.finalizeCapture(captureID)
+                model.finalizeSpeechCapture(captureID)
                 Task { @MainActor in
                     guard isVisible, scenePhase == .active, runtimeLifetime.runtimeReady,
                           runtimeLifetime.acceptsSpeechCapture(from: captureEpoch) else { return }
@@ -368,6 +376,11 @@ struct ConversationView: View {
                 }
             }
         } catch {
+            if runtimeLifetime.acceptsSpeechCapture(from: captureEpoch) {
+                model.recordSpeechFailure(error is SpeechError
+                    ? "Speech recognition unavailable. Try again."
+                    : "Microphone could not start. Check microphone access and try again.")
+            }
             RuntimeFileLog.append("speech_capture_ui_error", fields: [
                 "error": String(describing: error)
             ])
@@ -380,6 +393,13 @@ struct ConversationView: View {
             speechOut.speak(message, useIndependentAudioSession: true)
             RuntimeFileLog.append("operator_error.announcement_requested", fields: ["message": message])
         }
+    }
+
+    private func requestSpeechAuthorization() async {
+        let granted = await speechIn.requestAuthorization()
+        guard !Task.isCancelled else { return }
+        authorized = granted
+        if !granted { model.recordSpeechFailure("Enable Speech Recognition and microphone access in Settings.") }
     }
 }
 

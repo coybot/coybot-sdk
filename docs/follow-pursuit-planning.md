@@ -37,6 +37,16 @@ rechecks pose, central clearance, communications and depth after acknowledgement
 reads. Transport admission checks the owner, target revision, pose and depth again;
 the original depth/pose/acknowledgement expiry is not renewed in the sender queue.
 
+Before the first send, a completed `start_blocked` rejection can still terminate
+startup after a goal update if its captured map shows the rover in the same
+blocked cell and the AR generation is unchanged. The starting-cell obstruction
+does not depend on the person's updated goal. Its cause and map diagnostics are
+retained instead of degrading to a generic startup timeout. This exception never
+commits an obsolete route, reuses goal-specific rejections, or applies after a send.
+Local-floor fits report reference-consistent, seed, inlier and required support
+counts for the assessment stages reached; counts not yet computed are omitted.
+This lets a blocked start be investigated without relaxing geometry checks.
+
 While replanning an already moving drive, the last committed path remains active
 under the normal safety checks. New plans are installed atomically; worker waits
 do not suspend the control loop. If the old goal is reached while a replacement

@@ -5,6 +5,104 @@ import RoverNav
 
 @MainActor
 final class ConversationViewModelTests: XCTestCase {
+    func testEachRejectedOperatorActionAnnouncesEvenWhenTextIsUnchanged() async {
+        let message = "Rover stop could not be confirmed."
+        let model = ConversationViewModel(submit: { _ in .rejected(message) }, stop: { .rejected(message) })
+        var spoken: [String] = []
+        for _ in 0..<2 {
+            await model.submitFinalSpeech("follow me")
+            model.announceDisplayedErrors { spoken.append($0) }
+            model.announceDisplayedErrors { spoken.append($0) }
+        }
+        for _ in 0..<2 {
+            await model.stopFollowing()
+            model.announceDisplayedErrors { spoken.append($0) }
+            model.announceDisplayedErrors { spoken.append($0) }
+        }
+        XCTAssertEqual(spoken, Array(repeating: message, count: 4))
+    }
+
+    func testRecognitionFailuresAnnouncePerCaptureAndIgnoreDuplicateOrOldEvents() {
+        let model = ConversationViewModel()
+        var spoken: [String] = []
+        for sequence: UInt64 in 1...2 {
+            let id = SpeechCaptureID(rawValue: sequence)
+            model.receiveSpeechCaptureEvent(.started(id: id))
+            model.receiveSpeechCaptureEvent(.failed(id: .init(rawValue: 99), message: "Old failure"))
+            XCTAssertNil(model.speechErrorMessage)
+            let before = model.errorAnnouncement
+            model.receiveSpeechCaptureEvent(.failed(id: id, message: "No speech detected. Try again."))
+            XCTAssertNotEqual(model.errorAnnouncement, before)
+            model.announceDisplayedErrors { spoken.append($0) }
+            model.receiveSpeechCaptureEvent(.failed(id: id, message: "No speech detected. Try again."))
+            model.announceDisplayedErrors { spoken.append($0) }
+        }
+        XCTAssertEqual(spoken, Array(repeating: "No speech detected. Try again.", count: 2))
+        model.receiveSpeechCaptureEvent(.started(id: .init(rawValue: 3)))
+        model.finalizeSpeechCapture(.init(rawValue: 3))
+        model.receiveSpeechCaptureEvent(.failed(id: .init(rawValue: 3), message: "Late failure"))
+        XCTAssertNil(model.speechErrorMessage)
+    }
+
+    func testRecognizerUnavailableStartFailureIsDisplayedAndAnnouncedOnEveryAttempt() {
+        let model = ConversationViewModel()
+        var spoken: [String] = []
+        let message = "Speech recognition unavailable. Try again."
+        model.recordSpeechFailure(message)
+        let first = model.errorAnnouncement
+        model.announceDisplayedErrors { spoken.append($0) }
+        model.recordSpeechFailure(message)
+        XCTAssertNotEqual(model.errorAnnouncement, first, "SwiftUI must observe a new occurrence despite identical text")
+        model.announceDisplayedErrors { spoken.append($0) }
+        XCTAssertEqual(model.speechErrorMessage, message)
+        XCTAssertEqual(spoken, [message, message])
+    }
+
+    func testAnnouncementFencesQueuedTranscriptBeforeStoppingMicrophone() throws {
+        let lifetime = ConversationRuntimeLifetime()
+        let capture = try XCTUnwrap(lifetime.beginSpeechCapture(playbackActive: false))
+        var microphoneStopped = false
+        lifetime.prepareForSpeechPlayback {
+            XCTAssertFalse(lifetime.acceptsSpeechCapture(from: capture), "Even a final result queued before playback must be discarded")
+            microphoneStopped = true
+        }
+        XCTAssertTrue(microphoneStopped)
+        XCTAssertNil(lifetime.beginSpeechCapture(playbackActive: true), "Do not record queued or playing announcements")
+        let freshCapture = try XCTUnwrap(lifetime.beginSpeechCapture(playbackActive: false))
+        XCTAssertTrue(lifetime.acceptsSpeechCapture(from: freshCapture))
+        XCTAssertFalse(lifetime.acceptsSpeechCapture(from: capture))
+    }
+
+    func testClearingRecognitionErrorOnRetryDoesNotReplayCompletedFollowError() throws {
+        let model = ConversationViewModel(followState: { .failed("Person lost.") })
+        let lifetime = ConversationRuntimeLifetime()
+        let first = SpeechCaptureID(rawValue: 1)
+        model.receiveSpeechCaptureEvent(.started(id: first))
+        model.receiveSpeechCaptureEvent(.failed(id: first, message: "No speech detected. Try again."))
+        model.announceDisplayedErrors { _ in }
+        // Playback completed; the operator is now permitted to retry capture.
+        let retryEpoch = try XCTUnwrap(lifetime.beginSpeechCapture(playbackActive: false))
+        model.receiveSpeechCaptureEvent(.started(id: .init(rawValue: 2)))
+        model.announceDisplayedErrors { _ in
+            lifetime.prepareForSpeechPlayback(stopCapture: {})
+            XCTFail("Removing a delivered recognition error must not replay a delivered follow error")
+        }
+        XCTAssertNil(model.speechErrorMessage)
+        XCTAssertTrue(lifetime.acceptsSpeechCapture(from: retryEpoch))
+    }
+
+    func testCaptureRetryCannotSuppressANewFollowFailureBeforeViewUpdate() {
+        var state = FollowMeState.idle
+        let model = ConversationViewModel(followState: { state })
+        model.recordSpeechFailure("No speech detected. Try again.")
+        model.announceDisplayedErrors { _ in }
+        state = .failed("Motor stop could not be confirmed. Motion is blocked.")
+        model.receiveSpeechCaptureEvent(.started(id: .init(rawValue: 2)))
+        var spoken: [String] = []
+        model.announceDisplayedErrors { spoken.append($0) }
+        XCTAssertEqual(spoken, ["Motor stop could not be confirmed. Motion is blocked."])
+    }
+
     func testCommunicationStopEscalationReplacesSpeechAndKeepsRetryControl() {
         var state = FollowMeState.failed("Rover communication lost. Attempting to stop.")
         let model = ConversationViewModel(followState: { state })
@@ -55,7 +153,7 @@ final class ConversationViewModelTests: XCTestCase {
         model.announceDisplayedErrors { spoken.append($0) }
         await model.stopFollowing()
         model.announceDisplayedErrors { spoken.append($0) }
-        XCTAssertEqual(spoken, [message])
+        XCTAssertEqual(spoken, [message, message], "A new explicit failed stop deserves another announcement")
         XCTAssertEqual(model.errorMessage, message)
         XCTAssertTrue(model.showsStopFollowing)
     }

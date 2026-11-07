@@ -54,13 +54,19 @@ struct LocalGroundPlane: Sendable {
         }
         let all = cells.values.sorted { $0.x == $1.x ? $0.z < $1.z : $0.x < $1.x }
         let eligible = all.filter { abs($0.y - Double(expectedFloorY)) <= 0.06 }
+        let minimumSupportCells = 24
+        let requiredSupportFraction = 0.7
         fields["local_floor_spatial_cells"] = String(all.count)
-        guard eligible.count >= 24 else { return reject("insufficient_reference_consistent_support") }
+        fields["local_floor_reference_consistent_cells"] = String(eligible.count)
+        fields["local_floor_required_inlier_cells"] = String(max(minimumSupportCells, Int(ceil(Double(all.count) * requiredSupportFraction))))
+        guard eligible.count >= minimumSupportCells else { return reject("insufficient_reference_consistent_support") }
         let median = eligible.map(\.y).sorted()[eligible.count / 2]
         let seed = eligible.filter { abs($0.y - median) <= 0.03 }
+        fields["local_floor_seed_cells"] = String(seed.count)
         guard let initial = fit(seed) else { return reject("degenerate_support") }
         let inliers = eligible.filter { abs($0.y - (initial.2 + initial.0 * $0.x + initial.1 * $0.z)) <= 0.015 }
-        guard inliers.count >= 24, Double(inliers.count) >= Double(all.count) * 0.7,
+        fields["local_floor_inlier_cells"] = String(inliers.count)
+        guard inliers.count >= minimumSupportCells, Double(inliers.count) >= Double(all.count) * requiredSupportFraction,
               let (a, b, c) = fit(inliers) else { return reject("inconsistent_surface") }
         guard hypot(a, b) <= 0.08, abs(c - Double(expectedFloorY)) <= 0.04 else { return reject("slope_or_mount_mismatch") }
         let rms = sqrt(inliers.reduce(0.0) { $0 + pow($1.y - (c + a * $1.x + b * $1.z), 2) } / Double(inliers.count))
@@ -81,7 +87,6 @@ struct LocalGroundPlane: Sendable {
         fields["local_floor_y_at_start_m"] = String(c)
         fields["local_floor_x_slope"] = String(a)
         fields["local_floor_z_slope"] = String(b)
-        fields["local_floor_inlier_cells"] = String(inliers.count)
         fields["local_floor_rms_m"] = String(rms)
         fields["local_floor_support_bounds_dx_dz_m"] = "\(minX),\(maxX),\(minZ),\(maxZ)"
         return (.init(center: center, xSlope: a, zSlope: b, height: c, minX: minX, maxX: maxX, minZ: minZ, maxZ: maxZ), fields)

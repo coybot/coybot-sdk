@@ -4,7 +4,12 @@ import PhroverKit
 @Observable
 @MainActor
 final class ConversationViewModel {
-    private(set) var errorMessage: String?
+    private(set) var errorMessage: String? {
+        didSet { if errorMessage != nil { errorOccurrence &+= 1 } }
+    }
+    private(set) var speechErrorMessage: String?
+    private var activeSpeechCapture: SpeechCaptureID?
+    private var errorOccurrence: UInt64 = 0
     private(set) var missionPhase: MissionAgent.Phase = .idle
     private var acceptsMissionPhase = true
     private var submissionGeneration: UInt64 = 0
@@ -20,6 +25,16 @@ final class ConversationViewModel {
     private var submitFinalized: ((String, TimeInterval) async -> OperatorSubmission)?
     private var monotonic: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
     private var announcedErrors: Set<String> = []
+    private var announcedOccurrence: UInt64 = 0
+
+    struct ErrorAnnouncement: Equatable {
+        let messages: [String]
+        let occurrence: UInt64
+    }
+
+    var errorAnnouncement: ErrorAnnouncement {
+        .init(messages: displayedErrors, occurrence: errorOccurrence)
+    }
 
     /// Read the same failure sources the Talk screen displays. Following can
     /// fail asynchronously, after the initial command submission was accepted.
@@ -27,14 +42,16 @@ final class ConversationViewModel {
         var messages: [String] = []
         if case .failed(let message) = followState() { messages.append(message) }
         if let errorMessage, !messages.contains(errorMessage) { messages.append(errorMessage) }
+        if let speechErrorMessage, !messages.contains(speechErrorMessage) { messages.append(speechErrorMessage) }
         return messages.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     }
 
     func announceDisplayedErrors(cancel: () -> Void = {}, using announce: (String) -> Void) {
         let messages = displayedErrors
         let current = Set(messages)
-        guard current != announcedErrors else { return }
+        guard current != announcedErrors || (!current.isEmpty && errorOccurrence != announcedOccurrence) else { return }
         announcedErrors = current
+        announcedOccurrence = errorOccurrence
         // Replace the whole pending error queue when the displayed set changes.
         // Otherwise interrupting an old utterance could silently drop another
         // still-visible error that was queued but never heard.
@@ -43,6 +60,33 @@ final class ConversationViewModel {
     }
 
     func resetErrorAnnouncements() { announcedErrors = [] }
+
+    func receiveSpeechCaptureEvent(_ event: SpeechCaptureEvent) {
+        switch event {
+        case .started(let id):
+            activeSpeechCapture = id
+            speechErrorMessage = nil
+            // Capture is admitted only after playback drains. Removing its old
+            // recognition error must not replay completed errors and cancel this
+            // new capture. Do not mark any newly arrived error as announced.
+            announcedErrors.formIntersection(Set(displayedErrors))
+        case .partial: break
+        case .failed(let id, let message):
+            guard activeSpeechCapture == id else { return }
+            activeSpeechCapture = nil
+            recordSpeechFailure(message)
+        }
+    }
+
+    func finalizeSpeechCapture(_ id: SpeechCaptureID) {
+        if activeSpeechCapture == id { activeSpeechCapture = nil }
+    }
+
+    func recordSpeechFailure(_ message: String) {
+        activeSpeechCapture = nil
+        speechErrorMessage = message
+        errorOccurrence &+= 1
+    }
 
     init(submit: @escaping (String) async -> OperatorSubmission = { _ in .rejected("Rover is starting. Try again.") },
          stop: @escaping () async -> OperatorSubmission = { .accepted },
@@ -219,4 +263,15 @@ final class ConversationRuntimeLifetime {
     private(set) var speechEpoch: UInt64 = 0
     func invalidateSpeechCapture() { speechEpoch &+= 1 }
     func acceptsSpeechCapture(from epoch: UInt64) -> Bool { speechEpoch == epoch }
+
+    func beginSpeechCapture(playbackActive: Bool) -> UInt64? {
+        guard !playbackActive else { return nil }
+        invalidateSpeechCapture()
+        return speechEpoch
+    }
+
+    func prepareForSpeechPlayback(stopCapture: () -> Void) {
+        invalidateSpeechCapture()
+        stopCapture()
+    }
 }

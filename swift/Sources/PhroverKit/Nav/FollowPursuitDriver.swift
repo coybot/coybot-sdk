@@ -60,6 +60,17 @@ final class FollowPursuitDriver {
         init(revision: UInt64, goal: Vec2, source: NavigationPoseSample, started: Double) {
             self.revision = revision; self.goal = goal; self.source = source; self.started = started
         }
+
+        func stillBlocksStart(at current: NavigationPoseSample) -> Bool {
+            guard result?.rejection == .startBlocked, let map = result?.map,
+                  let generation = source.frameID?.generation,
+                  current.frameID?.generation == generation,
+                  let capturedPose = source.pose, let currentPose = current.pose else { return false }
+            let capturedCell = map.worldToCell(capturedPose.position)
+            let currentCell = map.worldToCell(currentPose.position)
+            return capturedCell.cx == currentCell.cx && capturedCell.cy == currentCell.cy &&
+                map.isBlocked(currentCell.cx, currentCell.cy)
+        }
     }
 
     private let environment: Environment
@@ -236,19 +247,23 @@ final class FollowPursuitDriver {
                 guard tick >= job.started, tick < job.started + Self.planningTimeout else { return .failed(.noPath) }
                 if job.completed {
                     self.job = nil
-                    if job.revision == revision {
-                        if let rejected = job.result?.rejection {
-                            switch rejected {
-                            case .startBlocked: failureCause = .pursuitStartBlocked
-                            case .goalBlocked: failureCause = .pursuitGoalBlocked
-                            case .noConnectedPath: failureCause = .pursuitDisconnectedPath
-                            case .startOutsideMap, .goalOutsideMap: failureCause = .pursuitOutsideMap
-                            }
-                            var fields = (job.result?.diagnostics ?? [:]).mapValues { FollowDiagnosticValue.string($0) }
-                            fields["planning_rejection"] = .string(rejected.rawValue)
-                            environment.emit("planning_rejected", fields)
-                            return .failed(.noPath)
+                    // A moving target invalidates a route or goal rejection, but
+                    // cannot clear the unchanged starting cell before any send.
+                    if let rejected = job.result?.rejection,
+                       job.revision == revision || (!sent && job.stillBlocksStart(at: source)) {
+                        switch rejected {
+                        case .startBlocked: failureCause = .pursuitStartBlocked
+                        case .goalBlocked: failureCause = .pursuitGoalBlocked
+                        case .noConnectedPath: failureCause = .pursuitDisconnectedPath
+                        case .startOutsideMap, .goalOutsideMap: failureCause = .pursuitOutsideMap
                         }
+                        var fields = (job.result?.diagnostics ?? [:]).mapValues { FollowDiagnosticValue.string($0) }
+                        fields["planning_rejection"] = .string(rejected.rawValue)
+                        fields["planning_goal_superseded"] = .bool(job.revision != revision)
+                        environment.emit("planning_rejected", fields)
+                        return .failed(.noPath)
+                    }
+                    if job.revision == revision {
                         guard job.source.frameID?.generation == generation,
                               let result = job.result, !result.path.isEmpty,
                               result.path.allSatisfy({ $0.x.isFinite && $0.y.isFinite }),

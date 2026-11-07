@@ -5,6 +5,64 @@ import simd
 
 @MainActor
 final class FollowPursuitDriverTests: XCTestCase {
+    func testMovingTargetCannotDiscardBlockedStartAtUnchangedRoverCell() async {
+        let f = Fixture()
+        var map = Costmap(width: 40, height: 40, resolution: 0.1, origin: Vec2(-1, -1))
+        let start = map.worldToCell(.zero)
+        map.setCost(start.cx, start.cy, Costmap.lethal)
+        let blockedMap = map
+        f.planProvider = { _, goal in
+            // Recorded run: every 120–133 ms result lost its goal revision,
+            // although the rover remained in the same blocked start cell.
+            f.time += 0.13
+            _ = f.driver.updateGoal(Vec2(goal.x + 0.1, goal.y))
+            return .init(path: [], map: blockedMap, rejection: .startBlocked,
+                diagnostics: ["raw_start_cost": "255", "local_floor_rejection": "inconsistent_surface"])
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .failed(.noPath))
+        XCTAssertEqual(f.driver.failureCause, .pursuitStartBlocked)
+        XCTAssertEqual(f.plannedGoals.count, 1, "A goal update cannot change the unchanged starting cell")
+        XCTAssertTrue(f.events.contains("planning_rejected"))
+        XCTAssertTrue(f.commands.isEmpty)
+    }
+
+    func testSupersededGoalBlockCannotRejectNewGoal() async {
+        let f = Fixture()
+        f.planProvider = { _, goal in
+            if f.plannedGoals.count == 1 {
+                _ = f.driver.updateGoal(Vec2(4, 0))
+                return .init(path: [], rejection: .goalBlocked)
+            }
+            return .init(path: [goal])
+        }
+        f.onSend = { _ in f.position = Vec2(4, 0) }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertNil(f.driver.failureCause)
+        XCTAssertEqual(f.commands.count, 1)
+    }
+
+    func testSupersededStartBlockCannotRejectRoverInDifferentCell() async {
+        let f = Fixture()
+        var map = Costmap(width: 80, height: 80, resolution: 0.1, origin: Vec2(-1, -1))
+        let start = map.worldToCell(.zero)
+        map.setCost(start.cx, start.cy, Costmap.lethal)
+        let blockedMap = map
+        f.planProvider = { _, goal in
+            if f.plannedGoals.count == 1 {
+                f.position = Vec2(0.3, 0)
+                _ = f.driver.updateGoal(Vec2(4, 0))
+                return .init(path: [], map: blockedMap, rejection: .startBlocked)
+            }
+            return .init(path: [goal])
+        }
+        f.onSend = { _ in f.position = Vec2(4, 0) }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertNil(f.driver.failureCause)
+    }
+
     func testBlockedPlanningFailureReachesControllerWithoutSendingMotion() async {
         let f = ControllerFixture()
         f.planningFailure = .startBlocked

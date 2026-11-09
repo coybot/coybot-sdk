@@ -2,18 +2,32 @@ import Foundation
 import RoverNav
 
 struct FollowPursuitPlan: Sendable {
+    static let joinMargin = 0.02
     let path: [Vec2]
     var map: Costmap? = nil
     var rejection: PathPlanningFailure? = nil
     var diagnostics: [String: String] = [:]
+    var endpointTolerance: Double { max(map?.resolution ?? 0, 1e-6) }
 
     func joined(from position: Vec2) -> Self? {
         guard let map else { return self }
         guard let closest = path.indices.min(by: { path[$0].distance(to: position) < path[$1].distance(to: position) }) else { return nil }
-        for index in closest..<path.count where map.isSegmentClear(from: position, to: path[index], margin: 0.02) {
+        for index in closest..<path.count where map.isSegmentClear(from: position, to: path[index], margin: Self.joinMargin) {
             return .init(path: Array(path[index...]), map: map)
         }
         return nil
+    }
+
+    /// Replace only the final leg using the same captured collision map. This
+    /// creates a plan for the latest goal; it does not authorize the old goal.
+    func retargeted(to goal: Vec2, from capturedStart: Vec2) -> Self? {
+        guard rejection == nil, let map, !path.isEmpty,
+              goal.x.isFinite, goal.y.isFinite,
+              path.allSatisfy({ $0.x.isFinite && $0.y.isFinite }) else { return nil }
+        let prefix = path.dropLast()
+        let anchor = prefix.last ?? capturedStart
+        guard map.isSegmentClear(from: anchor, to: goal, margin: Self.joinMargin) else { return nil }
+        return .init(path: Array(prefix) + [goal], map: map)
     }
 }
 
@@ -71,6 +85,18 @@ final class FollowPursuitDriver {
             return capturedCell.cx == currentCell.cx && capturedCell.cy == currentCell.cy &&
                 map.isBlocked(currentCell.cx, currentCell.cy)
         }
+
+        func retargeted(to goal: Vec2, revision: UInt64, current: NavigationPoseSample) -> Job? {
+            guard let generation = source.frameID?.generation,
+                  current.frameID?.generation == generation, let capturedPose = source.pose,
+                  let result, result.rejection == nil, let endpoint = result.path.last,
+                  endpoint.distance(to: self.goal) <= result.endpointTolerance,
+                  let updated = result.retargeted(to: goal, from: capturedPose.position) else { return nil }
+            let job = Job(revision: revision, goal: goal, source: source, started: started)
+            job.result = updated
+            job.completed = true
+            return job
+        }
     }
 
     private let environment: Environment
@@ -123,6 +149,7 @@ final class FollowPursuitDriver {
     static let planningTimeout = 1.0
     static let initialAdmissionTimeout = 2.0
     static let depthRefreshLimit = 0.6
+    static let maximumUnmappedPoseShift = 0.02
     // Cold-start reserve only; transport still enforces exact expiry. Observed
     // evaluation/send durations raise this budget instead of assuming 100 ms.
     static let minimumFreshnessMargin = 0.02
@@ -170,6 +197,8 @@ final class FollowPursuitDriver {
         let generation = initial.frameID?.generation
         var route: FollowPursuitPlan?
         var routeRevision: UInt64?
+        var routeSource: NavigationPoseSample?
+        var routePlanStartedAt: Double?
         var routeGoal = goal
         var lastPlan = began
         var sent = false
@@ -191,6 +220,22 @@ final class FollowPursuitDriver {
         var refreshCaptureCount = 0
         var refreshFirstCapture: Double?
         var refreshLastCapture: Double?
+
+        func recordAcceptance(_ reason: String, job: Job?, source: NavigationPoseSample, at time: Double,
+                              event: String = "plan_acceptance_rejected", includeGeometry: Bool = true) {
+            let capturedPlan: FollowPursuitPlan?
+            if let job { capturedPlan = job.result } else { capturedPlan = route }
+            let capture = FollowPursuitPlanDiagnostics(plan: capturedPlan,
+                capturedSource: job?.source ?? routeSource, currentSource: source,
+                capturedGoal: job?.goal ?? (route == nil ? nil : routeGoal), latestGoal: goal,
+                expectedGeneration: generation, capturedRevision: job?.revision ?? routeRevision,
+                latestRevision: revision, planStartedAt: job?.started ?? routePlanStartedAt,
+                evaluatedAt: time, startupDeadline: began + Self.initialAdmissionTimeout, sent: sent)
+            var fields = capture.fields(reason: reason, includeGeometry: includeGeometry)
+            // Keep the existing revision field for planning_superseded consumers.
+            fields["revision"] = job.map { .number(Double($0.revision)) } ?? .null
+            environment.emit(event, fields)
+        }
 
         func resetHealthyDelivery() {
             healthySince = nil; lastHealthySend = nil; lastHealthyCapture = nil; healthySends = 0
@@ -232,9 +277,15 @@ final class FollowPursuitDriver {
             let tick = environment.uptime()
             guard tick.isFinite, tick >= began else { return .failed(.trackingLost) }
             let source = environment.pose()
-            guard source.rejection(at: tick, expectedGeneration: generation) == nil,
-                  let pose = source.pose else { return .failed(.trackingLost) }
-            if !sent, tick >= began + Self.initialAdmissionTimeout { return .failed(.noPath) }
+            let sourceRejection = source.rejection(at: tick, expectedGeneration: generation)
+            guard sourceRejection == nil, let pose = source.pose else {
+                recordAcceptance("source_" + (sourceRejection ?? "missing_pose"), job: job, source: source, at: tick)
+                return .failed(.trackingLost)
+            }
+            if !sent, tick >= began + Self.initialAdmissionTimeout {
+                recordAcceptance("startup_timeout", job: job, source: source, at: tick)
+                return .failed(.noPath)
+            }
             if let refreshDeadline, tick >= refreshDeadline { return .failed(.depthUnavailable(refreshReason)) }
             if let boundary = refreshAfter {
                 guard let timestamp = source.sourceTimestamp, timestamp > boundary.time,
@@ -244,7 +295,10 @@ final class FollowPursuitDriver {
                 }
             }
             if let job {
-                guard tick >= job.started, tick < job.started + Self.planningTimeout else { return .failed(.noPath) }
+                guard tick >= job.started, tick < job.started + Self.planningTimeout else {
+                    recordAcceptance(tick < job.started ? "planning_clock_regressed" : "planning_timeout", job: job, source: source, at: tick)
+                    return .failed(.noPath)
+                }
                 if job.completed {
                     self.job = nil
                     // A moving target invalidates a route or goal rejection, but
@@ -261,23 +315,54 @@ final class FollowPursuitDriver {
                         fields["planning_rejection"] = .string(rejected.rawValue)
                         fields["planning_goal_superseded"] = .bool(job.revision != revision)
                         environment.emit("planning_rejected", fields)
+                        recordAcceptance("planner_" + rejected.rawValue, job: job, source: source, at: tick)
                         return .failed(.noPath)
                     }
+                    var candidate = job
+                    if !sent, job.revision != revision,
+                       let updated = job.retargeted(to: goal, revision: revision, current: source) {
+                        recordAcceptance("latest_goal_tail_verified", job: job, source: source, at: tick,
+                            event: "planning_retargeted", includeGeometry: false)
+                        candidate = updated
+                    }
+                    let job = candidate
                     if job.revision == revision {
-                        guard job.source.frameID?.generation == generation,
-                              let result = job.result, !result.path.isEmpty,
-                              result.path.allSatisfy({ $0.x.isFinite && $0.y.isFinite }),
-                              result.path.last!.distance(to: job.goal) <= max(result.map?.resolution ?? 0, 1e-6) else { return .failed(.noPath) }
-                        guard let joined = result.joined(from: pose.position) else { return .failed(.noPath) }
-                        if result.map == nil, let origin = job.source.pose, origin.position.distance(to: pose.position) > 0.02 {
+                        guard job.source.frameID?.generation == generation else {
+                            recordAcceptance("captured_generation_mismatch", job: job, source: source, at: tick)
+                            return .failed(.noPath)
+                        }
+                        guard let result = job.result else {
+                            recordAcceptance("planner_returned_nil", job: job, source: source, at: tick)
+                            return .failed(.noPath)
+                        }
+                        guard !result.path.isEmpty else {
+                            recordAcceptance("empty_path", job: job, source: source, at: tick)
+                            return .failed(.noPath)
+                        }
+                        guard result.path.allSatisfy({ $0.x.isFinite && $0.y.isFinite }) else {
+                            recordAcceptance("nonfinite_waypoint", job: job, source: source, at: tick)
+                            return .failed(.noPath)
+                        }
+                        guard result.path.last!.distance(to: job.goal) <= result.endpointTolerance else {
+                            recordAcceptance("endpoint_mismatch", job: job, source: source, at: tick)
+                            return .failed(.noPath)
+                        }
+                        guard let joined = result.joined(from: pose.position) else {
+                            recordAcceptance("path_join_blocked", job: job, source: source, at: tick)
+                            return .failed(.noPath)
+                        }
+                        if result.map == nil, let origin = job.source.pose, origin.position.distance(to: pose.position) > Self.maximumUnmappedPoseShift {
+                            recordAcceptance("unmapped_pose_shift", job: job, source: source, at: tick)
                             return .failed(.trackingLost)
                         }
                         route = joined; routeRevision = job.revision; routeGoal = job.goal; lastPlan = tick
+                        routeSource = job.source; routePlanStartedAt = job.started
                         environment.publishPath(joined.path)
                         environment.emit("planning_completed", ["elapsed_s": .number(tick - job.started),
                             "revision": .number(Double(job.revision))])
                     } else {
-                        environment.emit("planning_superseded", ["revision": .number(Double(job.revision))])
+                        recordAcceptance("goal_revision_superseded", job: job, source: source, at: tick,
+                            event: "planning_superseded", includeGeometry: false)
                     }
                 }
             }
@@ -293,10 +378,19 @@ final class FollowPursuitDriver {
             let current = environment.pose()
             let time = environment.uptime()
             guard time.isFinite, time >= tick else { return .failed(.trackingLost) }
-            if !sent, time >= began + Self.initialAdmissionTimeout { return .failed(.noPath) }
-            if let job, time >= job.started + Self.planningTimeout { return .failed(.noPath) }
-            guard current.rejection(at: time, expectedGeneration: generation) == nil,
-                  let currentPose = current.pose else { return .failed(.trackingLost) }
+            if !sent, time >= began + Self.initialAdmissionTimeout {
+                recordAcceptance("startup_timeout", job: job, source: current, at: time)
+                return .failed(.noPath)
+            }
+            if let job, time >= job.started + Self.planningTimeout {
+                recordAcceptance("planning_timeout", job: job, source: current, at: time)
+                return .failed(.noPath)
+            }
+            let currentRejection = current.rejection(at: time, expectedGeneration: generation)
+            guard currentRejection == nil, let currentPose = current.pose else {
+                recordAcceptance("source_" + (currentRejection ?? "missing_pose"), job: job, source: current, at: time)
+                return .failed(.trackingLost)
+            }
             switch guardLayer.evaluate(forwardClearance: environment.clearance(), lastAckAt: ack,
                 now: environment.date(), feedback: nil, requireFreshAck: true, checkForwardObstacle: true) {
             case .go: break
@@ -308,7 +402,10 @@ final class FollowPursuitDriver {
                 await environment.sleep(.milliseconds(20)); continue
             }
             if let refreshDeadline, time >= refreshDeadline { return .failed(.depthUnavailable(refreshReason)) }
-            guard let joined = route.joined(from: currentPose.position) else { return .failed(.noPath) }
+            guard let joined = route.joined(from: currentPose.position) else {
+                recordAcceptance("active_route_join_blocked", job: nil, source: current, at: time)
+                return .failed(.noPath)
+            }
             let output = pursuit.step(pose: currentPose, path: joined.path)
             if output.reachedGoal {
                 // A pending new goal must not be discarded by old-goal arrival.
@@ -403,11 +500,17 @@ final class FollowPursuitDriver {
             let finalSource = environment.pose()
             let sendTime = environment.uptime()
             guard sendTime.isFinite, sendTime >= time else { return .failed(.trackingLost) }
-            guard finalSource.rejection(at: sendTime, expectedGeneration: generation) == nil else { return .failed(.trackingLost) }
+            if let rejection = finalSource.rejection(at: sendTime, expectedGeneration: generation) {
+                recordAcceptance("source_" + rejection, job: nil, source: finalSource, at: sendTime)
+                return .failed(.trackingLost)
+            }
             if finalSource.pose != current.pose { await environment.sleep(.milliseconds(20)); continue }
             if !sent, routeRevision != revision { continue }
             if let refreshDeadline, sendTime >= refreshDeadline { return .failed(.depthUnavailable(refreshReason)) }
-            if !sent, sendTime >= began + Self.initialAdmissionTimeout { return .failed(.noPath) }
+            if !sent, sendTime >= began + Self.initialAdmissionTimeout {
+                recordAcceptance("startup_timeout", job: job, source: finalSource, at: sendTime)
+                return .failed(.noPath)
+            }
             if let previousPosition, let previousGoal {
                 approach += previousPosition.distance(to: previousGoal) - currentPose.position.distance(to: previousGoal)
             }

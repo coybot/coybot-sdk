@@ -32,6 +32,7 @@ enum FollowMotionFailureCause: String, Sendable {
     case depthRecoveryExcursion = "depth_recovery_excursion"
     case burstPreSendExpired = "burst_pre_send_expired"
     case calibrationEvidenceIncomplete = "calibration_evidence_incomplete"
+    case turnResponseOppositeDirection = "turn_response_opposite_direction"
     case poseSourceStale = "pose_source_stale"
     case readyTravelLimit = "ready_travel_limit"
     case readyBackwardMotion = "ready_backward_motion"

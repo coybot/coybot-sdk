@@ -77,6 +77,7 @@ final class FollowMotionFake: FollowMeSourceClockMotion {
     var suspendStop = false
     var suspendRotation = false
     var suspendNavigation = false
+    var stopHandler: (() async -> Void)?
     private var stopWaiter: CheckedContinuation<Void, Never>?
     private var rotationWaiter: CheckedContinuation<Void, Never>?
     private var navigationWaiter: CheckedContinuation<Void, Never>?
@@ -96,6 +97,7 @@ final class FollowMotionFake: FollowMeSourceClockMotion {
     func stopAndConfirm() async throws {
         stopOrigins.append(FollowMotionTaskScope.stopOrigin)
         stops += 1
+        await stopHandler?()
         if suspendStop { await withCheckedContinuation { stopWaiter = $0 } }
         if stopError { throw StopError.unconfirmed }
         if let syntheticClock {

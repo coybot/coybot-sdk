@@ -30,12 +30,25 @@ Periodic rebuilding is suppressed during stopped refresh when the existing plan
 already matches the current goal. Goal changes still require a matching plan;
 the original startup and worker deadlines are not extended.
 
-Only the exact current goal revision can commit a plan. Before first movement,
+Only a plan for the exact current goal revision can be committed. Before first movement,
 the source must be healthy/fresh, the path endpoint must match the requested goal,
 and the current pose must connect to the captured map's path. The control loop
 rechecks pose, central clearance, communications and depth after acknowledgement
 reads. Transport admission checks the owner, target revision, pose and depth again;
 the original depth/pose/acknowledgement expiry is not renewed in the sender queue.
+
+If a target update supersedes a completed startup plan, pursuit can construct a
+latest-goal candidate by replacing only its final leg. This requires a captured
+map, matching AR generation, a finite original path ending within tolerance of
+its original goal, and a clear replacement segment with the same 20 mm join
+margin. The earlier path prefix is preserved. A one-point path instead verifies
+the segment from the captured start. The resulting path ends at the latest goal
+and must still pass current-pose joining, depth, source and sender authorization.
+The planning/startup deadlines retain their original timestamps. A blocked,
+out-of-map or unverifiable replacement is discarded and normal replanning
+continues. This startup-only adaptation never reuses a rejected planner result.
+`follow_pursuit.planning_retargeted` records the original and latest goal/revision
+when this check succeeds; it does not itself authorize a motor command.
 
 Before the first send, a completed `start_blocked` rejection can still terminate
 startup after a goal update if its captured map shows the rover in the same
@@ -150,6 +163,46 @@ later moving command stopped. Expired episode authority still leaves the current
 owner responsible for its cleanup stop.
 
 ## Diagnostics and verification
+
+### Temporary path-acceptance capture
+
+The November 9 trace returned `outcome=planned` repeatedly but failed with
+`noPath` before emitting `planning_completed` or a drive tick. The planner's
+success alone does not identify which pursuit acceptance check rejected it.
+
+`follow_pursuit.plan_acceptance_rejected` now records the actual failing branch
+under `acceptance_reason` (the envelope's `reason` remains separate):
+`planner_returned_nil`, `empty_path`, `nonfinite_waypoint`,
+`captured_generation_mismatch`, `endpoint_mismatch`, `path_join_blocked`,
+`active_route_join_blocked`, `unmapped_pose_shift`, `startup_timeout`,
+`planning_timeout`, `planning_clock_regressed`, `source_<rejection>`, or
+`planner_<typed rejection>`. Superseded results retain the existing
+`follow_pursuit.planning_superseded` event with
+`acceptance_reason=goal_revision_superseded` and summary-only geometry.
+
+These records carry `[DEBUG-pursuit-acceptance]`, capture schema version 1,
+captured/current poses and AR frame IDs, captured/latest goals and revisions,
+planning time/deadlines, endpoint error/tolerance, and the original join margin.
+No extra sensor reads or collision checks are performed for diagnostics, and
+the order and results of acceptance checks are unchanged.
+
+Each terminal rejection captures the existing candidate/committed route, up to
+512 waypoints and 16,384 map cells (the usual 120 × 120 map fits). Waypoints use
+`waypoints_xz`. `map_cells_base64` encodes exact unsigned-byte costs, row-major,
+with dimensions, resolution and origin beside it. Soft inflation costs are
+preserved so segment-clearance failures can be replayed. Oversized geometry is
+omitted with an explicit capture status, never silently truncated. Missing plans
+or maps remain explicitly unavailable. Nonfinite numbers serialize as null with
+an adjacent `*_availability=nonfinite` marker.
+
+To replay a complete capture, decode the grid bytes, restore each cell at
+`(index % width, index / width)`, reconstruct the waypoints and captured/current
+poses, and run the named check with its recorded tolerance. The diagnostics
+tests exercise this through the real `FollowPursuitPlan.joined` implementation.
+No images, raw mesh or depth arrays are captured. Remove this temporary capture
+after a device failure has been reproduced and its fix verified.
+
+### Existing events
 
 - `nav_follow_plan_snapshot`: mesh-copy and worker/delivery durations, vertex count,
   and planning outcome.

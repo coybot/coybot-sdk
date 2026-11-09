@@ -5,6 +5,139 @@ import XCTest
 
 @MainActor
 final class FollowMeCoordinatorTests: XCTestCase {
+    func testRecordedReacquisitionRecoversAcrossStaleDeliveryGapsWhileAlreadyStopped() async {
+        let (coordinator, perception, motion, clock) = sourcedRecoverySetup()
+        await acquireWaiting(coordinator, perception, clock)
+        await matchedBoundaryFrame(4, perception, clock, y: 4.4)
+        XCTAssertEqual(coordinator.state, .following)
+        clock.advance(to: clock.now + 0.1)
+        let lossTime = clock.now
+        perception.send(frame(5, at: lossTime))
+        await drain()
+        XCTAssertEqual(coordinator.state, .reacquiring)
+        var sequence: UInt64 = 6
+        // Keep perception healthy while no person is verified, as in the trace.
+        for offset in stride(from: 0.25, through: 6.75, by: 0.25) {
+            clock.advance(to: lossTime + offset)
+            perception.send(frame(sequence, at: clock.now))
+            sequence += 1
+            await drain()
+        }
+        let goalsBeforeRecovery = motion.goals.count
+        motion.stopHandler = {
+            // The device's confirmed-stop handoff also spends time awaiting
+            // transport/actor delivery; a 400 ms old detection can age out here.
+            clock.advance(to: clock.now + 0.35)
+            await Task.yield()
+        }
+        // Nov 9: reacquisition at ~7 s, observations arrive 392–425 ms
+        // after capture, then age beyond 500 ms before the next delivery.
+        for (offset, age) in [(7.0, 0.424), (7.4, 0.392), (7.85, 0.425),
+                              (8.25, 0.405), (8.7, 0.424), (9.1, 0.392), (9.55, 0.405)] {
+            clock.advance(to: max(clock.now, lossTime + offset))
+            await drain() // Let the real freshness watchdog run before delivery.
+            XCTAssertEqual(motion.goals.count, goalsBeforeRecovery, "An aged observation must not authorize movement")
+            let capturedAt = clock.now - age
+            perception.send(frame(sequence, at: capturedAt, pose: Pose2D(position: .zero, yaw: .pi / 2),
+                people: [person(sequence, at: capturedAt, y: 4.4)]))
+            sequence += 1
+            await drain()
+            if coordinator.state == .following { break }
+        }
+        if coordinator.state != .following {
+            clock.advance(to: max(clock.now, lossTime + 10.05))
+            await drain()
+        }
+        XCTAssertEqual(coordinator.state, .following,
+            "Fresh matching post-stop captures must restore following before the original ten-second deadline")
+        XCTAssertGreaterThan(motion.goals.count, goalsBeforeRecovery)
+        let stopsAfterRestoration = motion.stops
+        motion.stopHandler = nil
+        clock.advance(to: clock.now + 0.501)
+        await drain()
+        XCTAssertGreaterThan(motion.stops, stopsAfterRestoration,
+            "After motion resumes, stale perception must create a new stop obligation")
+        _ = await coordinator.stop()
+    }
+
+    func testStationaryReacquisitionStillStopsOnStructuralPerceptionFaults() async {
+        for fault in ["depth", "tracking", "pose"] {
+            let (coordinator, perception, motion, clock) = sourcedRecoverySetup()
+            await acquireWaiting(coordinator, perception, clock)
+            await matchedBoundaryFrame(4, perception, clock, y: 4.4)
+            perception.send(frame(5, at: clock.now))
+            await drain()
+            clock.advance(to: clock.now + 0.1)
+            perception.send(frame(6, at: clock.now, pose: Pose2D(position: .zero, yaw: .pi / 2),
+                people: [person(6, at: clock.now, y: 4.4)]))
+            await drain()
+            XCTAssertEqual(coordinator.state, .reacquiring)
+            let stops = motion.stops
+            let goals = motion.goals.count
+            clock.advance(to: clock.now + 0.1)
+            perception.send(frame(7, at: clock.now,
+                pose: fault == "pose" ? nil : Pose2D(position: .zero, yaw: .pi / 2),
+                depth: fault != "depth", quality: fault == "tracking" ? .limited : .normal))
+            await drain()
+            XCTAssertGreaterThan(motion.stops, stops, fault)
+            XCTAssertEqual(motion.goals.count, goals)
+            _ = await coordinator.stop()
+        }
+    }
+
+    func testStationaryReacquisitionKeepsFixedPerceptionOutageDeadline() async {
+        let (coordinator, perception, motion, clock) = sourcedRecoverySetup()
+        await acquireWaiting(coordinator, perception, clock)
+        await matchedBoundaryFrame(4, perception, clock, y: 4.4)
+        perception.send(frame(5, at: clock.now))
+        await drain()
+        clock.advance(to: clock.now + 0.1)
+        perception.send(frame(6, at: clock.now, pose: Pose2D(position: .zero, yaw: .pi / 2),
+            people: [person(6, at: clock.now, y: 4.4)]))
+        await drain()
+        let stops = motion.stops
+        let goals = motion.goals.count
+        clock.advance(to: clock.now + 0.501)
+        await drain()
+        XCTAssertEqual(motion.stops, stops, "An already-confirmed stationary recovery needs no duplicate stop for age alone")
+        let outageStarted = clock.now
+        clock.advance(to: outageStarted + 2, wakeSleepers: false)
+        perception.send(frame(7, at: clock.now, pose: Pose2D(position: .zero, yaw: .pi / 2),
+            people: [person(7, at: clock.now, y: 4.4)]))
+        await drain()
+        XCTAssertEqual(coordinator.state, .failed(FollowPerceptionIssue.staleFrame.message),
+            "A late healthy frame cannot renew the original outage deadline")
+        XCTAssertEqual(motion.goals.count, goals)
+        _ = await coordinator.stop()
+    }
+
+    func testStructuralFaultAfterStationaryAgeWaitCannotBeHiddenByHealthyFrame() async {
+        for fault in ["depth", "tracking", "pose"] {
+            let (coordinator, perception, motion, clock) = sourcedRecoverySetup()
+            await acquireWaiting(coordinator, perception, clock)
+            await matchedBoundaryFrame(4, perception, clock, y: 4.4)
+            perception.send(frame(5, at: clock.now))
+            await drain()
+            clock.advance(to: clock.now + 0.1)
+            perception.send(frame(6, at: clock.now, pose: Pose2D(position: .zero, yaw: .pi / 2),
+                people: [person(6, at: clock.now, y: 4.4)]))
+            await drain()
+            clock.advance(to: clock.now + 0.501)
+            await drain()
+            let stops = motion.stops
+            let goals = motion.goals.count
+            perception.send(frame(7, at: clock.now,
+                pose: fault == "pose" ? nil : Pose2D(position: .zero, yaw: .pi / 2),
+                depth: fault != "depth", quality: fault == "tracking" ? .limited : .normal))
+            perception.send(frame(8, at: clock.now, pose: Pose2D(position: .zero, yaw: .pi / 2),
+                people: [person(8, at: clock.now, y: 4.4)]))
+            await drain()
+            XCTAssertGreaterThan(motion.stops, stops, "The latched \(fault) fault must request a stop even during age-only waiting")
+            XCTAssertEqual(motion.goals.count, goals, "The queued healthy frame predates this new stop")
+            _ = await coordinator.stop()
+        }
+    }
+
     func testAlignmentCannotCommitHealthyHandoffPastPendingTrackingLoss() async {
         let perception = FollowPerceptionFake()
         let motion = ContextualFollowMotionFake()

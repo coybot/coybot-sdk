@@ -2,6 +2,18 @@ import XCTest
 @testable import PhroverKit
 
 final class FollowMotionFailureResolutionTests: XCTestCase {
+    func testWrongDirectionHasActionableMessageAndFailedStopStillWins() {
+        let context = FollowMotionOperationContext(request: nil, controllerOperationID: 1,
+            purpose: .followScan, profile: nil, failureCause: .turnResponseOppositeDirection)
+        var resolution = FollowMotionFailureResolution(.init(context: context, reason: .rotationResolutionInsufficient,
+            stopOutcome: .pending, source: .stream))
+        XCTAssertTrue(resolution.message.contains("opposite the requested direction"))
+        XCTAssertTrue(resolution.message.contains("Confirming motor stop"))
+        resolution.consume(.init(context: context, reason: .rotationResolutionInsufficient, stopOutcome: .confirmed, source: .result))
+        XCTAssertTrue(resolution.message.contains("Check turn calibration"))
+        resolution.consume(.init(context: context, reason: .commandFailed, stopOutcome: .failed, source: .confirmation))
+        XCTAssertEqual(resolution.message, "Motor stop could not be confirmed. Motion is blocked.")
+    }
     func testCommunicationLossOnlyClaimsStoppedAfterConfirmation() {
         for outcome in [FollowMotionStopOutcome.unknown, .pending, .confirmed, .failed] {
             let resolution = FollowMotionFailureResolution(.init(context: .unknown, reason: .commsLost,

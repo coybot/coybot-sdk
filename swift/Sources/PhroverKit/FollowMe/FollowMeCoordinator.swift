@@ -135,6 +135,7 @@ public final class FollowMeCoordinator {
     }
     private var recoveryStopBoundary: RecoveryStopBoundary?
     private var poseDeadline: TimeInterval?
+    private var perceptionStopRequested = false
     private var scanRotation: Double = 0
     private var scanAttempts = 0
     private var scanInterruptions = 0
@@ -244,6 +245,7 @@ public final class FollowMeCoordinator {
         recoveryHasProvisionalLock = false
         recoveryStopBoundary = nil
         poseDeadline = nil
+        perceptionStopRequested = false
         perceptionReady = false
         scanRotation = 0
         scanAttempts = 0
@@ -613,7 +615,8 @@ public final class FollowMeCoordinator {
             // Once an outage has already fenced motion and requested its stop,
             // intermediate bad frames are superseded by the newest recovery
             // observation. A new fault after recovery begins is latched again.
-            if poseDeadline == nil, FollowFrameHealth.safetyTransitionPriority(batch) > 0, frameIssue(batch, now: receivedAt) != nil,
+            if poseDeadline == nil || !perceptionStopRequested,
+               FollowFrameHealth.safetyTransitionPriority(batch) > 0, frameIssue(batch, now: receivedAt) != nil,
                pendingHealthFrame == nil || FollowFrameHealth.safetyTransitionPriority(batch) > FollowFrameHealth.safetyTransitionPriority(pendingHealthFrame!) {
                 pendingHealthFrame = batch
             }
@@ -717,6 +720,7 @@ public final class FollowMeCoordinator {
             return
         }
         poseDeadline = nil
+        perceptionStopRequested = false
         poseTask?.cancel()
         poseTask = nil
         // Alignment owns its pre/post-stop waits. Keep healthy frame association
@@ -937,7 +941,13 @@ public final class FollowMeCoordinator {
                             _ = await restoreRecovery(selected, phase: .waitingForMovement)
                         }
                     } else if !departurePending, recoveryFrameEligible(selected, batch: batch) {
-                        await follow(selected, rover: batch.pose!.position, generation: token)
+                        if let fence = stationaryRecoveryFence {
+                            guard matchedFrameClearsNewestStop(batch) else { return }
+                            await follow(selected, rover: batch.pose!.position, generation: token,
+                                confirmedStop: fence.identity)
+                        } else {
+                            await follow(selected, rover: batch.pose!.position, generation: token)
+                        }
                     }
                 } else {
                     recoveryStopBoundary = nil
@@ -2070,6 +2080,19 @@ public final class FollowMeCoordinator {
         return activeReadyAdmission?.isRefreshingRecovery(at: clock.now) == true
     }
 
+    /// A detection stop has drained motion and no new command has been launched.
+    /// Frame age alone cannot create another physical stop obligation here.
+    private var stationaryRecoveryFence: FollowTurnStopFence? {
+        guard state == .reacquiring, recoveryStopBoundary != nil,
+              !scanning, movementTask == nil, alignmentTask == nil,
+              !stopBlocked, stopTask == nil, confirmationTask == nil,
+              let fence = newestStopFence, let episode = recoveryEpisode,
+              let uptime = (motion as? any FollowMeSourceClockMotion)?.sourceUptime,
+              uptime.isFinite, fence.acknowledgementUptime.isFinite, uptime >= fence.acknowledgementUptime,
+              fence.sourceGeneration == episode.anchor?.frameID.generation else { return nil }
+        return fence
+    }
+
     private func perceptionUnavailable(_ issue: FollowPerceptionIssue, generation token: UInt64) async {
         guard generation == token else { return }
         if state == .signalingReady, issue == .staleFrame {
@@ -2087,20 +2110,29 @@ public final class FollowMeCoordinator {
         }
         searchClearance?.revoke()
         updatePerceptionIssue(issue)
-        // The deadline also marks an outage whose stop has already been requested.
-        // Subsequent unhealthy frames update diagnostics without stopping again.
-        guard poseDeadline == nil else { return }
-        cancelAlignment()
-        if state == .signalingReady { state = .aligning }
-        let deadline = clock.now + config.perceptionRecoverySeconds
-        poseDeadline = deadline
-        poseTask?.cancel()
-        poseTask = Task { [weak self, clock] in
-            await clock.sleep(seconds: max(0, deadline - clock.now))
-            guard !Task.isCancelled, let self, self.generation == token, self.poseDeadline == deadline,
-                  self.clock.now >= deadline else { return }
-            _ = await self.finish(.failed(self.perceptionFailureMessage))
+        // An age-only stationary wait owns a deadline but has not requested
+        // another stop. Keep those facts separate so a structural fault can
+        // still escalate without renewing the existing outage window.
+        if poseDeadline == nil {
+            cancelAlignment()
+            if state == .signalingReady { state = .aligning }
+            let deadline = clock.now + config.perceptionRecoverySeconds
+            poseDeadline = deadline
+            perceptionStopRequested = false
+            poseTask?.cancel()
+            poseTask = Task { [weak self, clock] in
+                await clock.sleep(seconds: max(0, deadline - clock.now))
+                guard !Task.isCancelled, let self, self.generation == token, self.poseDeadline == deadline,
+                       self.clock.now >= deadline else { return }
+                _ = await self.finish(.failed(self.perceptionFailureMessage))
+            }
         }
+        guard !perceptionStopRequested, let deadline = poseDeadline else { return }
+        // Preserve both the outage deadline and the existing acknowledged stop
+        // fence while waiting for fresh post-stop continuity. Re-stopping here
+        // would move the fence past each delayed observation indefinitely.
+        if issue == .staleFrame, stationaryRecoveryFence != nil { return }
+        perceptionStopRequested = true
         // Enforce recovery independently of the duration of motor acknowledgement.
         guard await confirmStop(generation: token) else { return }
         guard generation == token, poseDeadline == deadline,

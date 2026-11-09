@@ -5,6 +5,166 @@ import simd
 
 @MainActor
 final class FollowPursuitDriverTests: XCTestCase {
+    func testMovingGoalDuringEveryPlanCanStartUsingVerifiedLatestGoalTail() async {
+        let f = Fixture()
+        let map = Costmap(width: 80, height: 80, resolution: 0.1, origin: Vec2(-1, -1))
+        f.planProvider = { start, goal in
+            f.time += 0.4 // Device worker latency overlaps a new target update.
+            _ = f.driver.updateGoal(goal + Vec2(0.12, 0))
+            return .init(path: [start, goal], map: map)
+        }
+        f.onSend = { _ in
+            XCTAssertEqual(f.paths.last?.last, f.driver.goal, "Never send toward the superseded goal")
+            XCTAssertLessThan(f.time, 12, "Keep the original startup deadline")
+            f.position = f.driver.goal
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertEqual(f.commands.count, 1)
+        XCTAssertEqual(f.plannedGoals.count, 1)
+    }
+
+    func testStartupRetargetCannotCrossObstacleOrExtendAdmissionDeadline() async {
+        let f = Fixture()
+        f.planProvider = { start, goal in
+            var map = Costmap(width: 80, height: 80, resolution: 0.1, origin: Vec2(-1, -1))
+            let updatedGoal = goal + Vec2(0.12, 0)
+            let blocked = map.worldToCell(updatedGoal)
+            map.setCost(blocked.cx, blocked.cy, Costmap.lethal)
+            f.time += 0.4
+            _ = f.driver.updateGoal(updatedGoal)
+            return .init(path: [start, goal], map: map)
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .failed(.noPath))
+        XCTAssertTrue(f.commands.isEmpty)
+        XCTAssertTrue(f.paths.isEmpty)
+        XCTAssertLessThan(f.time, 12.5)
+        XCTAssertFalse(f.events.contains("planning_retargeted"))
+    }
+
+    func testRetargetPreservesDetourAndRejectsUnverifiedNewTail() {
+        var map = Costmap(width: 80, height: 80, resolution: 0.1, origin: Vec2(-1, -1))
+        let original = [Vec2.zero, Vec2(0, 1), Vec2(5, 1), Vec2(5, 0)]
+        let goal = Vec2(4.8, 0)
+        let plan = FollowPursuitPlan(path: original, map: map)
+        XCTAssertEqual(plan.retargeted(to: goal, from: .zero)?.path, Array(original.dropLast()) + [goal])
+        let obstacle = map.worldToCell(Vec2(4.9, 0.5))
+        map.setCost(obstacle.cx, obstacle.cy, 1)
+        XCTAssertNil(FollowPursuitPlan(path: original, map: map).retargeted(to: goal, from: .zero),
+            "Soft inflation still blocks a newly verified segment")
+        XCTAssertNil(FollowPursuitPlan(path: original).retargeted(to: goal, from: .zero))
+        XCTAssertNil(plan.retargeted(to: Vec2(100, 0), from: .zero))
+        XCTAssertNil(plan.retargeted(to: Vec2(.nan, 0), from: .zero))
+    }
+
+    func testNewGoalDuringAdmissionCannotSendPreviouslyRetargetedRoute() async {
+        let f = Fixture()
+        let map = Costmap(width: 80, height: 80, resolution: 0.1, origin: Vec2(-1, -1))
+        f.planProvider = { start, goal in
+            _ = f.driver.updateGoal(goal + Vec2(0.12, 0))
+            return .init(path: [start, goal], map: map)
+        }
+        var changedDuringAdmission = false
+        f.acknowledgement = {
+            if !f.paths.isEmpty, !changedDuringAdmission {
+                changedDuringAdmission = true
+                _ = f.driver.updateGoal(Vec2(4, 0))
+            }
+            return Date(timeIntervalSince1970: f.time)
+        }
+        f.onSend = { _ in
+            XCTAssertTrue(changedDuringAdmission)
+            XCTAssertEqual(f.paths.last?.last, f.driver.goal)
+            XCTAssertEqual(f.driver.goal, Vec2(4.12, 0))
+            f.position = f.driver.goal
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertEqual(f.commands.count, 1)
+    }
+
+    func testAcceptanceDiagnosticsIdentifyActualRejectingGuardWithoutSending() async throws {
+        for reason in ["planner_returned_nil", "empty_path", "nonfinite_waypoint", "endpoint_mismatch", "path_join_blocked", "unmapped_pose_shift"] {
+            let f = Fixture()
+            f.planProvider = { _, goal in
+                switch reason {
+                case "planner_returned_nil": return nil
+                case "empty_path": return .init(path: [])
+                case "nonfinite_waypoint": return .init(path: [Vec2(.nan, 0), goal])
+                case "endpoint_mismatch": return .init(path: [goal + Vec2(0.2, 0)])
+                case "path_join_blocked":
+                    var map = Costmap(width: 80, height: 80, resolution: 0.1, origin: Vec2(-1, -1))
+                    map.setCost(15, 10, 1) // Preserve even soft-cost cells needed to replay segment checks.
+                    return .init(path: [goal], map: map)
+                default:
+                    f.position = Vec2(0.03, 0)
+                    return .init(path: [goal])
+                }
+            }
+            let result = await f.driver.run()
+            XCTAssertEqual(result, reason == "unmapped_pose_shift" ? .failed(.trackingLost) : .failed(.noPath))
+            XCTAssertTrue(f.commands.isEmpty)
+            let records = f.records.filter { $0.0 == "plan_acceptance_rejected" }
+            XCTAssertEqual(records.count, 1)
+            let fields = try XCTUnwrap(records.first?.1)
+            XCTAssertEqual(fields["acceptance_reason"], .string(reason))
+            XCTAssertEqual(fields["captured_goal_xz"], .object(["x": .number(5), "z": .number(0)]))
+            XCTAssertEqual(fields["has_sent_motion"], .bool(false))
+            XCTAssertNotNil(fields["captured_source"])
+            XCTAssertNotNil(fields["current_source"])
+        }
+    }
+
+    func testSupersededPlanDiagnosticCapturesBothGoalsWithoutFullGeometry() async throws {
+        let f = Fixture()
+        f.planProvider = { _, goal in
+            if f.plannedGoals.count == 1 { _ = f.driver.updateGoal(Vec2(4, 0)) }
+            return .init(path: [goal])
+        }
+        f.onSend = { _ in f.position = Vec2(4, 0) }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        let fields = try XCTUnwrap(f.records.first { $0.0 == "planning_superseded" }?.1)
+        XCTAssertEqual(fields["acceptance_reason"], .string("goal_revision_superseded"))
+        XCTAssertEqual(fields["captured_revision"], .string("0"))
+        XCTAssertEqual(fields["latest_revision"], .string("1"))
+        XCTAssertEqual(fields["captured_goal_xz"], .object(["x": .number(5), "z": .number(0)]))
+        XCTAssertEqual(fields["latest_goal_xz"], .object(["x": .number(4), "z": .number(0)]))
+        XCTAssertEqual(fields["waypoints_capture_status"], .string("summary_only"))
+        XCTAssertEqual(fields["waypoints_xz"], .null)
+        XCTAssertFalse(f.events.contains("plan_acceptance_rejected"))
+    }
+
+    func testStartupTimeoutDiagnosticDoesNotInventAPlannerRejection() async throws {
+        let f = Fixture()
+        f.planProvider = { _, goal in
+            _ = f.driver.updateGoal(Vec2(goal.x + 0.1, 0))
+            return .init(path: [goal])
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .failed(.noPath))
+        let fields = try XCTUnwrap(f.records.first { $0.0 == "plan_acceptance_rejected" }?.1)
+        XCTAssertEqual(fields["acceptance_reason"], .string("startup_timeout"))
+        XCTAssertTrue(f.commands.isEmpty)
+    }
+
+    func testFinalSourceRejectionIsCapturedBeforeAnySend() async throws {
+        let f = Fixture()
+        f.depthProvider = { _ in
+            f.generation += 1
+            return f.observation(age: 0.01)
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .failed(.trackingLost))
+        XCTAssertTrue(f.commands.isEmpty)
+        let fields = try XCTUnwrap(f.records.first { $0.0 == "plan_acceptance_rejected" }?.1)
+        XCTAssertEqual(fields["acceptance_reason"], .string("source_source_generation_changed"))
+        XCTAssertEqual(fields["expected_ar_generation"], .string("1"))
+        guard case .object(let source)? = fields["current_source"] else { return XCTFail("Missing source") }
+        XCTAssertEqual(source["ar_generation"], .string("2"))
+    }
+
     func testMovingTargetCannotDiscardBlockedStartAtUnchangedRoverCell() async {
         let f = Fixture()
         var map = Costmap(width: 40, height: 40, resolution: 0.1, origin: Vec2(-1, -1))
@@ -1034,6 +1194,7 @@ final class FollowPursuitDriverTests: XCTestCase {
         var plannedGoals: [Vec2] = []
         var paths: [[Vec2]] = []
         var events: [String] = []
+        var records: [(String, [String: FollowDiagnosticValue])] = []
         var stops = 0
         var planProvider: (@MainActor (Vec2, Vec2) async -> FollowPursuitPlan?)?
         var depthProvider: ((WheelCommand) -> DepthSafetyObservation)?
@@ -1072,7 +1233,10 @@ final class FollowPursuitDriverTests: XCTestCase {
             }
             self.sequence += 1
             await Task.yield()
-        }, publishPath: { self.paths.append($0) }, moving: {}, emit: { name, _ in self.events.append(name) },
+        }, publishPath: { self.paths.append($0) }, moving: {}, emit: { name, fields in
+            self.events.append(name)
+            self.records.append((name, fields))
+        },
             admissionDuration: { self.sendAdmissionDuration }, depthNotificationsEnabled: notifications))
         }
     }

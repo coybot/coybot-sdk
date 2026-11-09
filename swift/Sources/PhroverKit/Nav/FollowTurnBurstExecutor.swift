@@ -156,6 +156,15 @@ enum FollowTurnOperationExecutor {
                     reduced(captured, reduction)
                     return reduction
                 }
+                // A complete settled response moving significantly against the
+                // actual commanded direction is not evidence to repeat/increase
+                // that command. Stay stopped; do not infer a motor-sign reversal.
+                if let reduction, reduction.rejection == nil, let signed = reduction.signedResponse,
+                   signed * Double(direction) < -profile.tolerance {
+                    FollowMotionTaskScope.evidence?.recordFailure(.rotationResolutionInsufficient,
+                        cause: .turnResponseOppositeDirection)
+                    return .failed(.rotationResolutionInsufficient)
+                }
                 guard let pose = settled.pose else { return .failed(.trackingLost) }
                 let error = abs(FollowReacquisitionPlanner.wrap(targetYaw - pose.yaw))
                 guard error.isFinite else { return .failed(.trackingLost) }

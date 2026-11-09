@@ -159,6 +159,10 @@ struct FollowMotionFailureResolution {
             return "Navigation stopped: insufficient measured progress."
         case .rotationResolutionInsufficient:
             let turn = context.purpose == .followScan ? "Search rotation" : (context.purpose == .followAlignment ? "Person alignment" : "Turn")
+            if context.failureCause == .turnResponseOppositeDirection {
+                let stop = stopOutcome == .confirmed ? "Stop confirmed. Check turn calibration before restarting following." : "Confirming motor stop…"
+                return "\(turn) stopped: measured heading moved opposite the requested direction. \(stop)"
+            }
             let stop = stopOutcome == .confirmed ? "Stop confirmed. Restart following to try again." : "Confirming motor stop…"
             if context.failureCause == .burstPreSendExpired {
                 return "Turn not started: command scheduling exceeded burst budget. \(stop)"

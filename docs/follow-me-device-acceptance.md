@@ -32,6 +32,32 @@ the request, not proof that the phone audibly played it.
 SDK clients that omit the announcement callback retain the legacy motion signal.
 The probe-specific acceptance sections below apply to that legacy mode.
 
+## Stationary reacquisition after delayed perception
+
+The November 9 run found a person again near the end of reacquisition but did
+not restore following before the original ten-second deadline. The coordinator
+replay uses the recorded 392–425 ms observation ages and a representative
+350 ms stop-confirmation delay with synthetic accepted person observations.
+It reproduces `Person lost` before the fix; this is a timing-pattern replay, not
+a replay of raw camera images or the physical rover.
+
+After a detection stop has drained all motion, pure frame-age expiry can wait
+without requesting another stop. This requires a retained stop fence in the
+same AR generation, a valid source clock, no scan/alignment/movement task, and
+no pending or failed stop. The original perception-outage and reacquisition
+deadlines remain active. Tracking, pose and depth faults still request a stop.
+
+A post-departure recovery can reuse that stop only after a fresh matching frame
+clears the latest stop fence and its settling interval. It cannot use a
+pre-stop, consumed, stale or conflicting observation to resume movement. Once
+movement is launched, frame expiry requires a new stop again.
+
+On device, briefly lose the person after departure, return into view before the
+deadline, and verify that following resumes without repeated stationary stop
+requests. Also verify that a sustained perception outage still terminates, and
+that stale perception after resumed movement stops the rover. Physical
+acceptance remains pending.
+
 ## Pre-ready acquisition rotation policy
 
 Initial search, alignment, and reacquisition use bounded in-place turns without
@@ -51,6 +77,24 @@ reacquisition remains in-place; then repeat after ready completion and verify th
 normal depth gate applies. Full physical acceptance of this policy remains pending.
 
 ## Alignment after a stop-latency spike
+
+### Significant wrong-way response
+
+After a complete, confirmed-stopped response, the turn executor compares signed
+measured yaw travel with the actual commanded turn direction. Opposite travel
+larger than the purpose's existing angular tolerance (5 degrees for alignment,
+7 degrees for scan) terminates with `turn_response_opposite_direction`. Smaller
+measurement reversals retain the existing response/progress checks. The executor
+does not infer reversed wiring, flip command signs, extend its watchdog, or send
+another corrective pulse after this rejection. Stop failure still takes priority
+over the direction diagnostic.
+
+The November 9 replay covers the captured wrong-way yaw sequence, both turn signs,
+and wraparound. Device verification must establish why the physical response
+disagreed with the request; this check prevents repeated wrong-way commands but
+does not establish a corrected physical turn calibration.
+
+### Confirmed overshoot correction
 
 A complete, confirmed alignment overshoot may authorize one opposite correction
 using the strictly smaller measured overshoot ceiling, even when the retained

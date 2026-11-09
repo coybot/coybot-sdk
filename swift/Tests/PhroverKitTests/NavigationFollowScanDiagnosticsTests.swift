@@ -4,6 +4,54 @@ import RoverNav
 
 @MainActor
 final class NavigationFollowScanDiagnosticsTests: XCTestCase {
+    func testRecordedOppositeYawResponseStopsBeforeRepeatingTheSameTurn() async {
+        for sign in [-1.0, 1.0] {
+            for offset in [0.0, 2.5] { // Mirror the response and cross the +/-pi seam.
+                let (result, sends) = await runRecordedTurnResponse(sign: sign, offset: offset,
+                    responses: [0.5347604874327074, 0.4598689562791796, 0.45917837221315894,
+                                0.5124380096862726, 0.5619173858352426, 0.6212986373333939])
+                XCTAssertEqual(result.result, .failed(.rotationResolutionInsufficient))
+                XCTAssertEqual(result.context.failureCause?.rawValue, "turn_response_opposite_direction")
+                XCTAssertEqual(result.stopOutcome, .confirmed)
+                XCTAssertEqual(sends, 1, "Do not increase/repeat pulses after a significant measured wrong-way response")
+            }
+        }
+    }
+
+    func testSmallOppositeYawNoiseDoesNotPreventLaterConfirmedArrival() async {
+        let (result, sends) = await runRecordedTurnResponse(sign: 1, offset: 0,
+            responses: [0.7268411638016628, 0.9113740890010957], sendDelay: 0.001, stopDelay: 0.002)
+        XCTAssertEqual(result.result, .arrived)
+        XCTAssertNil(result.failure)
+        XCTAssertEqual(result.stopOutcome, .confirmed)
+        XCTAssertEqual(sends, 2)
+    }
+
+    private func runRecordedTurnResponse(sign: Double, offset: Double, responses: [Double],
+                                         sendDelay: Double = 0.03, stopDelay: Double = 0.04) async -> (FollowMotionResult, Int) {
+        let source = FollowRecoveryDiagnosticSourceFixture()
+        // Nov 9 recovery operation 18: target increases from 0.73684 to
+        // 0.91137 rad, but the first two settled responses move the other way.
+        let start = 0.7368411638016628
+        let target = 0.9113740890010957
+        func yaw(_ value: Double) -> Double { atan2(sin(sign * (value + offset)), cos(sign * (value + offset))) }
+        source.pose = .init(position: .zero, yaw: yaw(start))
+        source.capture(after: 0.001)
+        var sends = 0
+        let controller = FollowNavigationController(currentPose: { nil }, forwardClearance: { 2 },
+            plan: { _, _ in nil }, lastAckAt: { Date(timeIntervalSince1970: source.uptime) },
+            sendCommand: { _ in sends += 1; source.uptime += sendDelay },
+            stopRover: { source.uptime += stopDelay }, sleep: { duration in
+                if sends > 0 { source.pose = .init(position: .zero, yaw: yaw(responses[min(sends - 1, responses.count - 1)])) }
+                await source.advance(duration)
+            }, now: { Date(timeIntervalSince1970: source.uptime) }, poseSample: { source.snapshot },
+            sourceNow: { source.uptime }, sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
+        let result = await NavigationFollowMeMotion(navigation: controller).perform(.scan(sign * (target - start)), context:
+            .init(sessionGeneration: 9, requestToken: 909, purpose: .followScan, phase: "reacquiring"))
+        return (result, sends)
+    }
+
     func testNextBurstKeepsOperationMaximaButDoesNotRelabelPreviousResponseAsCurrent() async throws {
         let source = FollowRecoveryDiagnosticSourceFixture()
         let sink = FollowDiagnosticRecordingSink()

@@ -1,7 +1,155 @@
 import XCTest
-import PhroverKit
+@testable import PhroverKit
 
 final class FollowTurnBurstPlannerTests: XCTestCase {
+    func testRecordedAlignmentUndershootAllowsOneStrictlySmallerFinishingProbe() throws {
+        let calibration = recordedAlignmentUndershoot()
+        let profile = Planner.Profile(purpose: .alignment)
+        XCTAssertEqual(calibration.responseOverhead, 0.18194791682064532, accuracy: 1e-9)
+        XCTAssertEqual(calibration.responseRate, 2 * .pi / 3, accuracy: 1e-10)
+        let observed = try XCTUnwrap(calibration.lastObservedBurst)
+        XCTAssertEqual(observed.headingSpan, 0.23177530848011052, accuracy: 1e-10)
+        let actual = 1.1433738826968847
+        let decision = Planner.plan(.init(actualYaw: actual, profile: profile,
+            calibration: calibration, sendEntryUptime: 2135124.67284125, provisionalProbeIssued: true))
+        guard case .burst(let direction, let budget) = decision else {
+            return XCTFail("Recorded valid undershoot should permit a bounded smaller finishing probe, got \(decision)")
+        }
+        XCTAssertEqual(direction, 1)
+        XCTAssertGreaterThan(budget, 0)
+        XCTAssertLessThan(budget, observed.budget)
+        let excess = calibration.targetYaw - actual - profile.tolerance
+        XCTAssertLessThanOrEqual(budget, observed.budget * excess / observed.headingSpan)
+        XCTAssertLessThanOrEqual(budget, excess / calibration.responseRate)
+    }
+
+    func testFinishingCorrectionIsAlignmentOnlyAndMirrorsAcrossWraparound() throws {
+        let profile = Planner.Profile(purpose: .alignment)
+        for sign in [-1.0, 1.0] {
+            for offset in [0.0, 2.1] {
+                let calibration = recordedAlignmentUndershoot(sign: sign, offset: offset)
+                let actual = atan2(sin(sign * (1.1433738826968847 + offset)), cos(sign * (1.1433738826968847 + offset)))
+                let error = atan2(sin(calibration.targetYaw - actual), cos(calibration.targetYaw - actual))
+                XCTAssertNotNil(Planner.finishingCorrectionBudget(calibration, error: error, profile: profile))
+                XCTAssertNil(Planner.finishingCorrectionBudget(calibration, error: error, profile: .init(purpose: .scan)))
+                XCTAssertNil(Planner.finishingCorrectionBudget(calibration, error: sign * (2 * profile.tolerance + 0.001), profile: profile))
+                XCTAssertNil(Planner.finishingCorrectionBudget(calibration, error: -error, profile: profile))
+                XCTAssertEqual(Planner.plan(.init(actualYaw: actual, profile: profile, calibration: calibration,
+                    sendEntryUptime: 2135125, authorized: false)), .unavailable)
+                XCTAssertEqual(Planner.plan(.init(actualYaw: actual, profile: profile, calibration: calibration,
+                    sendEntryUptime: 1e20)), .resolutionFailure(.rotationResolutionInsufficient))
+                guard case .burst(let direction, let budget) = Planner.plan(.init(actualYaw: actual, profile: profile,
+                    calibration: calibration, sendEntryUptime: 2135125)) else { return XCTFail("Missing finishing probe") }
+                XCTAssertEqual(direction, Int(sign))
+                XCTAssertGreaterThan(budget, 0)
+                XCTAssertLessThan(budget, 0.08)
+            }
+        }
+    }
+
+    func testFinishingProbeCannotRenewAfterNoProgressWrongWayOrOvershoot() throws {
+        let profile = Planner.Profile(purpose: .alignment)
+        var calibration = recordedAlignmentUndershoot()
+        let start = try XCTUnwrap(calibration.lastSourceSample?.yaw)
+        let budget = try XCTUnwrap(Planner.finishingCorrectionBudget(calibration,
+            error: calibration.targetYaw - start, profile: profile))
+        calibration.consumeFinishingCorrection(budget: budget)
+        for end in [start, start - 0.01, calibration.targetYaw + 0.12] {
+            let measured = Planner.recording(finishingResponse(calibration, start: start, end: end, budget: budget),
+                in: calibration, profile: profile)
+            XCTAssertNil(measured.rejection)
+            XCTAssertEqual(Planner.plan(.init(actualYaw: end, profile: profile,
+                calibration: measured.calibration, sendEntryUptime: 2135126)), .resolutionFailure(.rotationResolutionInsufficient))
+            XCTAssertEqual(measured.calibration.finishingCorrectionCeiling, budget)
+        }
+        let missing = Planner.recording(.init(operationID: 1, generation: 7, targetYaw: calibration.targetYaw,
+            clockDomain: "test_uptime", requestedBudget: budget, sendEntryUptime: 2135125,
+            sendResponseUptime: 2135125.03, stopObligationUptime: 2135125 + budget,
+            stopAcknowledgementUptime: 2135125.2, samples: []), in: calibration, profile: profile)
+        XCTAssertEqual(Planner.plan(.init(actualYaw: start, profile: profile, calibration: missing.calibration,
+            sendEntryUptime: 2135126)), .resolutionFailure(.rotationResolutionInsufficient))
+    }
+
+    func testLargeOutAndBackExcursionCannotAuthorizeFinishingProbe() {
+        let seed = initial(0.8)
+        let profile = Planner.Profile(purpose: .alignment)
+        let measured = Planner.recording(response(seed, samples: [sample(0.65), sample(0.95, 2, 100.1),
+            sample(0.67, 3, 100.6)], stop: 0.2), in: seed, profile: profile)
+        XCTAssertNil(measured.rejection)
+        XCTAssertNil(Planner.finishingCorrectionBudget(measured.calibration, error: 0.13, profile: profile))
+        XCTAssertEqual(Planner.plan(.init(actualYaw: 0.67, profile: profile,
+            calibration: measured.calibration, sendEntryUptime: 101)), .resolutionFailure(.rotationResolutionInsufficient))
+    }
+
+    func testFinishingCannotBorrowResponseAfterLargeStoppedPoseChange() {
+        let seed = initial(1)
+        let profile = Planner.Profile(purpose: .alignment)
+        let measured = Planner.recording(response(seed, samples: [sample(0.3), sample(0.75, 2, 100.6)],
+            stop: 0.2), in: seed, profile: profile)
+        XCTAssertNil(measured.rejection)
+        // The stored response ended 0.25 rad short. A substituted current pose
+        // only 0.14 rad short is outside the allowed settled-source agreement.
+        XCTAssertNil(Planner.finishingCorrectionBudget(measured.calibration, error: 0.14, profile: profile))
+        XCTAssertEqual(Planner.plan(.init(actualYaw: 0.86, profile: profile,
+            calibration: measured.calibration, sendEntryUptime: 101)), .resolutionFailure(.rotationResolutionInsufficient))
+    }
+
+    func testImprovingFinishingResponsesCanRepeatButNeverGrowTheirBudget() throws {
+        let profile = Planner.Profile(purpose: .alignment)
+        var calibration = recordedAlignmentUndershoot()
+        var start = try XCTUnwrap(calibration.lastSourceSample?.yaw)
+        let ceiling = try XCTUnwrap(Planner.finishingCorrectionBudget(calibration,
+            error: calibration.targetYaw - start, profile: profile))
+        calibration.consumeFinishingCorrection(budget: ceiling)
+        var budget = ceiling
+        for (index, end) in [1.17, 1.185, 1.22].enumerated() {
+            let measured = Planner.recording(finishingResponse(calibration, start: start, end: end, budget: budget,
+                entry: 2135125 + Double(index), sequence: UInt64(6100 + index * 2)), in: calibration, profile: profile)
+            XCTAssertNil(measured.rejection)
+            calibration = measured.calibration
+            XCTAssertLessThanOrEqual(try XCTUnwrap(calibration.finishingCorrectionCeiling), budget)
+            let decision = Planner.plan(.init(actualYaw: end, profile: profile, calibration: calibration,
+                sendEntryUptime: 2135126 + Double(index)))
+            if index == 2 { XCTAssertEqual(decision, .arrived) }
+            else {
+                guard case .burst(let direction, let nextBudget) = decision else { return XCTFail("Expected measured continuation") }
+                XCTAssertEqual(direction, 1)
+                XCTAssertLessThanOrEqual(nextBudget, budget)
+                budget = nextBudget
+            }
+            start = end
+        }
+    }
+
+    private func finishingResponse(_ calibration: Planner.Calibration, start: Double, end: Double,
+                                   budget: Double, entry: Double = 2135125, sequence: UInt64 = 6100) -> Planner.Response {
+        .init(operationID: 1, generation: 7, targetYaw: calibration.targetYaw, clockDomain: "test_uptime",
+            requestedBudget: budget, sendEntryUptime: entry, sendResponseUptime: entry + 0.03,
+            stopObligationUptime: entry + budget, stopAcknowledgementUptime: entry + 0.2,
+            samples: [sample(start, sequence, entry - 0.01), sample(end, sequence + 1, entry + 0.6)])
+    }
+
+    private func recordedAlignmentUndershoot(sign: Double = 1, offset: Double = 0) -> Planner.Calibration {
+        // Nov 9 16:08:03 PST, alignment operation 28. Minimized to the
+        // immutable endpoints and extrema; preserves the logged span and model.
+        func yaw(_ value: Double) -> Double { atan2(sin(sign * (value + offset)), cos(sign * (value + offset))) }
+        let seed = initial(yaw(1.2794171306496813))
+        let first = sample(yaw(0.9165123339590775), 5984, 2135123.832511541, collected: 2135123.906307667)
+        let minimum = sample(yaw(0.9160944908427845), 5997, 2135124.04919775, collected: 2135124.1280067503)
+        let maximum = sample(yaw(1.147869799322895), 6011, 2135124.282551958, collected: 2135124.3689957918)
+        let last = sample(yaw(1.140633465553874), 6020, 2135124.4325655, collected: 2135124.5058945417)
+        let reduced = Planner.recording(.init(operationID: 1, generation: 7, targetYaw: seed.targetYaw,
+            clockDomain: "test_uptime", requestedBudget: 0.08,
+            sendEntryUptime: 2135124.00554525, sendResponseUptime: 2135124.0920684584,
+            stopObligationUptime: 2135124.08554525, stopAcknowledgementUptime: 2135124.267493167,
+            samples: [first, minimum, maximum, last],
+            planningEvaluation: sample(first.yaw, 5984, first.sourceTimestamp, collected: 2135124.00496175),
+            stoppedEvaluation: sample(last.yaw, 6020, last.sourceTimestamp, collected: 2135124.6057875003)),
+            in: seed, profile: .init(purpose: .alignment))
+        XCTAssertNil(reduced.rejection)
+        return reduced.calibration
+    }
+
     func testAstralAndCoybotResidualsUseInclusiveFiveDegreeAlignmentAcceptance() {
         for sign in [-1.0, 1.0] {
             for residual in [0.052565507099431086, 0.08364032971500879, 5 * Double.pi / 180] {

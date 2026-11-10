@@ -87,6 +87,8 @@ enum FollowTurnOperationExecutor {
                     return .failed(.stalled)
                 }
                 let signed = Double(direction) * profile.fixedWheelMagnitude
+                let finishingCorrection = FollowTurnBurstPlanner.finishingCorrectionBudget(calibration,
+                    error: FollowReacquisitionPlanner.wrap(targetYaw - pose.yaw), profile: profile) == budget
                 let receipt: FollowTurnBurstExecutionReceipt
                 do { receipt = try await burst(.init(left: -signed, right: signed), budget, progress, calibration.lastSourceSample, sample) }
                 catch {
@@ -95,6 +97,7 @@ enum FollowTurnOperationExecutor {
                     if let failure = runtime.failure { return .failed(failure) }
                     return .failed(.commandFailed)
                 }
+                if finishingCorrection { calibration.consumeFinishingCorrection(budget: budget) }
                 probeIssued = true
                 guard authorized(), !Task.isCancelled else { return .cancelled }
                 guard let fence = receipt.confirmedStopFence else { return .failed(.commandFailed) }

@@ -941,7 +941,7 @@ public final class FollowMeCoordinator {
                             _ = await restoreRecovery(selected, phase: .waitingForMovement)
                         }
                     } else if !departurePending, recoveryFrameEligible(selected, batch: batch) {
-                        if let fence = stationaryRecoveryFence {
+                        if let fence = stationaryObservationFence {
                             guard matchedFrameClearsNewestStop(batch) else { return }
                             await follow(selected, rover: batch.pose!.position, generation: token,
                                 confirmedStop: fence.identity)
@@ -2080,22 +2080,28 @@ public final class FollowMeCoordinator {
         return activeReadyAdmission?.isRefreshingRecovery(at: clock.now) == true
     }
 
-    /// A detection stop has drained motion and no new command has been launched.
-    /// Frame age alone cannot create another physical stop obligation here.
-    private var stationaryRecoveryFence: FollowTurnStopFence? {
-        guard state == .reacquiring, recoveryStopBoundary != nil,
+    /// A detection/readiness stop has drained motion and no command has been
+    /// launched since. Frame age alone does not create another stop obligation.
+    private var stationaryObservationFence: FollowTurnStopFence? {
+        let recovering = state == .reacquiring && recoveryStopBoundary != nil && recoveryEpisode != nil
+        let spokenReady = state == .signalingReady && stationaryReadyAnnouncement != nil &&
+            (stationaryReadyPending || readySignalSucceeded)
+        guard recovering || spokenReady,
               !scanning, movementTask == nil, alignmentTask == nil,
               !stopBlocked, stopTask == nil, confirmationTask == nil,
-              let fence = newestStopFence, let episode = recoveryEpisode,
+              pendingAdmission == nil, activeReadyAdmission == nil,
+              let fence = newestStopFence,
               let uptime = (motion as? any FollowMeSourceClockMotion)?.sourceUptime,
               uptime.isFinite, fence.acknowledgementUptime.isFinite, uptime >= fence.acknowledgementUptime,
-              fence.sourceGeneration == episode.anchor?.frameID.generation else { return nil }
+              fence.sourceGeneration == latestFrame?.generation else { return nil }
+        if let episode = recoveryEpisode, fence.sourceGeneration != episode.anchor?.frameID.generation { return nil }
         return fence
     }
 
     private func perceptionUnavailable(_ issue: FollowPerceptionIssue, generation token: UInt64) async {
         guard generation == token else { return }
-        if state == .signalingReady, issue == .staleFrame {
+        let waitingWhileStopped = issue == .staleFrame && stationaryObservationFence != nil
+        if state == .signalingReady, issue == .staleFrame, !waitingWhileStopped {
             readySignalInterruptedByStalePerception = true
         }
         if state == .recoveringReadyPath {
@@ -2114,8 +2120,6 @@ public final class FollowMeCoordinator {
         // another stop. Keep those facts separate so a structural fault can
         // still escalate without renewing the existing outage window.
         if poseDeadline == nil {
-            cancelAlignment()
-            if state == .signalingReady { state = .aligning }
             let deadline = clock.now + config.perceptionRecoverySeconds
             poseDeadline = deadline
             perceptionStopRequested = false
@@ -2131,7 +2135,9 @@ public final class FollowMeCoordinator {
         // Preserve both the outage deadline and the existing acknowledged stop
         // fence while waiting for fresh post-stop continuity. Re-stopping here
         // would move the fence past each delayed observation indefinitely.
-        if issue == .staleFrame, stationaryRecoveryFence != nil { return }
+        if waitingWhileStopped { return }
+        cancelAlignment()
+        if state == .signalingReady { state = .aligning }
         perceptionStopRequested = true
         // Enforce recovery independently of the duration of motor acknowledgement.
         guard await confirmStop(generation: token) else { return }

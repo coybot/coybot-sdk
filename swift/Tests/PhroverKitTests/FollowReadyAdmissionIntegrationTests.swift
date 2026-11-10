@@ -6,6 +6,131 @@ import simd
 
 @MainActor
 final class FollowReadyAdmissionIntegrationTests: XCTestCase {
+    func testSpokenReadyRecoveryCompletesDespiteAgedFramesBetweenDeliveries() async {
+        let f = Fixture()
+        var announcements: [String] = []
+        f.stationaryAnnouncement = { announcements.append($0) }
+        var sequence = await reachSpokenReadyDuringRecovery(f)
+        XCTAssertEqual(announcements, ["I'm ready to follow"])
+        XCTAssertEqual(f.coordinator.state, .signalingReady,
+            "Recovery must still establish a distinct post-announcement baseline")
+        f.stopDelay = 0.25
+        // Nov 9 pre-departure pattern: valid observations arrive 350 ms old,
+        // cross the 500 ms watchdog between deliveries, then are seen again.
+        for _ in 0..<12 {
+            f.clock.advance(to: f.clock.now + 0.55)
+            await drain()
+            f.send(sequence, range: 1.6, timestamp: f.clock.now - 0.35)
+            sequence += 1
+            await drain()
+            if f.coordinator.state == .waitingForMovement || !f.coordinator.isActive { break }
+        }
+        XCTAssertEqual(f.coordinator.state, .waitingForMovement,
+            "Spoken readiness must reach its departure baseline before the existing recovery deadline")
+        XCTAssertEqual(announcements, ["I'm ready to follow"], "A stale frame must not repeat the announcement")
+        XCTAssertEqual(f.commands, 0)
+        XCTAssertTrue(f.records.contains { $0["event"] as? String == "follow_recovery.cleared" })
+        _ = await f.coordinator.stop()
+    }
+
+    func testSpokenReadyAgeWaitPreservesBaselineAndOriginalRecoveryDeadline() async throws {
+        let f = Fixture()
+        var announcements: [String] = []
+        f.stationaryAnnouncement = { announcements.append($0) }
+        let sequence = await reachSpokenReadyDuringRecovery(f)
+        let deadline = try XCTUnwrap(f.records.first { $0["event"] as? String == "follow_recovery.started" }?["deadline_s"] as? Double)
+        f.clock.advance(to: deadline, wakeSleepers: false)
+        f.send(sequence, range: 1.6)
+        await drain()
+        XCTAssertEqual(f.coordinator.state, .failed("Person lost."))
+        XCTAssertEqual(announcements, ["I'm ready to follow"])
+        XCTAssertEqual(f.commands, 0)
+        XCTAssertFalse(f.records.contains { $0["event"] as? String == "follow_recovery.cleared" })
+        _ = await f.coordinator.stop()
+    }
+
+    func testSpokenReadyPendingWaitsForFreshFrameWithoutRepeatingStop() async {
+        let f = Fixture()
+        var announcements: [String] = []
+        f.stationaryAnnouncement = { announcements.append($0) }
+        await f.acquire()
+        f.send(2, range: 1.6)
+        await drain()
+        let stops = f.stops
+        f.clock.advance(to: f.clock.now + 0.501)
+        await drain()
+        XCTAssertEqual(f.stops, stops)
+        XCTAssertEqual(f.coordinator.state, .signalingReady)
+        XCTAssertTrue(announcements.isEmpty)
+        f.send(3, range: 1.6, timestamp: f.clock.now - 0.1)
+        await drain()
+        XCTAssertEqual(announcements, ["I'm ready to follow"])
+        await f.fresh(4, range: 1.6)
+        XCTAssertEqual(f.coordinator.state, .waitingForMovement)
+        XCTAssertEqual(f.commands, 0)
+        _ = await f.coordinator.stop()
+    }
+
+    func testSpokenReadinessStationaryWaitRetainsPerceptionOutageDeadline() async {
+        for announced in [false, true] {
+            let f = Fixture()
+            var announcements: [String] = []
+            f.stationaryAnnouncement = { announcements.append($0) }
+            await f.acquire()
+            f.send(2, range: 1.6)
+            await drain()
+            if announced { await f.fresh(3, range: 1.6) }
+            let stops = f.stops
+            f.clock.advance(to: f.clock.now + 0.501)
+            await drain()
+            XCTAssertEqual(f.stops, stops)
+            f.clock.advance(to: f.clock.now + 2, wakeSleepers: false)
+            f.send(4, range: 1.6)
+            await drain()
+            XCTAssertEqual(f.coordinator.state, .failed(FollowPerceptionIssue.staleFrame.message))
+            XCTAssertEqual(announcements.count, announced ? 1 : 0)
+            XCTAssertEqual(f.commands, 0)
+            _ = await f.coordinator.stop()
+        }
+    }
+
+    func testSpokenReadyAgeWaitCannotHideStructuralFaultBehindHealthyFrame() async {
+        for fault in ["tracking", "depth", "pose"] {
+            let f = Fixture()
+            var announcements: [String] = []
+            f.stationaryAnnouncement = { announcements.append($0) }
+            await f.acquire()
+            f.send(2, range: 1.6)
+            await drain()
+            f.clock.advance(to: f.clock.now + 0.501)
+            await drain()
+            let stops = f.stops
+            f.send(3, range: 1.6, tracking: fault == "tracking" ? .limited : .normal,
+                depthAvailable: fault != "depth", poseAvailable: fault != "pose")
+            f.send(4, range: 1.6)
+            await drain()
+            XCTAssertGreaterThan(f.stops, stops, fault)
+            XCTAssertTrue(announcements.isEmpty, "The queued healthy observation predates the structural-fault stop")
+            XCTAssertEqual(f.commands, 0)
+            _ = await f.coordinator.stop()
+        }
+    }
+
+    private func reachSpokenReadyDuringRecovery(_ f: Fixture) async -> UInt64 {
+        await f.acquire()
+        // Lose the target while aligning, before the first readiness signal.
+        f.send(2, range: 1.6, peopleAvailable: false)
+        await drain()
+        XCTAssertEqual(f.coordinator.state, .reacquiring)
+        var sequence: UInt64 = 3
+        while !f.records.contains(where: { $0["event"] as? String == "follow_ready.announcement_requested" }), sequence < 12 {
+            await f.fresh(sequence, range: 1.6)
+            sequence += 1
+        }
+        XCTAssertEqual(f.coordinator.state, .signalingReady)
+        return sequence
+    }
+
     func testSpokenReadinessConfirmsStopAndNeverInvokesReadyMovementOrMapProbe() async {
         let f = Fixture()
         f.mappedRecovery = true
@@ -1353,6 +1478,7 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
         var plans = 0
         var failSend = false
         var failStop = false
+        var stopDelay = 0.0
         var clearance = 2.0
         var yaw = 0.0
         var turns = 0
@@ -1525,6 +1651,11 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
             stops += 1
             stopSendCounts.append(wheelCommands.count)
             if stops == holdStopNumber { await stopFeedback.suspend() }
+            if stopDelay > 0 {
+                clock.advance(to: clock.now + stopDelay)
+                controllerTime = controllerTime.addingTimeInterval(stopDelay)
+                await Task.yield()
+            }
             if failStop { throw URLError(.cannotConnectToHost) }
         }
         func tick(_ duration: Duration) async {

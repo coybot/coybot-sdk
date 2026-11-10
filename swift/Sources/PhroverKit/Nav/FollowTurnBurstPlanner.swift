@@ -52,6 +52,9 @@ public enum FollowTurnBurstPlanner {
         public let completedResponses: Int
         public let measuredResponses: Int
         public let terminalResolutionFailure: Bool
+        /// Non-renewable ceiling after the one unproven undershoot-finishing
+        /// probe. Further requests require measured improvement and cannot grow.
+        public private(set) var finishingCorrectionCeiling: Double?
         public let lastStopAcknowledgementUptime: Double?
         public let lastSourceSequence: UInt64?
         public let lastSourceTimestamp: Double?
@@ -73,6 +76,7 @@ public enum FollowTurnBurstPlanner {
             completedResponses = 0
             measuredResponses = 0
             terminalResolutionFailure = false
+            finishingCorrectionCeiling = nil
             lastStopAcknowledgementUptime = nil
             lastSourceSequence = nil
             lastSourceTimestamp = nil
@@ -96,10 +100,16 @@ public enum FollowTurnBurstPlanner {
             completedResponses = previous.completedResponses + 1
             measuredResponses = previous.measuredResponses + (measured ? 1 : 0)
             terminalResolutionFailure = previous.terminalResolutionFailure || terminal
+            finishingCorrectionCeiling = previous.finishingCorrectionCeiling.map { min($0, response.requestedBudget) }
             lastStopAcknowledgementUptime = response.stopAcknowledgementUptime
             lastSourceSequence = response.samples.last?.sequence ?? previous.lastSourceSequence
             lastSourceTimestamp = response.samples.last?.sourceTimestamp ?? previous.lastSourceTimestamp
             lastSourceSample = response.samples.last ?? previous.lastSourceSample
+        }
+
+        mutating func consumeFinishingCorrection(budget: Double) {
+            guard finishingCorrectionCeiling == nil, budget.isFinite, budget > 0 else { return }
+            finishingCorrectionCeiling = budget
         }
     }
     public struct Input: Sendable {
@@ -346,6 +356,10 @@ public enum FollowTurnBurstPlanner {
             let preError = wrap(calibration.targetYaw - response.samples.first!.yaw)
             let postError = wrap(calibration.targetYaw - response.samples.last!.yaw)
             let directedResponse = net * (preError < 0 ? -1 : 1)
+            if calibration.finishingCorrectionCeiling != nil,
+               directedResponse <= 0 || abs(postError) >= abs(preError) || preError * postError <= 0 {
+                terminal = true
+            }
             if abs(preError) > profile.tolerance, directedResponse >= abs(preError), abs(postError) > profile.tolerance {
                 let previousExcess = abs(preError) - profile.tolerance
                 let distance = abs(net)
@@ -381,8 +395,10 @@ public enum FollowTurnBurstPlanner {
         let candidate = excess / calibration.responseRate - calibration.responseOverhead
         let observed = repeatableBudget(calibration, error: error, profile: input.profile)
         let correction = overshootCorrectionBudget(calibration, error: error, profile: input.profile)
-        let budget = min(input.profile.maximumHostBurstBudget, max(candidate, observed ?? -.infinity, correction ?? -.infinity),
-            calibration.overshootCeiling ?? .infinity)
+        let finishing = finishingCorrectionBudget(calibration, error: error, profile: input.profile)
+        let budget = min(input.profile.maximumHostBurstBudget,
+            max(candidate, observed ?? -.infinity, correction ?? -.infinity, finishing ?? -.infinity),
+            calibration.overshootCeiling ?? .infinity, calibration.finishingCorrectionCeiling ?? .infinity)
         let deadline = input.sendEntryUptime + budget
         guard budget.isFinite, budget > 0, deadline.isFinite, deadline > input.sendEntryUptime else {
             return .resolutionFailure(.rotationResolutionInsufficient)
@@ -399,7 +415,8 @@ public enum FollowTurnBurstPlanner {
               let observed = calibration.lastObservedBurst,
               observed.signedTravel * error > 0,
               observed.absoluteTravel > 0,
-               observed.headingSpan <= abs(error) + profile.tolerance else { return nil }
+                observed.headingSpan <= abs(error) + profile.tolerance else { return nil }
+        if let ceiling = calibration.finishingCorrectionCeiling, observed.budget > ceiling { return nil }
         if let ceiling = calibration.overshootCeiling {
             guard profile.purpose == .alignment, calibration.responsesAfterOvershoot > 0,
                   observed.budget <= ceiling else { return nil }
@@ -416,13 +433,35 @@ public enum FollowTurnBurstPlanner {
     /// source, cancellation, deadline and original progress-watchdog boundaries.
     static func overshootCorrectionBudget(_ calibration: Calibration, error: Double, profile: Profile) -> Double? {
         let excess = abs(error) - profile.tolerance
-        guard profile.purpose == .alignment, !calibration.terminalResolutionFailure, calibration.responsesAfterOvershoot == 0,
+        guard profile.purpose == .alignment, !calibration.terminalResolutionFailure,
+              calibration.finishingCorrectionCeiling == nil, calibration.responsesAfterOvershoot == 0,
               let ceiling = calibration.overshootCeiling, let observed = calibration.lastObservedBurst,
               let settled = calibration.lastSourceSample,
               observed.signedTravel * error < 0,
               abs(error) <= abs(wrap(calibration.targetYaw - settled.yaw)) + profile.tolerance,
               excess > 0, excess / calibration.responseRate - calibration.responseOverhead <= 0 else { return nil }
         let budget = min(ceiling, excess / calibration.responseRate, profile.maximumHostBurstBudget)
+        guard budget.isFinite, budget > 0, budget < observed.budget else { return nil }
+        return budget
+    }
+
+    /// Acknowledgement overhead is not a measured physical minimum turn. After
+    /// a valid undershoot near the target, allow one smaller request derived
+    /// from the measured heading span and remaining excess. This is a bounded
+    /// probe, not a guarantee of physical displacement or an arrival claim.
+    static func finishingCorrectionBudget(_ calibration: Calibration, error: Double, profile: Profile) -> Double? {
+        let excess = abs(error) - profile.tolerance
+        guard profile.purpose == .alignment, !calibration.terminalResolutionFailure,
+              calibration.finishingCorrectionCeiling == nil, calibration.overshootCeiling == nil,
+              let observed = calibration.lastObservedBurst, let settled = calibration.lastSourceSample,
+              excess > 0, abs(error) <= 2 * profile.tolerance,
+              observed.signedTravel * error > 0, observed.headingSpan > abs(error) + profile.tolerance,
+              observed.headingSpan <= abs(observed.signedTravel) + profile.tolerance,
+              excess / calibration.responseRate - calibration.responseOverhead <= 0 else { return nil }
+        let settledError = wrap(calibration.targetYaw - settled.yaw)
+        guard settledError * error > 0, abs(error - settledError) <= profile.tolerance else { return nil }
+        let budget = min(profile.maximumHostBurstBudget, excess / calibration.responseRate,
+            observed.budget * excess / observed.headingSpan)
         guard budget.isFinite, budget > 0, budget < observed.budget else { return nil }
         return budget
     }

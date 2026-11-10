@@ -4,6 +4,50 @@ import RoverNav
 
 @MainActor
 final class NavigationFollowScanDiagnosticsTests: XCTestCase {
+    func testAlignmentUndershootUsesBoundedFinishingProbeAndStopsOnBadResponse() async throws {
+        for ending in ["arrived", "no_progress", "failed_stop"] {
+            let source = FollowRecoveryDiagnosticSourceFixture()
+            let sink = FollowDiagnosticRecordingSink()
+            let start = 0.9165123339590775
+            let target = 1.2794171306496813
+            let undershoot = 1.140633465553874
+            source.pose = .init(position: .zero, yaw: start)
+            source.capture(after: 0.001)
+            var sends = 0
+            let controller = FollowNavigationController(currentPose: { nil }, forwardClearance: { 2 },
+                plan: { _, _ in nil }, lastAckAt: { Date(timeIntervalSince1970: source.uptime) },
+                sendCommand: { _ in sends += 1; source.uptime += 0.08652320830151439 }, stopRover: {
+                    source.uptime += 0.18194791682064532
+                    if sends == 2, ending == "failed_stop" { throw URLError(.timedOut) }
+                    if sends == 1 {
+                        source.pose = .init(position: .zero, yaw: 1.147869799322895)
+                        source.capture(after: 0) // Preserve the observed heading-span peak.
+                    }
+                }, sleep: { duration in
+                    if sends > 0 {
+                        source.pose = .init(position: .zero, yaw: sends == 1 || ending == "no_progress" ? undershoot : target)
+                    }
+                    await source.advance(duration)
+                }, now: { Date(timeIntervalSince1970: source.uptime) },
+                diagnosticEmitter: .init(streamID: "finishing", monotonic: { source.uptime }, utc: { Date() }, sink: sink.append),
+                poseSample: { source.snapshot }, sourceNow: { source.uptime }, sourceEvents: { source.events.stream },
+                sourceStopSnapshot: { source.snapshot })
+            source.controller = controller
+            let result = await NavigationFollowMeMotion(navigation: controller).perform(.alignment(target - start), context:
+                .init(sessionGeneration: 9, requestToken: 910, purpose: .followAlignment, phase: "aligning"))
+            XCTAssertEqual(sends, 2, "Only one unproven finishing pulse is permitted")
+            if ending == "arrived" { XCTAssertEqual(result.result, .arrived) }
+            if ending == "no_progress" { XCTAssertEqual(result.result, .failed(.rotationResolutionInsufficient)) }
+            XCTAssertEqual(result.stopOutcome, ending == "failed_stop" ? .failed : .confirmed)
+            let decisions = try records(sink)
+            let correction = try XCTUnwrap(decisions.first { $0["budget_selection_reason"] as? String == "bounded_undershoot_finishing" })
+            let budget = try XCTUnwrap(correction["selected_budget_s"] as? Double)
+            XCTAssertGreaterThan(budget, 0)
+            XCTAssertLessThan(budget, 0.08)
+            XCTAssertEqual(try XCTUnwrap(correction["tolerance_rad"] as? Double), 5 * .pi / 180, accuracy: 1e-12)
+        }
+    }
+
     func testRecordedOppositeYawResponseStopsBeforeRepeatingTheSameTurn() async {
         for sign in [-1.0, 1.0] {
             for offset in [0.0, 2.5] { // Mirror the response and cross the +/-pi seam.

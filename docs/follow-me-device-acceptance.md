@@ -29,6 +29,22 @@ safety checks. The cue is requested once per follow session; cancelled or failed
 stops do not announce readiness. `follow_ready.announcement_requested` records
 the request, not proof that the phone audibly played it.
 
+While spoken readiness is confirmed stopped and waiting for its post-stop match
+or distinct departure-baseline frame, pure frame-age expiry preserves that
+phase and stop fence. It does not restart alignment or repeat stop confirmation.
+The 500 ms observation limit, two-second perception-outage deadline and any
+existing ten-second reacquisition deadline remain unchanged. Tracking, pose,
+depth and ownership faults still take their normal stop paths; the exception
+does not apply to an active alignment or legacy ready-motion request.
+
+The November 9 pre-departure replay covers loss during alignment, reacquisition,
+spoken readiness, then 350 ms-old observations delivered 550 ms apart with a
+representative 250 ms stop delay. It failed with `Person lost` before the fix and
+now reaches `waitingForMovement` without sending translation. This is a
+synthetic timing-pattern replay through the real controller, not physical
+acceptance. On device, verify one readiness cue, a fresh baseline, and eventual
+departure after a brief perception interruption.
+
 SDK clients that omit the announcement callback retain the legacy motion signal.
 The probe-specific acceptance sections below apply to that legacy mode.
 
@@ -93,6 +109,36 @@ The November 9 replay covers the captured wrong-way yaw sequence, both turn sign
 and wraparound. Device verification must establish why the physical response
 disagreed with the request; this check prevents repeated wrong-way commands but
 does not establish a corrected physical turn calibration.
+
+### Bounded undershoot finishing
+
+The November 9 16:08 local alignment trace stopped roughly eight degrees short
+after a valid 80 ms request. Its 182 ms observed stop overhead made the inverse
+model negative, while the measured heading span was just too large to repeat
+the previous request. A minimized replay retains the logged endpoints/extrema,
+source evaluations and transport timing.
+
+For alignment only, a complete improving undershoot can authorize one smaller
+finishing probe when the remaining error is above five and at most ten degrees,
+the inverse model is nonpositive, and the previous pulse does not fit the
+remaining corridor. The current error must agree with the last settled source
+within the existing tolerance; large out-and-back excursions, prior overshoot
+corrections and incomplete evidence cannot grant this exception.
+
+The request is bounded by both `previousBudget * remainingExcess / headingSpan`
+and `remainingExcess / retainedResponseRate`, with no minimum pulse floor. It is
+strictly smaller than the observed request. Once used, its ceiling cannot be
+renewed or increased. Subsequent requests require a fresh complete response
+with same-direction improvement; no progress, wrong-way movement or overshoot
+outside the arrival tolerance terminates. Confirmed arrival still requires the
+unchanged five-degree tolerance. Source, ownership, stop, depth, watchdog and
+recovery-deadline checks remain active.
+
+Telemetry labels the initial exception `bounded_undershoot_finishing` and
+records `finishing_correction_budget_s` and `finishing_correction_ceiling_s`.
+These are host request budgets, not a guarantee of physical motor-on time or
+turn distance. Physical acceptance must verify the smaller pulse's actual
+response and stopping behavior on the mounted rover.
 
 ### Confirmed overshoot correction
 

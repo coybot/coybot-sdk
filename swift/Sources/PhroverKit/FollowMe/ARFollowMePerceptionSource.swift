@@ -53,6 +53,8 @@ public final class ARFollowMePerceptionSource: FollowMePerception {
                 if published - lastLatencySummary >= 1 {
                     lastLatencySummary = published
                     RuntimeFileLog.append("follow_perception_latency", fields: [
+                        "thermal_state": String(ProcessInfo.processInfo.thermalState.rawValue),
+                        "low_power_mode": String(ProcessInfo.processInfo.isLowPowerModeEnabled),
                         "frame_id": "\(snapshot.id.generation):\(snapshot.id.sequence)",
                         "capture_to_inference_start_s": String(started - snapshot.timestamp),
                         "inference_s": String(duration),

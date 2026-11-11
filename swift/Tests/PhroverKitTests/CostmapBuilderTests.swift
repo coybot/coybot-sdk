@@ -3,6 +3,56 @@ import RoverNav
 @testable import PhroverKit
 
 final class CostmapBuilderTests: XCTestCase {
+    func testRecordedInflatedStartDoesNotClearOneMetreHighNearbyGeometry() {
+        // Nov 11 11:22:14: ground near Y=0, mount reference Y=0.256,
+        // and a blocking vertex 4.5 cm lateral / 7.5 cm behind the start.
+        let center = Vec2(-2.1021475791931152, -0.32796743512153625)
+        var vertices: [SIMD3<Float>] = []
+        for x in -10...10 { for z in -10...10 {
+            vertices.append(SIMD3(Float(center.x) + Float(x) * 0.1,
+                -0.0005480936, Float(center.y) + Float(z) * 0.1))
+        } }
+        vertices.append(SIMD3(-2.057022, 1.001897, -0.402796))
+        let result = CostmapBuilder.buildWithObserved(from: .init(worldVertices: vertices,
+            expectedFloorY: 0.25594383), center: center)
+        XCTAssertEqual(result.diagnostics["raw_start_cost"], "0")
+        XCTAssertEqual(result.diagnostics["inflated_start_cost"], "255")
+        XCTAssertEqual(result.diagnostics["local_floor_rejection"], "insufficient_reference_consistent_support")
+    }
+
+    private func clutteredSupportedFloor(obstacle: Bool = false) -> [SIMD3<Float>] {
+        // Controlled fixture: a surrounding, mount-consistent floor occupies
+        // fewer cells than raised furniture/wall geometry. The latter must not
+        // vote against floor consistency, and must still become obstacles.
+        var vertices = Array(repeating: SIMD3<Float>(-4, -0.98, -4), count: 1000)
+        for x in -10...10 { for z in -10...10 {
+            let px = Float(x) * 0.1 + 0.01, pz = Float(z) * 0.1 + 0.01
+            guard hypot(px, pz) <= 1.2 else { continue }
+            let floor = (abs(x) <= 4 && abs(z) <= 4) || x % 3 == 0 && z % 3 == 0
+            vertices.append(SIMD3(px, floor ? -0.87 : -0.60, pz))
+        } }
+        if obstacle { vertices.append(SIMD3(0.05, -0.69, 0.05)) }
+        return vertices
+    }
+
+    func testSurroundingFloorRemainsValidWhenNonFloorClutterDominatesMesh() throws {
+        let vertices = clutteredSupportedFloor()
+        let assessment = LocalGroundPlane.assess(vertices: vertices, center: .zero, expectedFloorY: -0.895)
+        XCTAssertNotNil(assessment.plane)
+        let result = CostmapBuilder.buildWithObserved(from: .init(worldVertices: vertices, expectedFloorY: -0.895), center: .zero)
+        XCTAssertEqual(result.diagnostics["raw_start_cost"], "0")
+        XCTAssertEqual(result.diagnostics["inflated_start_cost"], "0")
+        let clutter = result.map.worldToCell(Vec2(0.51, 0.51))
+        XCTAssertTrue(result.map.isBlocked(clutter.cx, clutter.cy))
+        let raised = CostmapBuilder.buildWithObserved(from: .init(worldVertices: clutteredSupportedFloor(obstacle: true), expectedFloorY: -0.895), center: .zero)
+        XCTAssertEqual(raised.diagnostics["raw_start_cost"], "255", "An 18 cm obstacle under the rover remains blocked")
+        for height: Float in [0.115, 0.145] {
+            let obstacle = vertices + [SIMD3<Float>(0.05, -0.87 + height, 0.05)]
+            let blocked = CostmapBuilder.buildWithObserved(from: .init(worldVertices: obstacle, expectedFloorY: -0.895), center: .zero)
+            XCTAssertEqual(blocked.diagnostics["raw_start_cost"], "255", "Real obstacles at the logged relative heights stay blocked")
+        }
+    }
+
     private func recordedHeightFixture(raisedObstacle: Bool = false) -> [SIMD3<Float>] {
         // Synthetic spatial support using the recorded elevations; not a replay
         // of the complete device mesh, which was not captured.
@@ -41,19 +91,31 @@ final class CostmapBuilderTests: XCTestCase {
         }
     }
 
-    func testInconsistentFloorReportsSupportDeficitWithoutAcceptingThePlane() throws {
+    func testOneSidedFloorStillFailsEvenWithConsistentCandidateSupport() throws {
         let vertices = recordedHeightFixture().map { point in
             point.x > 0 ? SIMD3<Float>(point.x, -0.90, point.z) : point
         }
         let assessment = LocalGroundPlane.assess(vertices: vertices, center: .zero, expectedFloorY: -1.10)
         XCTAssertNil(assessment.plane)
-        XCTAssertEqual(assessment.diagnostics["local_floor_rejection"], "inconsistent_surface")
+        XCTAssertEqual(assessment.diagnostics["local_floor_rejection"], "support_does_not_surround_rover")
         let inliers = try XCTUnwrap(assessment.diagnostics["local_floor_inlier_cells"].flatMap(Int.init))
         let required = try XCTUnwrap(assessment.diagnostics["local_floor_required_inlier_cells"].flatMap(Int.init))
         XCTAssertGreaterThanOrEqual(inliers, 24)
-        XCTAssertLessThan(inliers, required, "The log should identify inadequate spatial support, not just a generic rejection")
+        XCTAssertGreaterThanOrEqual(inliers, required, "Candidate agreement cannot replace surrounding spatial support")
         XCTAssertNotNil(assessment.diagnostics["local_floor_reference_consistent_cells"])
         XCTAssertNotNil(assessment.diagnostics["local_floor_seed_cells"])
+        XCTAssertEqual(assessment.diagnostics["local_floor_fit_cells_capture"], "complete")
+    }
+
+    func testCompetingMountConsistentSurfacesStillRequireSeventyPercentAgreement() {
+        var vertices: [SIMD3<Float>] = []
+        for x in -8...8 { for z in -8...8 {
+            vertices.append(SIMD3(Float(x) * 0.1 + 0.01, (x + z) % 2 == 0 ? -1.12 : -1.07,
+                Float(z) * 0.1 + 0.01))
+        } }
+        let assessment = LocalGroundPlane.assess(vertices: vertices, center: .zero, expectedFloorY: -1.10)
+        XCTAssertNil(assessment.plane)
+        XCTAssertEqual(assessment.diagnostics["local_floor_rejection"], "inconsistent_surface")
     }
 
     func testLocalPlaneDoesNotExtrapolateOrHideLocalDepression() throws {

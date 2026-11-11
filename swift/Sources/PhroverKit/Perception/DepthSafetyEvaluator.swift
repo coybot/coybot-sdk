@@ -233,11 +233,13 @@ enum DepthSafetyEvaluator {
                           now: TimeInterval,
                           operatorClearedRotation: Bool = false,
                           boundedReadyMotion: Bool = false,
-                          visibilityPolicy: FollowDepthPolicy = .fullVolume) -> DepthSafetyObservation {
+                          visibilityPolicy: FollowDepthPolicy = .fullVolume,
+                          includeDiagnosticCoverage: Bool = true) -> DepthSafetyObservation {
         let evaluationStarted = ProcessInfo.processInfo.systemUptime
         var observation = evaluateMotion(snapshot, command: command, now: now,
             operatorClearedRotation: operatorClearedRotation, boundedReadyMotion: boundedReadyMotion,
-            astralCompatible: visibilityPolicy == .astralCompatible)
+            astralCompatible: visibilityPolicy == .astralCompatible,
+            includeDiagnosticCoverage: includeDiagnosticCoverage)
         observation.visibilityPolicy = visibilityPolicy
         observation.evaluationDuration = ProcessInfo.processInfo.systemUptime - evaluationStarted
         return observation
@@ -248,7 +250,8 @@ enum DepthSafetyEvaluator {
                                        now: TimeInterval,
                                        operatorClearedRotation: Bool,
                                        boundedReadyMotion: Bool,
-                                       astralCompatible: Bool) -> DepthSafetyObservation {
+                                       astralCompatible: Bool,
+                                       includeDiagnosticCoverage: Bool) -> DepthSafetyObservation {
         let motion = DepthSafetyMotionClass.classify(command)
         let age = max(0, now - snapshot.timestamp)
         guard now.isFinite, snapshot.timestamp.isFinite, now >= snapshot.timestamp,
@@ -301,6 +304,14 @@ enum DepthSafetyEvaluator {
             return result
         }
         func checkingCoverage(_ observation: DepthSafetyObservation, horizon: Double) -> DepthSafetyObservation {
+            // Full-volume coverage is non-authoritative under this policy.
+            // Avoid its projection/history work on the live control actor;
+            // diagnostic callers can still explicitly request the comparison.
+            if astralCompatible && !includeDiagnosticCoverage {
+                var result = observation
+                result.coverageProvenance = "astral_compatible"
+                return finalized(result)
+            }
             let coverage = sweptVolumeCoverage(snapshot: snapshot, command: command, motion: motion, horizon: horizon)
             let sufficient = coverage.isSufficient(minimumSweptVolumeCoverage)
             // Astral-compatible follow does not require the visibility fraction; it is

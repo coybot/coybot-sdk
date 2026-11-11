@@ -110,6 +110,129 @@ and wraparound. Device verification must establish why the physical response
 disagreed with the request; this check prevents repeated wrong-way commands but
 does not establish a corrected physical turn calibration.
 
+### Depth control cost and November 11 follow-up
+
+The November 11 11:24 local run recovered once, then exhausted the next 600 ms
+depth window with roughly 59–60 ms validity remaining against a 60.7 ms reserve.
+Cached acknowledgement reads were already only microseconds. The 11:23 run also
+had large camera/inference publication delays, ending with an 817 ms-old frame.
+
+The live AR depth provider now omits diagnostic-only full-volume coverage under
+the existing Astral-compatible follow policy. Collision cells, remembered hazards,
+stopping distance, exact-command transport checks and freshness limits are still
+evaluated. Full-volume policy always evaluates coverage. Direct diagnostic
+evaluation defaults to including it; omitted coverage and the counterfactual
+full-volume result remain unknown/null, never reported as passing.
+
+An empty-hazard, 20-history-frame simulator benchmark measured about 0.562 ms
+per evaluation with shadow coverage versus 0.019 ms without it in Debug. This
+isolates diagnostic work; it is not a device latency guarantee or proof that the
+entire camera-staleness failure is resolved. Pipeline summaries now include
+thermal state (0 nominal, 1 fair, 2 serious, 3 critical) and low-power mode.
+
+The 11:22 map capture is a separate unresolved physical/calibration question:
+the floor was near Y=0, the mount-derived reference was near Y=0.256, and a
+sample at (-2.057022, 1.001897, -0.402796) lay about 8.7 cm from the rover's
+planar position. The raw start was clear but obstacle inflation blocked it.
+A regression preserves that rejection; the high sample is not reclassified
+as floor or removed as presumed self geometry. Confirm the rigid mount, actual
+lens height and nearby geometry before changing this classification.
+
+Release validation was attempted but coordinator/recovery tests failed or hung
+despite the targeted depth/AR/map/pursuit suites passing. The experimental
+scheduling changes to those test helpers were reverted. Do not treat Release as
+validated or install it based on the targeted pass. The full Debug suite passed
+1,534 tests without retries; the next device build remains Debug.
+
+### Small non-progressing search responses
+
+The November 10 16:12 local search stopped after a complete response measured
+-0.005944669 rad (-0.34 degrees), following 27 positive pulses. The executor
+previously rejected every negative search response, even below the separate
+significant-wrong-way threshold. A controller replay using the recorded yaw
+endpoints and send/stop timing reproduces this failure.
+
+Initial directed search now tolerates small complete non-progressing responses
+within the original 2.5-second progress watchdog. Pulse budget and wheel speed
+remain unchanged. Negative net travel is subtracted from sweep progress, never
+clamped into positive credit. Retreat more than the existing scan tolerance
+from the best directed sweep stops as wrong-way motion, including accumulated
+small reversals. A non-progressing response whose sampled absolute travel exceeds
+that tolerance is rejected rather than treated as noise. Missing evidence,
+significant wrong-way responses and failed stop confirmation remain terminal.
+
+The regression covers both directions, later measured arrival, persistent stall,
+accumulated reversal and large out-and-back travel. It does not establish whether
+the device's small response was mechanical settling or AR noise. Verify continued
+search and eventual person acquisition on the device; no motor-sign reversal or
+physical motor-on duration is inferred from HTTP acknowledgements.
+
+### Local floor support amid raised clutter
+
+The November 10 15:31 local attempt had a raw starting-cell cost of 255. Local
+floor fitting reported 66 inliers among 83–84 mount-consistent candidate cells,
+but required 206 because it counted all 294 local cells, including raised
+clutter, in the consistency denominator. This could reject a supported floor
+solely because more wall or furniture cells were present.
+
+The fit now requires 70% agreement among mount-consistent candidates, still with
+at least 24 cells. The surrounding-support, maximum slope, mount agreement,
+residual, lower-level conflict and bounded-extrapolation checks are unchanged.
+Excluded raised geometry remains input to obstacle classification; neither the
+starting cell nor any presumed chassis region is cleared.
+
+A controlled regression with a surrounding floor and dominant raised clutter
+failed before this change and passes afterward. Actual 11.5, 14.5 and 18 cm
+obstacles still block the starting cell. Competing candidate surfaces, one-sided
+support, lower levels, steep surfaces and missing mount references remain rejected.
+This is a synthetic regression, not an exact replay of the uncaptured device mesh.
+
+Rejected fits now capture up to 512 reduced cells as
+`local_floor_fit_cells_dx_y_dz_m` (relative X/Z, absolute world Y), with explicit
+capture status, plus candidate plane height/slopes when available. These inputs
+allow the next device rejection to be replayed. Physical verification must check
+the configured 30 cm camera height and -8.5 cm forward offset; these values were
+not recalibrated from the log. A candidate may still fail the independent mount,
+geometry or lower-level checks after the consistency denominator is corrected.
+
+### Joining planned routes through soft-cost cells
+
+The November 10 14:57 local capture failed before the first pursuit command:
+the planner produced a route, but the joining check treated the rover's cost-14
+cell as blocked. Planning permits costs below 253; joining previously required
+every touched cell to have zero cost. The minimized controller replay preserves
+the recorded pose, seven waypoints and the single start-cell cost that triggers
+the failure.
+
+Joining an existing follow route now uses the planner's threshold of 253 while
+retaining the 2 cm segment margin, map bounds and conservative cell-intersection
+check. Costs 253–255 remain blocked. Other clearance checks, including a newly
+retargeted final leg, retain the zero-soft-cost requirement. Diagnostics record
+`join_blocking_cost` alongside the captured costmap. Tests cover soft and hard
+start cells, nearby hard cells inside the margin, diagonal corner contact and
+map edges. Physical acceptance still requires a follow trial on the mounted rover.
+
+### Stopped depth recovery acknowledgement reads
+
+The November 9 19:28 local pursuit attempt received clear post-stop depth,
+but only 34–40 ms of its 250 ms validity remained at admission. The measured
+admission reserve was 57.6 ms, so the original 600 ms recovery window expired.
+The log establishes the freshness shortfall, not the exact source of the delay.
+
+A deterministic pursuit replay combines the logged 149 ms publication age and
+47.6 ms admission cost with a simulated 60 ms asynchronous acknowledgement-read
+delay. Repeating that read on every stopped depth update reproduces the timeout.
+While confirmed stopped, pursuit now reuses a real post-stop acknowledgement
+read with its original watchdog expiry. It rereads when that evidence cannot
+cover the admission reserve, and resumes ordinary reads after movement resumes.
+Missing, future, nonfinite or expired acknowledgements cannot authorize pursuit.
+
+The 250 ms raw-depth validity, 600 ms recovery deadline, three distinct post-stop
+captures and transport-time validation remain required. The replay now resumes;
+physical verification must establish whether acknowledgement scheduling is the
+device bottleneck. `acknowledgement_read_s` and `acknowledgement_reused` on pursuit
+drive/wait diagnostics distinguish that from intrinsically late depth delivery.
+
 ### Bounded undershoot finishing
 
 The November 9 16:08 local alignment trace stopped roughly eight degrees short

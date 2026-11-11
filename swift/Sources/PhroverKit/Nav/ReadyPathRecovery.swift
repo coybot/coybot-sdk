@@ -306,8 +306,9 @@ enum ReadyPathRecovery {
             var lastReason = DepthSafetyUnavailableReason.staleRawDepth
             var waitingForPerception = false
             func emitWait(_ stage: String) {
+                let time = environment.uptime()
                 environment.emit(stage, [
-                    "depth_wait_elapsed_s": .number(waitStarted.map { environment.uptime() - $0 } ?? 0),
+                    "depth_wait_elapsed_s": .number(waitStarted.map { time - $0 } ?? 0),
                     "depth_wait_deadline_s": .number(refreshDeadline),
                     "depth_wait_limit_s": .number(FollowReadyAdmission.recoveryRefreshLimit), "depth_wait_poll_count": .number(Double(polls)),
                     "waiting_for_perception": .bool(waitingForPerception),

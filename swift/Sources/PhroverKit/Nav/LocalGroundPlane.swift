@@ -36,8 +36,17 @@ struct LocalGroundPlane: Sendable {
     static func assess(vertices: [SIMD3<Float>], center: Vec2, expectedFloorY: Float?)
         -> (plane: Self?, diagnostics: [String: String]) {
         var fields = ["local_floor_status": "rejected", "mounted_floor_reference_y_m": expectedFloorY.map { String($0) } ?? "unavailable"]
+        var fitCells: [SIMD3<Double>] = []
         func reject(_ reason: String) -> (Self?, [String: String]) {
             fields["local_floor_rejection"] = reason
+            // Bounded reduced estimator input, not the full mesh. Preserve exact
+            // values so device rejections can be replayed without guessing geometry.
+            if !fitCells.isEmpty, fitCells.count <= 512 {
+                fields["local_floor_fit_cells_capture"] = "complete"
+                fields["local_floor_fit_cells_dx_y_dz_m"] = fitCells.map { "\($0.x),\($0.y),\($0.z)" }.joined(separator: ";")
+            } else {
+                fields["local_floor_fit_cells_capture"] = fitCells.isEmpty ? "unavailable" : "omitted_cell_limit"
+            }
             return (nil, fields)
         }
         guard let expectedFloorY, expectedFloorY.isFinite else { return reject("no_valid_mount_reference") }
@@ -53,12 +62,18 @@ struct LocalGroundPlane: Sendable {
             if cells[cell].map({ p.y < $0.y }) ?? true { cells[cell] = p }
         }
         let all = cells.values.sorted { $0.x == $1.x ? $0.z < $1.z : $0.x < $1.x }
+        fitCells = all
         let eligible = all.filter { abs($0.y - Double(expectedFloorY)) <= 0.06 }
         let minimumSupportCells = 24
         let requiredSupportFraction = 0.7
         fields["local_floor_spatial_cells"] = String(all.count)
         fields["local_floor_reference_consistent_cells"] = String(eligible.count)
-        fields["local_floor_required_inlier_cells"] = String(max(minimumSupportCells, Int(ceil(Double(all.count) * requiredSupportFraction))))
+        // Consistency is measured among independently mount-consistent floor
+        // candidates. Raised clutter is still classified by the costmap, but
+        // cannot increase the number of floor inliers required to fit a plane.
+        let requiredInliers = max(minimumSupportCells, Int(ceil(Double(eligible.count) * requiredSupportFraction)))
+        fields["local_floor_non_candidate_cells"] = String(all.count - eligible.count)
+        fields["local_floor_required_inlier_cells"] = String(requiredInliers)
         guard eligible.count >= minimumSupportCells else { return reject("insufficient_reference_consistent_support") }
         let median = eligible.map(\.y).sorted()[eligible.count / 2]
         let seed = eligible.filter { abs($0.y - median) <= 0.03 }
@@ -66,8 +81,11 @@ struct LocalGroundPlane: Sendable {
         guard let initial = fit(seed) else { return reject("degenerate_support") }
         let inliers = eligible.filter { abs($0.y - (initial.2 + initial.0 * $0.x + initial.1 * $0.z)) <= 0.015 }
         fields["local_floor_inlier_cells"] = String(inliers.count)
-        guard inliers.count >= minimumSupportCells, Double(inliers.count) >= Double(all.count) * requiredSupportFraction,
+        guard inliers.count >= requiredInliers,
               let (a, b, c) = fit(inliers) else { return reject("inconsistent_surface") }
+        fields["local_floor_candidate_y_at_start_m"] = String(c)
+        fields["local_floor_candidate_x_slope"] = String(a)
+        fields["local_floor_candidate_z_slope"] = String(b)
         guard hypot(a, b) <= 0.08, abs(c - Double(expectedFloorY)) <= 0.04 else { return reject("slope_or_mount_mismatch") }
         let rms = sqrt(inliers.reduce(0.0) { $0 + pow($1.y - (c + a * $1.x + b * $1.z), 2) } / Double(inliers.count))
         guard rms <= 0.01 else { return reject("high_residual") }

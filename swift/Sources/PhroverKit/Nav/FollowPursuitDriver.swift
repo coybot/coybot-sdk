@@ -12,7 +12,10 @@ struct FollowPursuitPlan: Sendable {
     func joined(from position: Vec2) -> Self? {
         guard let map else { return self }
         guard let closest = path.indices.min(by: { path[$0].distance(to: position) < path[$1].distance(to: position) }) else { return nil }
-        for index in closest..<path.count where map.isSegmentClear(from: position, to: path[index], margin: Self.joinMargin) {
+        // Join an already planned route using its traversability policy. Soft
+        // inflation is a preference cost, not a new obstacle under the rover.
+        for index in closest..<path.count where map.isSegmentClear(from: position, to: path[index],
+            margin: Self.joinMargin, blockingCost: Costmap.lethalThreshold) {
             return .init(path: Array(path[index...]), map: map)
         }
         return nil
@@ -220,6 +223,7 @@ final class FollowPursuitDriver {
         var refreshCaptureCount = 0
         var refreshFirstCapture: Double?
         var refreshLastCapture: Double?
+        var stoppedAcknowledgement: Date?
 
         func recordAcceptance(_ reason: String, job: Job?, source: NavigationPoseSample, at time: Double,
                               event: String = "plan_acceptance_rejected", includeGeometry: Bool = true) {
@@ -259,6 +263,7 @@ final class FollowPursuitDriver {
                 "transport_attempts": .number(0)])
             do { try await environment.stop() } catch { return .commandFailed }
             movementActive = false
+            stoppedAcknowledgement = nil
             refreshAfter = (environment.pose().frameID, environment.uptime())
             // Recovery accepts only captures after this stop. Give those captures
             // the full bounded window instead of spending it on stop transport.
@@ -373,7 +378,22 @@ final class FollowPursuitDriver {
                 beginPlan(from: source, reason: route == nil ? "startup" : (routeRevision != revision ? "live_goal" : "periodic"))
             }
 
-            let ack = await environment.acknowledgement()
+            // While confirmed stopped, an async actor round trip on every depth
+            // publication can consume its send margin before we even evaluate it.
+            // Reuse only a real post-stop read with its original watchdog expiry;
+            // never manufacture an acknowledgement or renew its timestamp.
+            let ackReadStarted = environment.uptime()
+            let cachedAge = stoppedAcknowledgement.map { environment.date().timeIntervalSince($0) }
+            let reuseAck = refreshAfter != nil && !movementActive && cachedAge.map {
+                $0.isFinite && $0 >= 0 && $0 + max(Self.minimumFreshnessMargin, maximumAdmissionDuration + 0.01) < RoverConfig.commsWatchdogTimeout
+            } == true
+            let ack: Date?
+            if reuseAck { ack = stoppedAcknowledgement }
+            else {
+                ack = await environment.acknowledgement()
+                stoppedAcknowledgement = refreshAfter != nil && !movementActive ? ack : nil
+            }
+            let ackReadDuration = environment.uptime() - ackReadStarted
             guard owned else { return .cancelled }
             let current = environment.pose()
             let time = environment.uptime()
@@ -390,6 +410,11 @@ final class FollowPursuitDriver {
             guard currentRejection == nil, let currentPose = current.pose else {
                 recordAcceptance("source_" + (currentRejection ?? "missing_pose"), job: job, source: current, at: time)
                 return .failed(.trackingLost)
+            }
+            guard let acknowledgedAt = ack else { return .failed(.commsLost) }
+            let ackAge = environment.date().timeIntervalSince(acknowledgedAt)
+            guard ackAge.isFinite, ackAge >= 0, ackAge <= RoverConfig.commsWatchdogTimeout else {
+                return .failed(.commsLost)
             }
             switch guardLayer.evaluate(forwardClearance: environment.clearance(), lastAckAt: ack,
                 now: environment.date(), feedback: nil, requireFreshAck: true, checkForwardObstacle: true) {
@@ -473,6 +498,7 @@ final class FollowPursuitDriver {
                     if let failure = await recoverExpiredCommand(expiry: depthExpiry, rawDepth: true) { return .failed(failure) }
                 }
                 environment.emit("freshness_margin_wait", ["remaining_s": .number(remaining),
+                    "acknowledgement_read_s": .number(ackReadDuration), "acknowledgement_reused": .bool(reuseAck),
                     "required_s": .number(requiredMargin), "observed_admission_s": .number(maximumAdmissionDuration),
                     "depth_capture_s": .number(captureTime),
                     "confirmed_stop_s": refreshAfter.map { .number($0.time) } ?? .null,
@@ -526,6 +552,7 @@ final class FollowPursuitDriver {
             if sendTime - lastDiagnostic >= 0.5 {
                 lastDiagnostic = sendTime
                 environment.emit("drive_tick", ["goal_x": .number(routeGoal.x), "goal_z": .number(routeGoal.y),
+                    "acknowledgement_read_s": .number(ackReadDuration), "acknowledgement_reused": .bool(reuseAck),
                     "requested_goal_x": .number(goal.x), "requested_goal_z": .number(goal.y),
                     "revision": .number(Double(revision)), "path_revision": .number(Double(routeRevision ?? 0)),
                     "planning_pending": .bool(job != nil), "depth_valid_until_s": .number(depthExpiry),

@@ -529,7 +529,8 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
             now: timestamp,
             operatorClearedRotation: FollowSearchRotationScope.authorized,
             boundedReadyMotion: ReadyMotionDepthScope.active,
-            visibilityPolicy: FollowDepthPolicyScope.current
+            visibilityPolicy: FollowDepthPolicyScope.current,
+            includeDiagnosticCoverage: FollowDepthPolicyScope.current != .astralCompatible
         )
     }
 

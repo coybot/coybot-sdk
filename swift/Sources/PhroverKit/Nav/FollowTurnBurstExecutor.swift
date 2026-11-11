@@ -52,6 +52,7 @@ enum FollowTurnOperationExecutor {
         }
         var probeIssued = false
         var sweptAngle = 0.0
+        var bestDirectedSweep = 0.0
         var sampledTravel = 0.0
         while authorized(), !Task.isCancelled {
             let selection = await admit(progress)
@@ -178,12 +179,24 @@ enum FollowTurnOperationExecutor {
                             cause: .calibrationEvidenceIncomplete)
                         return .failed(.rotationResolutionInsufficient)
                     }
-                    guard net * (sweep < 0 ? -1 : 1) >= 0 else {
+                    let sweepDirection = sweep < 0 ? -1.0 : 1.0
+                    // A small complete response may be dominated by settling or
+                    // pose noise. Large out-and-back motion is not such evidence.
+                    if net * sweepDirection <= 0, travel > profile.tolerance {
                         return .failed(.rotationResolutionInsufficient)
                     }
                     sweptAngle += net
                     sampledTravel += travel
                     guard sweptAngle.isFinite, sampledTravel.isFinite else { return .failed(.rotationResolutionInsufficient) }
+                    let directedSweep = sweptAngle * sweepDirection
+                    // Keep backward travel as a debit. Repeated small reversals
+                    // must not evade the per-response wrong-way protection.
+                    if bestDirectedSweep - directedSweep > profile.tolerance {
+                        FollowMotionTaskScope.evidence?.recordFailure(.rotationResolutionInsufficient,
+                            cause: .turnResponseOppositeDirection)
+                        return .failed(.rotationResolutionInsufficient)
+                    }
+                    bestDirectedSweep = max(bestDirectedSweep, directedSweep)
                     searchSweepProgress(sweptAngle, sampledTravel)
                     // Search covers an arc and then looks from the confirmed stopped
                     // pose. It does not reverse to recover an already swept heading.

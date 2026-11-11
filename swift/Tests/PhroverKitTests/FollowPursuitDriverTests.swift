@@ -5,6 +5,50 @@ import simd
 
 @MainActor
 final class FollowPursuitDriverTests: XCTestCase {
+    func testRecordedStartupJoinAcceptsPlannerSoftCostsButRejectsHardCells() async {
+        // Nov 10 14:57 PST: retain the captured pose, route and the single
+        // start-cell cost sufficient to reproduce path_join_blocked.
+        let path = [Vec2(-0.0162500038743012, 0.019763301312924142),
+            Vec2(0.08374999612569844, 0.11976330131292379),
+            Vec2(0.1837499961256981, 0.21976330131292343),
+            Vec2(0.2837499961256986, 0.31976330131292396),
+            Vec2(0.2837499961256986, 0.4197633013129236),
+            Vec2(0.2837499961256986, 0.5197633013129241),
+            Vec2(0.3182586567461686, 0.7896189417008743)]
+        for cost: UInt8 in [14, 252, 253, 255] {
+            let f = Fixture()
+            f.position = Vec2(-0.06614302098751068, -0.03034256584942341)
+            var map = Costmap(width: 120, height: 120, resolution: 0.1,
+                origin: Vec2(-6.066250003874302, -6.030236698687077))
+            map.setCost(60, 59, cost)
+            _ = f.driver.updateGoal(path.last!)
+            f.planProvider = { [map] _, _ in .init(path: path, map: map) }
+            f.onSend = { _ in f.position = path.last! }
+            let result = await f.driver.run()
+            let blocked = cost >= Costmap.lethalThreshold
+            XCTAssertEqual(result, blocked ? .failed(.noPath) : .arrived, "cost \(cost)")
+            XCTAssertEqual(f.commands.count, blocked ? 0 : 1, "cost \(cost)")
+        }
+    }
+
+    func testPlannerCostJoinRetainsHardClearanceAndConservativeDefault() {
+        var map = Costmap(width: 10, height: 10, resolution: 0.1)
+        let start = Vec2(0.25, 0.299)
+        let end = Vec2(0.55, 0.299)
+        map.setCost(3, 3, 253)
+        XCTAssertNil(FollowPursuitPlan(path: [end], map: map).joined(from: start),
+            "The two-centimetre margin still intersects a hard obstacle beside the segment")
+        map.setCost(3, 3, 14)
+        XCTAssertNotNil(FollowPursuitPlan(path: [end], map: map).joined(from: start))
+        XCTAssertFalse(map.isSegmentClear(from: start, to: end, margin: 0.02),
+            "Other clearance callers retain the strict soft-inflation policy")
+        XCTAssertNil(FollowPursuitPlan(path: [end], map: map).joined(from: Vec2(0.01, 0.299)),
+            "The margin cannot extend outside the captured map")
+        map.setCost(3, 2, 255)
+        XCTAssertNil(FollowPursuitPlan(path: [Vec2(0.45, 0.45)], map: map).joined(from: Vec2(0.25, 0.25)),
+            "A diagonal connector cannot cut a hard obstacle's corner")
+    }
+
     func testMovingGoalDuringEveryPlanCanStartUsingVerifiedLatestGoalTail() async {
         let f = Fixture()
         let map = Costmap(width: 80, height: 80, resolution: 0.1, origin: Vec2(-1, -1))
@@ -95,7 +139,7 @@ final class FollowPursuitDriverTests: XCTestCase {
                 case "endpoint_mismatch": return .init(path: [goal + Vec2(0.2, 0)])
                 case "path_join_blocked":
                     var map = Costmap(width: 80, height: 80, resolution: 0.1, origin: Vec2(-1, -1))
-                    map.setCost(15, 10, 1) // Preserve even soft-cost cells needed to replay segment checks.
+                    map.setCost(15, 10, Costmap.lethalThreshold) // A hard cell blocks the route connector.
                     return .init(path: [goal], map: map)
                 default:
                     f.position = Vec2(0.03, 0)
@@ -920,6 +964,58 @@ final class FollowPursuitDriverTests: XCTestCase {
         XCTAssertEqual(result, .arrived)
         XCTAssertEqual(f.commands.count, 2)
         XCTAssertTrue(f.events.contains("freshness_margin_wait"))
+    }
+
+    func testStoppedRecoveryDoesNotAgeEveryDepthPublicationByRepeatedAckReads() async {
+        let f = Fixture()
+        var capture = f.time - 0.01
+        f.depthProvider = { _ in f.observation(age: f.time - capture) }
+        f.acknowledgement = {
+            // A cross-actor acknowledgement read can resume one frame later.
+            // With the recorded 149 ms publication age this consumes the margin
+            // needed for the observed 47.6 ms transport admission.
+            if f.stops > 0 { f.time += 0.06 }
+            return Date(timeIntervalSince1970: f.time)
+        }
+        f.waitHandler = { duration in
+            f.time += Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
+            f.sequence += 1
+            capture = f.time - (f.stops > 0 ? 0.149 : (f.commands.isEmpty ? 0.01 : 0.21))
+            await Task.yield()
+        }
+        f.onSend = { _ in
+            f.time += 0.0476
+            f.sendAdmissionDuration = 0.0476
+            XCTAssertLessThan(f.time - capture, DepthSafetyEvaluator.maximumRawDepthAge)
+            if f.commands.count == 2 { f.position = Vec2(5, 0) }
+        }
+        // Force the first moving refresh, then deliver continuously clear depth.
+        f.onStop = { capture = f.time - 0.3 }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertEqual(f.commands.count, 2)
+        XCTAssertEqual(f.stops, 1)
+        XCTAssertTrue(f.events.contains("depth_wait_recovered"))
+    }
+
+    func testStoppedRecoveryCannotRenewCachedAcknowledgementOrHideCommsLoss() async {
+        let f = Fixture()
+        var stoppedAck: Date?
+        var stoppedReads = 0
+        f.depthProvider = { _ in f.observation(age: f.commands.isEmpty ? 0.01 : 0.239) }
+        f.onStop = { stoppedAck = Date(timeIntervalSince1970: f.time - 1.9) }
+        f.acknowledgement = {
+            guard f.stops > 0 else { return Date(timeIntervalSince1970: f.time) }
+            stoppedReads += 1
+            return stoppedReads == 1 ? stoppedAck : nil
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .failed(.commsLost))
+        XCTAssertEqual(f.commands.count, 1)
+        XCTAssertEqual(f.stops, 1)
+        XCTAssertEqual(stoppedReads, 2)
+        XCTAssertLessThan(f.time, 10.6)
+        XCTAssertFalse(f.events.contains("depth_wait_recovered"))
     }
 
     func testStartupGoalChurnIsThrottledAndNeverSendsObsoletePlan() async {

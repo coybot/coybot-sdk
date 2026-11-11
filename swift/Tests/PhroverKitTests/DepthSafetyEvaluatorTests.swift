@@ -5,6 +5,60 @@ import RoverNav
 @testable import PhroverKit
 
 final class DepthSafetyEvaluatorTests: XCTestCase {
+    @MainActor
+    func testControlDepthCoverageTiming() throws {
+        var scene = liveNearBlindSnapshot()
+        scene.history = try (1...20).map { try rememberedFrame(back: 0, age: Double($0) * 0.09, cells: []) }
+        let command = WheelCommand(left: 0.2, right: 0.25)
+        var elapsed: [Double] = []
+        for diagnostics in [true, false] {
+            let begin = ProcessInfo.processInfo.systemUptime
+            for _ in 0..<100 {
+                let result = DepthSafetyEvaluator.evaluate(scene, command: command, now: 10.18,
+                    visibilityPolicy: .astralCompatible, includeDiagnosticCoverage: diagnostics)
+                XCTAssertEqual(result.state, .clear)
+            }
+            elapsed.append((ProcessInfo.processInfo.systemUptime - begin) * 10)
+        }
+        // Report rather than assert a noisy wall-clock threshold. Differential
+        // safety tests assert semantic equivalence independently of machine load.
+        XCTContext.runActivity(named: "Depth evaluation ms per call: shadow=\(elapsed[0]), control=\(elapsed[1])") { _ in }
+    }
+
+    func testSkippingShadowCoveragePreservesLiveAndRememberedCollisionDecisions() throws {
+        let live = liveNearBlindSnapshot()
+        let hazards = Set((-1...1).map { DepthSafetyCell(lateralIndex: $0, heightIndex: 1, forwardIndex: 2) })
+        for remembered in [false, true] {
+            for cells in [Set<DepthSafetyCell>(), hazards] {
+                var scene = DepthSafetySnapshot(timestamp: 10, cells: remembered ? [] : cells,
+                    cellResolution: 0.04, validSampleRatio: 1, geometry: geometry,
+                    projection: live.projection, failureReason: nil)
+                if remembered { scene.history = [try rememberedFrame(back: 0, age: 0.1, cells: cells)] }
+                for command in [WheelCommand(left: 0.25, right: 0.25), .init(left: 0.2, right: 0.25),
+                                .init(left: -0.25, right: 0.25), .init(left: -0.2, right: -0.2)] {
+                    for age in [0.18, 0.251] {
+                        let full = DepthSafetyEvaluator.evaluate(scene, command: command, now: 10 + age,
+                            visibilityPolicy: .astralCompatible)
+                        let control = DepthSafetyEvaluator.evaluate(scene, command: command, now: 10 + age,
+                            visibilityPolicy: .astralCompatible, includeDiagnosticCoverage: false)
+                        XCTAssertEqual(control.state, full.state)
+                        XCTAssertEqual(control.clearance, full.clearance)
+                        XCTAssertEqual(control.supportCount, full.supportCount)
+                        XCTAssertEqual(control.speedLimit, full.speedLimit)
+                        XCTAssertEqual(control.requiredStoppingDistance, full.requiredStoppingDistance)
+                        XCTAssertEqual(control.rememberedHazardCellCount, full.rememberedHazardCellCount)
+                        XCTAssertNil(control.coverage)
+                        let strict = DepthSafetyEvaluator.evaluate(scene, command: command, now: 10 + age)
+                        let strictWithoutDiagnostics = DepthSafetyEvaluator.evaluate(scene, command: command, now: 10 + age,
+                            includeDiagnosticCoverage: false)
+                        XCTAssertEqual(strictWithoutDiagnostics.state, strict.state)
+                        XCTAssertEqual(strictWithoutDiagnostics.coverage?.coveredPoints, strict.coverage?.coveredPoints)
+                    }
+                }
+            }
+        }
+    }
+
     func testFarSceneAndTwentyRetainedFramesDoNotConsumeNearMotionWork() throws {
         var farCells = Set<DepthSafetyCell>()
         for lateral in -40...40 { for height in 1...10 { for forward in 30...39 {

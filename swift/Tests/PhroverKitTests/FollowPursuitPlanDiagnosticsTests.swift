@@ -16,6 +16,7 @@ final class FollowPursuitPlanDiagnosticsTests: XCTestCase {
     func testSerializedCaptureReconstructsExactMapAndReplaysJoinFailure() throws {
         var map = Costmap(width: 80, height: 80, resolution: 0.1, origin: Vec2(-1, -1))
         map.setCost(15, 10, 1)
+        map.setCost(16, 10, Costmap.lethalThreshold)
         map.setCost(20, 20, 252)
         map.setCost(21, 20, 255)
         let plan = FollowPursuitPlan(path: [Vec2(5, 0)], map: map)
@@ -43,6 +44,7 @@ final class FollowPursuitPlanDiagnosticsTests: XCTestCase {
         XCTAssertEqual(replayPath, plan.path)
         XCTAssertNil(FollowPursuitPlan(path: replayPath, map: replayMap).joined(from: .zero))
         XCTAssertEqual(fields["acceptance_reason"] as? String, "path_join_blocked")
+        XCTAssertEqual(fields["join_blocking_cost"] as? Int, Int(Costmap.lethalThreshold))
         XCTAssertNil(fields["reason"] as? String, "Envelope reason must not be confused with the acceptance reason")
     }
 

@@ -4,6 +4,84 @@ import RoverNav
 
 @MainActor
 final class NavigationFollowScanDiagnosticsTests: XCTestCase {
+    func testRecordedSmallReverseSearchResponseCanResumeWithoutCreditingNoise() async {
+        for sign in [-1.0, 1.0] {
+            let (result, sends) = await searchResponseReplay(sign: sign, mode: "recover")
+            XCTAssertEqual(result.result, .arrived)
+            XCTAssertEqual(sends, 3)
+            XCTAssertEqual(result.stopOutcome, .confirmed)
+            XCTAssertEqual(result.searchSweepProgress ?? -1, sign * 0.2, accuracy: 1e-9)
+        }
+    }
+
+    func testSearchNoiseHandlingRetainsWatchdogWrongWayAndStopFailure() async {
+        for mode in ["stalled", "wrong_way", "cumulative_reverse", "excursion", "failed_stop"] {
+            let (result, sends) = await searchResponseReplay(mode: mode)
+            switch mode {
+            case "stalled":
+                XCTAssertEqual(result.result, .failed(.stalled))
+                XCTAssertGreaterThan(sends, 1)
+                XCTAssertLessThan(sends, 12, "No-progress pulses remain bounded by the original watchdog")
+            case "wrong_way":
+                XCTAssertEqual(result.context.failureCause, .turnResponseOppositeDirection)
+                XCTAssertEqual(sends, 1)
+            case "cumulative_reverse":
+                XCTAssertEqual(result.context.failureCause, .turnResponseOppositeDirection)
+                XCTAssertEqual(sends, 5)
+            case "excursion":
+                XCTAssertEqual(result.result, .failed(.rotationResolutionInsufficient))
+                XCTAssertEqual(sends, 1, "Large out-and-back travel must not qualify as small noise")
+            default:
+                XCTAssertEqual(result.stopOutcome, .failed)
+                XCTAssertEqual(sends, 1)
+            }
+            if mode != "failed_stop" { XCTAssertEqual(result.stopOutcome, .confirmed) }
+            XCTAssertNotEqual(result.result, .arrived)
+        }
+    }
+
+    private func searchResponseReplay(sign: Double = 1, mode: String) async -> (FollowMotionResult, Int) {
+        let source = FollowRecoveryDiagnosticSourceFixture()
+        let start = 0.5793413240198485
+        source.pose = .init(position: .zero, yaw: sign * start)
+        source.capture(after: 0.001)
+        var sends = 0
+        let controller = FollowNavigationController(currentPose: { nil }, forwardClearance: { 2 },
+            plan: { _, _ in nil }, lastAckAt: { Date(timeIntervalSince1970: source.uptime) },
+            sendCommand: { command in
+                sends += 1
+                XCTAssertEqual(command.left, -sign * 0.25)
+                let authorization = FollowTurnBurstTransportScope.authorization!
+                XCTAssertEqual(authorization.deadline - authorization.sendEntryUptime, 0.08, accuracy: 1e-9)
+                source.uptime += 0.08780962508171797
+            }, stopRover: {
+                source.uptime += 0.026920541655272245
+                if mode == "failed_stop", sends > 0 { throw URLError(.timedOut) }
+                if mode == "excursion", sends > 0 {
+                    source.pose = .init(position: .zero, yaw: sign * (start + 0.2))
+                    source.capture(after: 0.001)
+                }
+            }, sleep: { duration in
+                if sends > 0 {
+                    let delta: Double
+                    switch mode {
+                    case "wrong_way": delta = -0.13
+                    case "cumulative_reverse": delta = -0.03 * Double(sends)
+                    case "stalled": delta = -0.005944669045223727
+                    default: delta = sends == 1 ? -0.005944669045223727 : (sends == 2 ? 0.1 : 0.2)
+                    }
+                    source.pose = .init(position: .zero, yaw: sign * (start + delta))
+                }
+                await source.advance(duration)
+            }, now: { Date(timeIntervalSince1970: source.uptime) }, poseSample: { source.snapshot },
+            sourceNow: { source.uptime }, sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
+        let result = await NavigationFollowMeMotion(navigation: controller).perform(.scan(sign * .pi / 18), context:
+            .init(sessionGeneration: 9, requestToken: 911, purpose: .followScan, phase: "searching",
+                isSearchSweep: true, allowsAcquisitionRotationWithoutDepth: true))
+        return (result, sends)
+    }
+
     func testAlignmentUndershootUsesBoundedFinishingProbeAndStopsOnBadResponse() async throws {
         for ending in ["arrived", "no_progress", "failed_stop"] {
             let source = FollowRecoveryDiagnosticSourceFixture()

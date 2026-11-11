@@ -48,7 +48,10 @@ public struct Costmap: Sendable {
 
     /// Conservative straight-segment clearance against occupied and inflated cells.
     /// Include every touched cell (including boundaries), rather than sampling centers.
-    public func isSegmentClear(from start: Vec2, to end: Vec2, margin: Double) -> Bool {
+    /// By default even soft inflation blocks clearance. A route connector may
+    /// explicitly use the planner's lethal threshold for traversable soft costs.
+    public func isSegmentClear(from start: Vec2, to end: Vec2, margin: Double,
+                               blockingCost: UInt8 = 1) -> Bool {
         guard start.x.isFinite, start.y.isFinite, end.x.isFinite, end.y.isFinite,
               margin.isFinite, margin >= 0 else { return false }
         let low = Vec2(min(start.x, end.x) - margin, min(start.y, end.y) - margin)
@@ -60,7 +63,7 @@ public struct Costmap: Sendable {
         let last = worldToCell(high)
         let delta = end - start
         for cy in max(0, first.cy - 1)...min(height - 1, last.cy + 1) {
-            for cx in max(0, first.cx - 1)...min(width - 1, last.cx + 1) where cost(cx, cy) > 0 {
+            for cx in max(0, first.cx - 1)...min(width - 1, last.cx + 1) where cost(cx, cy) >= blockingCost {
                 let x = origin.x + Double(cx) * resolution
                 let y = origin.y + Double(cy) * resolution
                 var entry = 0.0

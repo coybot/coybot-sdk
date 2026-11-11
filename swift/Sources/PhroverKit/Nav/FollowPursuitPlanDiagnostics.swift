@@ -47,6 +47,7 @@ struct FollowPursuitPlanDiagnostics {
             "endpoint_tolerance_m": plan.map { .number($0.endpointTolerance) } ?? .null,
             "endpoint_error_m": endpoint.flatMap { end in capturedGoal.map { .number(end.distance(to: $0)) } } ?? .null,
             "join_margin_m": .number(FollowPursuitPlan.joinMargin),
+            "join_blocking_cost": .number(Double(Costmap.lethalThreshold)),
             "join_evaluation": .string(reason == "path_join_blocked" || reason == "active_route_join_blocked" ? "blocked" : "not_reached_or_not_required"),
             "unmapped_pose_shift_limit_m": .number(FollowPursuitDriver.maximumUnmappedPoseShift),
             "pose_displacement_m": capturedSource?.pose.flatMap { captured in

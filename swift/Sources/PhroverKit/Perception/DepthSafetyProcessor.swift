@@ -64,6 +64,8 @@ final class DepthSafetyProcessor {
                 if published - lastTimingLog >= 1 {
                     lastTimingLog = published
                     RuntimeFileLog.append("depth_pipeline_timing", fields: [
+                        "thermal_state": String(ProcessInfo.processInfo.thermalState.rawValue),
+                        "low_power_mode": String(ProcessInfo.processInfo.isLowPowerModeEnabled),
                         "source_timestamp_s": String(job.input.timestamp),
                         "capture_to_submit_s": String(job.submitted - job.input.timestamp),
                         "submit_to_worker_s": String(started - job.submitted),

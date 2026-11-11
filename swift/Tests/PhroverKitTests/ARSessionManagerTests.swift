@@ -255,6 +255,32 @@ final class ARSessionManagerTests: XCTestCase {
         XCTAssertEqual(ar.latestDepthSafetySnapshot?.history.count, 0)
     }
 
+    func testFollowControlDepthAvoidsDiagnosticOnlyCoverageButKeepsSafety() throws {
+        let ar = ARSessionManager()
+        ar.ingestDepthSafety(rawDepthMap: makeDepth(2), intrinsics: matrix_identity_float3x3,
+            cameraTransform: matrix_identity_float4x4, timestamp: 10)
+        let snapshot = try XCTUnwrap(ar.latestDepthSafetySnapshot)
+        let command = WheelCommand(left: 0.2, right: 0.25)
+        let diagnostic = DepthSafetyEvaluator.evaluate(snapshot, command: command, now: 10.18,
+            visibilityPolicy: .astralCompatible)
+        XCTAssertNotNil(diagnostic.coverage)
+        let control = FollowDepthPolicyScope.$current.withValue(.astralCompatible) {
+            ar.depthSafetyObservation(for: command, at: 10.18)
+        }
+        XCTAssertEqual(control.state, diagnostic.state)
+        XCTAssertEqual(control.clearance, diagnostic.clearance)
+        XCTAssertEqual(control.supportCount, diagnostic.supportCount)
+        XCTAssertEqual(control.requiredStoppingDistance, diagnostic.requiredStoppingDistance)
+        XCTAssertNil(control.coverage, "Shadow full-volume analysis must not delay an Astral-compatible control decision")
+        XCTAssertNil(control.fullVolumeWouldBlock, "Skipped diagnostics must not claim the full-volume policy passed")
+        let stale = FollowDepthPolicyScope.$current.withValue(.astralCompatible) {
+            ar.depthSafetyObservation(for: command, at: 10.251)
+        }
+        XCTAssertEqual(stale.state, .unavailable(.staleRawDepth))
+        let strict = ar.depthSafetyObservation(for: command, at: 10.18)
+        XCTAssertNotNil(strict.coverage, "Full-volume policy must still evaluate coverage")
+    }
+
     func testSnapshotPreservesDepthConfidenceOrientationAndIngressEvidence() throws {
         var image: CVPixelBuffer?
         var confidence: CVPixelBuffer?

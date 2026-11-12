@@ -307,6 +307,27 @@ final class ARSessionManagerTests: XCTestCase {
         }
     }
 
+    func testGroundDepthEvidenceRequiresFreshHistoryAndIsRevokedByReset() async {
+        let ar = ARSessionManager()
+        ar.resetTracking(generation: 1, runSession: false)
+        ar.ingestForTesting(image: makeImage(), timestamp: 10.2, cameraTransform: matrix_identity_float4x4,
+            intrinsics: matrix_identity_float3x3, imageResolution: CGSize(width: 8, height: 6),
+            depthMap: nil, trackingQuality: .normal)
+        XCTAssertNil(ar.groundDepthEvidence(at: 10.21))
+        for time in [10.0, 10.1] {
+            let published = expectation(description: "depth \(time)")
+            let remove = ar.observeDepthSafety { if $0?.timestamp == time { published.fulfill() } }
+            ar.enqueueDepthSafety(rawDepthMap: makeDepth(2), intrinsics: matrix_identity_float3x3,
+                cameraTransform: matrix_identity_float4x4, timestamp: time)
+            await fulfillment(of: [published], timeout: 2)
+            remove()
+        }
+        XCTAssertNotNil(ar.groundDepthEvidence(at: 10.21))
+        XCTAssertNil(ar.groundDepthEvidence(at: 10.4))
+        ar.resetTracking(generation: 2, runSession: false)
+        XCTAssertNil(ar.groundDepthEvidence(at: 10.21))
+    }
+
     func testSnapshotPreservesDepthConfidenceOrientationAndIngressEvidence() throws {
         var image: CVPixelBuffer?
         var confidence: CVPixelBuffer?

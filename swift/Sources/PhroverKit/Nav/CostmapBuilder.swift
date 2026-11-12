@@ -12,6 +12,7 @@ public enum CostmapBuilder {
         let worldVertices: [SIMD3<Float>]
         var expectedFloorY: Float? = nil
         var classifiedFloorY: Float? = nil
+        var groundDepth: GroundDepthEvidence? = nil
     }
 
     /// Owns copied bytes, never ARKit or Metal storage. Coordinate transformation
@@ -76,7 +77,8 @@ public enum CostmapBuilder {
 
     @MainActor
     static func planFollowAsync(from anchors: [ARMeshAnchor], start: Vec2, goal: Vec2,
-                                expectedFloorY: Float? = nil, classifiedFloorY: Float? = nil) async -> FollowPursuitPlan? {
+                                expectedFloorY: Float? = nil, classifiedFloorY: Float? = nil,
+                                groundDepth: GroundDepthEvidence? = nil) async -> FollowPursuitPlan? {
         let began = ProcessInfo.processInfo.systemUptime
         var local: [LocalMeshSnapshot] = []
         for anchor in anchors {
@@ -100,7 +102,7 @@ public enum CostmapBuilder {
         let worker = Task.detached(priority: .utility) {
             guard !Task.isCancelled else { return nil as FollowPursuitPlan? }
             let snapshot = MeshSnapshot(worldVertices: capturedLocal.flatMap { $0.worldVertices() },
-                expectedFloorY: expectedFloorY, classifiedFloorY: classifiedFloorY)
+                expectedFloorY: expectedFloorY, classifiedFloorY: classifiedFloorY, groundDepth: groundDepth)
             guard !Task.isCancelled else { return nil }
             return computeFollowPlan(snapshot, start: start, goal: goal)
         }
@@ -221,6 +223,9 @@ public enum CostmapBuilder {
         let localFloor = LocalGroundPlane.assess(vertices: snapshot.worldVertices, center: center,
             expectedFloorY: snapshot.expectedFloorY, classifiedFloorY: snapshot.classifiedFloorY)
         var localDropVertices = 0
+        var lowerVerdicts: [Int: GroundDepthEvidence.Verdict] = [:]
+        var unresolvedStartCells: Set<Int> = []
+        var otherStartBlockers = 0
 
         var nearbyObstacleCount = 0
         var nearbyObstacleSamples: [String] = []
@@ -236,20 +241,32 @@ public enum CostmapBuilder {
             observed.markObserved(at: groundPoint)
             let supportedHeight = localFloor.plane?.height(at: groundPoint)
             let classificationFloor = supportedHeight ?? floorY
-            let drop = supportedHeight != nil && world.y < classificationFloor - 0.05
+            let lowerReference = localFloor.plane?.lowerHazardReference(at: groundPoint)
+            let drop = lowerReference.map { world.y < $0 - 0.05 } ?? false
             if drop { localDropVertices += 1 }
+            let seed = map.worldToCell(groundPoint)
+            var unresolvedLower = false
+            if drop, let plane = localFloor.plane, plane.reconcileLowerGeometry,
+               map.inBounds(seed.cx, seed.cy) {
+                let key = seed.cy * cells + seed.cx
+                let verdict = lowerVerdicts[key] ?? snapshot.groundDepth?.assess(cellX: seed.cx, cellZ: seed.cy, map: map, plane: plane) ?? .unresolved
+                lowerVerdicts[key] = verdict
+                if verdict == .floorObserved { continue }
+                unresolvedLower = verdict == .unresolved
+            }
             guard drop || isObstacleHeight(
                 world.y,
                 floorY: classificationFloor,
                 floorBand: params.floorBand,
                 ceilingBand: params.ceilingBand
             ) else { continue }
-            let seed = map.worldToCell(groundPoint)
             map.setCost(seed.cx, seed.cy, Costmap.lethal)
             let dx = seed.cx - startCell.cx, dz = seed.cy - startCell.cy
             // Costmap inflation makes the immediate axial-neighbor ring lethal;
             // further rings add soft cost. Keep this evidence aligned with that rule.
             if (dx == 0 && dz == 0) || (params.inflationRadius > 0 && abs(dx) + abs(dz) <= 1) {
+                if unresolvedLower { unresolvedStartCells.insert(seed.cy * cells + seed.cx) }
+                else { otherStartBlockers += 1 }
                 blockingVertices += 1
                 if blockingSamples.count < 16, blockingSampledCells.insert(seed.cy * cells + seed.cx).inserted {
                     blockingSamples.append(String(format: "%.6f,%.6f,%.6f", Double(world.x), Double(world.y), Double(world.z)))
@@ -280,6 +297,11 @@ public enum CostmapBuilder {
             "start_blocking_samples_world_xyz_m": blockingSamples.joined(separator: ";"),
             "raw_start_cost": String(rawCost), "inflated_start_cost": String(map.cost(startCell.cx, startCell.cy)),
             "nearby_obstacle_vertex_count": String(nearbyObstacleCount),
+            "lower_mesh_refuted_cells": String(lowerVerdicts.values.filter { $0 == .floorObserved }.count),
+            "lower_mesh_confirmed_cells": String(lowerVerdicts.values.filter { $0 == .lowerSurfaceObserved }.count),
+            "lower_mesh_unresolved_cells": String(lowerVerdicts.values.filter { $0 == .unresolved }.count),
+            "start_geometry_conflict": String(!unresolvedStartCells.isEmpty && otherStartBlockers == 0),
+            "ground_depth_capture_age_s": snapshot.groundDepth.map { String($0.capturedAt - $0.newestTimestamp) } ?? "unavailable",
             "local_obstacle_samples_dx_height_dz_m": nearbyObstacleSamples.joined(separator: ";")
         ]
         diagnostics.merge(localFloor.diagnostics) { _, new in new }

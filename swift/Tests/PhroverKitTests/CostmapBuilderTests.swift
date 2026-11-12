@@ -21,12 +21,17 @@ final class CostmapBuilderTests: XCTestCase {
         let base = recordedHeightFixture()
         let lowerPatch = base + [SIMD3<Float>(0.41, -1.213, 0.41), SIMD3<Float>(0.51, -1.213, 0.41), SIMD3<Float>(0.61, -1.213, 0.41)]
         let steep = base.map { SIMD3<Float>($0.x, floor + $0.x * 0.12, $0.z) }
-        for vertices in [base.filter { $0.x >= 0 }, lowerPatch, steep] {
+        for vertices in [base.filter { $0.x >= 0 }, steep] {
             let result = LocalGroundPlane.assess(vertices: vertices, center: .zero,
                 expectedFloorY: -1.25, classifiedFloorY: floor)
             XCTAssertNil(result.plane)
             XCTAssertEqual(result.diagnostics["local_floor_status"], "rejected")
         }
+        let localized = CostmapBuilder.buildWithObserved(from: .init(worldVertices: lowerPatch,
+            expectedFloorY: -1.25, classifiedFloorY: floor), center: .zero)
+        XCTAssertEqual(localized.diagnostics["local_floor_status"], "accepted")
+        let lowerCell = localized.map.worldToCell(Vec2(0.41, 0.41))
+        XCTAssertTrue(localized.map.isBlocked(lowerCell.cx, lowerCell.cy), "Unsupported lower geometry stays a local hazard")
         XCTAssertNil(LocalGroundPlane.assess(vertices: base, center: .zero,
             expectedFloorY: -1.25, classifiedFloorY: .nan).plane)
     }

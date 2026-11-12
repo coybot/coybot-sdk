@@ -26,6 +26,7 @@ struct LocalGroundPlane: Sendable {
     let maxX: Double
     let minZ: Double
     let maxZ: Double
+    var reconcileLowerGeometry = false
 
     func height(at point: Vec2) -> Float? {
         let x = point.x - center.x, z = point.y - center.y
@@ -33,12 +34,20 @@ struct LocalGroundPlane: Sendable {
         return Float(height + xSlope * x + zSlope * z)
     }
 
+    /// Extrapolation is allowed only to mark lower/unknown space as blocked,
+    /// never to clear it or classify above-floor geometry outside support.
+    func lowerHazardReference(at point: Vec2) -> Float? {
+        guard reconcileLowerGeometry, point.distance(to: center) <= 1.2 else { return height(at: point) }
+        return Float(height + xSlope * (point.x - center.x) + zSlope * (point.y - center.y))
+    }
+
     static func assess(vertices: [SIMD3<Float>], center: Vec2, expectedFloorY: Float?, classifiedFloorY: Float? = nil)
         -> (plane: Self?, diagnostics: [String: String]) {
         let mounted = assessReferenced(vertices: vertices, center: center, expectedFloorY: expectedFloorY)
         var result = mounted
         if mounted.plane == nil, let classifiedFloorY, classifiedFloorY.isFinite {
-            result = assessReferenced(vertices: vertices, center: center, expectedFloorY: classifiedFloorY)
+            result = assessReferenced(vertices: vertices, center: center, expectedFloorY: classifiedFloorY,
+                localizeLowerConflicts: true)
             result.diagnostics["mounted_floor_rejection"] = mounted.diagnostics["local_floor_rejection"]
             result.diagnostics["local_floor_reference_source"] = "classified_floor"
         } else {
@@ -49,7 +58,8 @@ struct LocalGroundPlane: Sendable {
         return result
     }
 
-    private static func assessReferenced(vertices: [SIMD3<Float>], center: Vec2, expectedFloorY: Float?)
+    private static func assessReferenced(vertices: [SIMD3<Float>], center: Vec2, expectedFloorY: Float?,
+                                         localizeLowerConflicts: Bool = false)
         -> (plane: Self?, diagnostics: [String: String]) {
         var fields = ["local_floor_status": "rejected", "mounted_floor_reference_y_m": expectedFloorY.map { String($0) } ?? "unavailable"]
         var fitCells: [SIMD3<Double>] = []
@@ -116,14 +126,16 @@ struct LocalGroundPlane: Sendable {
         // raised surface. Do not reinterpret that scene as a single clear plane.
         let lowerCells = all.filter { $0.y < c + a * $0.x + b * $0.z - 0.05 }.count
         fields["local_floor_conflicting_lower_cells"] = String(lowerCells)
-        guard lowerCells < 3 else { return reject("multiple_floor_levels") }
+        guard lowerCells < 3 || localizeLowerConflicts else { return reject("multiple_floor_levels") }
+        fields["local_floor_lower_conflict_policy"] = localizeLowerConflicts ? "per_cell_depth_validation" : "reject_plane"
         fields["local_floor_status"] = "accepted"
         fields["local_floor_y_at_start_m"] = String(c)
         fields["local_floor_x_slope"] = String(a)
         fields["local_floor_z_slope"] = String(b)
         fields["local_floor_rms_m"] = String(rms)
         fields["local_floor_support_bounds_dx_dz_m"] = "\(minX),\(maxX),\(minZ),\(maxZ)"
-        return (.init(center: center, xSlope: a, zSlope: b, height: c, minX: minX, maxX: maxX, minZ: minZ, maxZ: maxZ), fields)
+        return (.init(center: center, xSlope: a, zSlope: b, height: c, minX: minX, maxX: maxX, minZ: minZ, maxZ: maxZ,
+            reconcileLowerGeometry: localizeLowerConflicts), fields)
     }
 
     private static func fit(_ points: [SIMD3<Double>]) -> (Double, Double, Double)? {

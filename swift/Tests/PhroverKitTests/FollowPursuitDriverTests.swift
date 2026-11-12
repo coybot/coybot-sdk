@@ -5,6 +5,97 @@ import simd
 
 @MainActor
 final class FollowPursuitDriverTests: XCTestCase {
+    func testUnresolvedStartingGeometryHasDistinctFailureWithoutMotion() async {
+        let f = Fixture()
+        f.planProvider = { _, _ in .init(path: [], rejection: .startBlocked,
+            diagnostics: ["start_geometry_conflict": "true"]) }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .failed(.noPath))
+        XCTAssertEqual(f.driver.failureCause, .pursuitMapGeometryConflict)
+        XCTAssertTrue(f.commands.isEmpty)
+    }
+
+    func testApproachingNormalStopUsesLowSpeedBeforeArrival() async {
+        let f = Fixture()
+        f.position = Vec2(4.7, 0) // 30 cm from the stand-off goal, just outside arrival.
+        f.onSend = { command in
+            XCTAssertGreaterThan(command.left, 0)
+            XCTAssertLessThanOrEqual(max(command.left, command.right), 0.04 + 1e-9)
+            f.position = Vec2(4.81, 0)
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertEqual(f.commands.count, 1)
+    }
+
+    func testMovingGoalDuringEveryReplanCanReplaceActiveRouteWithoutStopping() async {
+        let f = Fixture()
+        let map = Costmap(width: 100, height: 100, resolution: 0.1, origin: Vec2(-1, -1))
+        f.planProvider = { start, goal in
+            f.time += 0.3
+            _ = f.driver.updateGoal(goal + Vec2(0.12, 0))
+            return .init(path: [start, goal], map: map)
+        }
+        f.onSend = { _ in
+            if f.commands.count == 1 { _ = f.driver.updateGoal(Vec2(5.5, 0)) }
+            if f.paths.count >= 2 { f.position = f.driver.goal }
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertGreaterThanOrEqual(f.paths.count, 2)
+        XCTAssertEqual(f.paths.last?.last, f.driver.goal)
+        XCTAssertEqual(f.stops, 0)
+    }
+
+    func testForwardPursuitStartsGentlyAndDoesNotJumpToCruiseSpeed() async {
+        let f = Fixture()
+        f.onSend = { _ in if f.commands.count >= 6 { f.position = Vec2(5, 0) } }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertEqual(f.commands.count, 6)
+        XCTAssertLessThanOrEqual(f.commands[0].left, 0.1)
+        XCTAssertGreaterThan(f.commands[5].left, f.commands[0].left)
+        for (previous, next) in zip(f.commands, f.commands.dropFirst()) {
+            XCTAssertLessThanOrEqual(next.left - previous.left, 0.05 + 1e-9)
+        }
+    }
+
+    func testMovingRetargetCannotAcceptBlockedNewTail() async {
+        let f = Fixture()
+        let clear = Costmap(width: 100, height: 100, resolution: 0.1, origin: Vec2(-1, -1))
+        f.planProvider = { start, goal in
+            var map = clear
+            if !f.commands.isEmpty {
+                let replacement = goal + Vec2(0.12, 0)
+                _ = f.driver.updateGoal(replacement)
+                let cell = map.worldToCell(replacement)
+                map.setCost(cell.cx, cell.cy, 1)
+            }
+            return .init(path: [start, goal], map: map)
+        }
+        f.onSend = { _ in if f.commands.count == 1 { _ = f.driver.updateGoal(Vec2(5.5, 0)) } }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .failed(.stalled))
+        XCTAssertEqual(f.paths.count, 1, "An unsafe new tail cannot replace the validated route")
+        XCTAssertEqual(f.paths.first?.last, Vec2(5, 0))
+    }
+
+    func testDepthRecoveryRestartsForwardRampFromLowSpeed() async {
+        let f = Fixture()
+        f.depthProvider = { _ in f.observation(age: f.commands.count >= 5 && f.stops == 0 ? 0.26 : 0.01) }
+        f.onSend = { command in
+            if f.stops > 0 {
+                XCTAssertLessThanOrEqual(max(command.left, command.right), 0.1)
+                f.position = Vec2(5, 0)
+            }
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertEqual(f.stops, 1)
+        XCTAssertEqual(f.commands.count, 6)
+        XCTAssertGreaterThan(f.commands[4].left, f.commands[0].left)
+    }
+
     func testRecordedStartupJoinAcceptsPlannerSoftCostsButRejectsHardCells() async {
         // Nov 10 14:57 PST: retain the captured pose, route and the single
         // start-cell cost sufficient to reproduce path_join_blocked.

@@ -519,6 +519,14 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         return classifiedFloors.reference(at: position, now: now)
     }
 
+    func groundDepthEvidence(at now: Double) -> GroundDepthEvidence? {
+        guard acceptsObservations, trackingQuality == .normal, let frame = latestSnapshot,
+              frame.id.generation == sessionGeneration, frame.trackingQuality == .normal,
+              now.isFinite, now >= frame.timestamp, now - frame.timestamp <= 0.5,
+              let snapshot = latestDepthSafetySnapshot else { return nil }
+        return GroundDepthEvidence(snapshot: snapshot, at: now)
+    }
+
     func depthSafetyObservation(
         for command: WheelCommand,
         at timestamp: TimeInterval = ProcessInfo.processInfo.systemUptime

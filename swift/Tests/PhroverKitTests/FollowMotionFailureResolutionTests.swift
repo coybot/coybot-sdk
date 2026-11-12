@@ -2,6 +2,17 @@ import XCTest
 @testable import PhroverKit
 
 final class FollowMotionFailureResolutionTests: XCTestCase {
+    func testGeometryConflictMessageDoesNotClaimConfirmedObstacleAndRetainsStopFailure() {
+        let context = FollowMotionOperationContext(request: nil, controllerOperationID: 1,
+            purpose: .followGoal, profile: nil, failureCause: .pursuitMapGeometryConflict)
+        var result = FollowMotionFailureResolution(.init(context: context, reason: .noPath, stopOutcome: .confirmed, source: .result))
+        XCTAssertTrue(result.message.contains("Map geometry conflicts"))
+        XCTAssertTrue(result.message.contains("rescan"))
+        XCTAssertFalse(result.message.contains("Clear nearby obstacles"))
+        result.consume(.init(context: context, reason: .commandFailed, stopOutcome: .failed, source: .confirmation))
+        XCTAssertEqual(result.message, "Motor stop could not be confirmed. Motion is blocked.")
+    }
+
     func testWrongDirectionHasActionableMessageAndFailedStopStillWins() {
         let context = FollowMotionOperationContext(request: nil, controllerOperationID: 1,
             purpose: .followScan, profile: nil, failureCause: .turnResponseOppositeDirection)

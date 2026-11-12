@@ -206,6 +206,7 @@ final class FollowPursuitDriver {
         var lastPlan = began
         var sent = false
         var movementActive = false
+        var acceleration = FollowPursuitAcceleration()
         var refreshDeadline: Double?
         var refreshReason = DepthSafetyUnavailableReason.staleRawDepth
         var expiryRecoveries = 0
@@ -263,6 +264,7 @@ final class FollowPursuitDriver {
                 "transport_attempts": .number(0)])
             do { try await environment.stop() } catch { return .commandFailed }
             movementActive = false
+            acceleration.reset()
             stoppedAcknowledgement = nil
             refreshAfter = (environment.pose().frameID, environment.uptime())
             // Recovery accepts only captures after this stop. Give those captures
@@ -311,7 +313,9 @@ final class FollowPursuitDriver {
                     if let rejected = job.result?.rejection,
                        job.revision == revision || (!sent && job.stillBlocksStart(at: source)) {
                         switch rejected {
-                        case .startBlocked: failureCause = .pursuitStartBlocked
+                        case .startBlocked:
+                            failureCause = job.result?.diagnostics["start_geometry_conflict"] == "true"
+                                ? .pursuitMapGeometryConflict : .pursuitStartBlocked
                         case .goalBlocked: failureCause = .pursuitGoalBlocked
                         case .noConnectedPath: failureCause = .pursuitDisconnectedPath
                         case .startOutsideMap, .goalOutsideMap: failureCause = .pursuitOutsideMap
@@ -324,7 +328,7 @@ final class FollowPursuitDriver {
                         return .failed(.noPath)
                     }
                     var candidate = job
-                    if !sent, job.revision != revision,
+                    if job.revision != revision,
                        let updated = job.retargeted(to: goal, revision: revision, current: source) {
                         recordAcceptance("latest_goal_tail_verified", job: job, source: source, at: tick,
                             event: "planning_retargeted", includeGeometry: false)
@@ -438,11 +442,15 @@ final class FollowPursuitDriver {
                 if movementActive {
                     do { try await environment.stop() } catch { return .failed(.commandFailed) }
                     movementActive = false
+                    acceleration.reset()
                 }
                 await environment.sleep(.milliseconds(20)); continue
             }
 
-            var safeCommand = output.command
+            let distanceToGoal = currentPose.position.distance(to: joined.path.last ?? routeGoal)
+            let approaching = FollowPursuitAcceleration.approaching(output.command,
+                distance: distanceToGoal, params: pursuit.params)
+            var safeCommand = acceleration.limited(approaching, at: environment.uptime())
             var unavailable: DepthSafetyUnavailableReason?
             var depthExpiry = -Double.infinity
             let assessmentStarted = environment.uptime()
@@ -556,6 +564,10 @@ final class FollowPursuitDriver {
                     "requested_goal_x": .number(goal.x), "requested_goal_z": .number(goal.y),
                     "revision": .number(Double(revision)), "path_revision": .number(Double(routeRevision ?? 0)),
                     "planning_pending": .bool(job != nil), "depth_valid_until_s": .number(depthExpiry),
+                    "desired_command_left": .number(output.command.left), "desired_command_right": .number(output.command.right),
+                    "forward_acceleration_mps2": .number(FollowPursuitAcceleration.acceleration),
+                    "distance_to_goal_m": .number(distanceToGoal),
+                    "approach_command_left": .number(approaching.left), "approach_command_right": .number(approaching.right),
                     "required_send_margin_s": .number(requiredMargin),
                     "observed_admission_s": .number(maximumAdmissionDuration),
                     "command_left": .number(safeCommand.left), "command_right": .number(safeCommand.right)])
@@ -584,6 +596,7 @@ final class FollowPursuitDriver {
             maximumAdmissionDuration = max(maximumAdmissionDuration,
                 environment.admissionDuration() ?? (environment.uptime() - sendStarted))
             sent = true
+            acceleration.sent(safeCommand, at: sendStarted)
             movementActive = true
             if refreshDeadline != nil { environment.emit("depth_wait_recovered", [:]) }
             let completedAt = environment.uptime()

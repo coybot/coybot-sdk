@@ -273,8 +273,9 @@ final class FollowNavigationController {
         makePursuitPlan = { start, goal in
             let reference = ar.mountedFloorReference(at: ProcessInfo.processInfo.systemUptime)
             let classified = ar.classifiedFloorReference(at: start, now: ProcessInfo.processInfo.systemUptime)
+            let groundDepth = ar.groundDepthEvidence(at: ProcessInfo.processInfo.systemUptime)
             return await CostmapBuilder.planFollowAsync(from: ar.meshAnchors, start: start, goal: goal,
-                expectedFloorY: reference, classifiedFloorY: classified)
+                expectedFloorY: reference, classifiedFloorY: classified, groundDepth: groundDepth)
         }
         readySignalCostmap = { await CostmapBuilder.buildAsync(from: ar.meshAnchors, center: $0) }
         currentLastAck = { await control.lastAckAt }

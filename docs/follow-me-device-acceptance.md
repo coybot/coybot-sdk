@@ -110,6 +110,84 @@ and wraparound. Device verification must establish why the physical response
 disagreed with the request; this check prevents repeated wrong-way commands but
 does not establish a corrected physical turn calibration.
 
+### Reconciling lower mesh against a classified floor
+
+The November 12 11:21 local attempt had a classified floor at -0.84197 m and
+a fitted plane at -0.84226 m, with 195 inliers (175 required). Eighty-four lower
+mesh cells vetoed the entire plane, causing fallback to a global estimate about
+7.3 cm lower. That changed some near-rover samples from below the obstacle-height
+cutoff into blocked cells. The screenshot alone cannot establish whether lower
+geometry is stale or a real drop.
+
+For independently classified, supported floor fits, lower geometry is now a
+local hazard rather than a veto on the whole plane. A lower mesh cell can be
+discarded only when two captured raw-depth frames, at least 50 ms apart and both
+at most 250 ms old at planning capture, affirm the expected floor. Each must
+support the center and four inset corners, cover at least three distinct pixels,
+and reconstruct nearby world hits within 2 cm of the plane. Lower observations,
+occlusion, missing/invalid depth, insufficient resolution, inconsistent frames,
+and out-of-view cells stay blocked. This is capture-time map evidence, not an
+extension of transport-time depth authorization.
+
+Lower surfaces outside the supported plane bounds but within its local 1.2 m
+radius can only be marked hazardous, never cleared by extrapolation. Raised
+mesh geometry is retained even when live depth contradicts lower mesh in the
+same cell. Mount-only fits retain their original multiple-level rejection.
+
+Diagnostics distinguish `lower_mesh_refuted_cells`, `lower_mesh_confirmed_cells`,
+and `lower_mesh_unresolved_cells`. If unresolved lower geometry alone blocks the
+start, the message is "Map geometry conflicts near the rover" and asks for a
+rescan. Known obstacles and depth-confirmed lower surfaces retain the blocked-map
+message; failed stop confirmation still takes priority. Tests use controlled
+geometry and depth, not the uncaptured raw pixels from the November 12 trial.
+
+### Gradual forward requests and moving-target replans
+
+Normal arrival now also tapers forward wheel requests ahead of the stopping
+boundary. With the current pursuit settings, the cap decreases from 0.35 m/s
+at 60 cm from the path endpoint to 0.04 m/s at 30 cm, before the 20 cm arrival
+gate. It scales both wheels together and never raises an already lower request.
+The previous acceleration ramp controls any subsequent speed increase. This is
+anticipatory slowdown while perception and command authority remain valid, not
+a sequence of extra movement commands after a stop/cancellation request. Actual
+crawl and braking behavior need verification on the rover.
+
+The November 12 10:55 trial confirms the acceleration ramp and moving retargets
+were active. Its abrupt stops were depth-refresh stops, not normal goal arrival:
+depth delivery delays preceded the first stop, tracking stayed normal, and the
+operation eventually exhausted recovery attempts. This trace does not establish
+that braking vibration caused perception latency. Depth/obstacle/ownership faults
+still stop immediately; they cannot be softened by prolonging invalid motion.
+`distance_to_goal_m` and the `approach_command_*` fields expose the normal taper.
+
+The November 12 10:22–10:24 local trials got into pursuit. Logs show repeated
+depth-refresh stops and restarts directly at the 0.35 m/s command cap. In the
+last attempt the active route remained at revision 0 while the requested goal
+advanced to revision 10; the rover then received in-place turn commands and
+ended with insufficient measured progress.
+
+Forward/curved pursuit requests now start with a maximum wheel magnitude of
+0.10 m/s and increase by at most 0.25 m/s per second. Both wheels are scaled
+together to preserve curvature, and the existing cruise cap still applies.
+Only successful sends advance the ramp. Scheduling gaps contribute at most
+200 ms of ramp time, and confirmed stops reset it. Lower requested speeds and
+safety stops take effect immediately. Pure-turn breakaway commands retain their
+existing policy. These are wheel-request limits, not physical acceleration or
+gearbox calibration. The limited command is evaluated before admission and
+checked again at transport.
+
+Completed moving replans may now retarget their final leg to the newest goal,
+using the existing captured-map segment verification and current-pose join.
+Original plan deadlines, generation checks and send-revision fencing remain.
+Unsafe tails still cannot replace a validated route. Diagnostics include
+desired and final wheel commands plus `forward_acceleration_mps2`.
+
+Regression tests reproduce abrupt startup and moving-replan starvation before
+the changes. Device acceptance must verify smooth physical breakaway and route
+updates while the person moves. Depth freshness and recovery exhaustion can
+still require immediate stops; this change does not authorize blind continuous
+motion or extend those recovery deadlines.
+
 ### Geometry-backed fallback for a disagreeing mount reference
 
 Follow planning can now retry a rejected mount-referenced local floor fit using
@@ -129,8 +207,8 @@ per anchor, with at most 128 boundary vertices.
 
 The independent reference is captured with the planning snapshot. The local
 mesh must still pass the existing spatial support, 70% candidate consistency,
-slope, reference agreement, residual, surrounding-support and conflicting-lower-
-level checks. Raised geometry is still classified against the accepted plane;
+slope, reference agreement, residual and surrounding-support checks. Lower-level
+conflicts are handled locally as described above. Raised geometry is still classified against the accepted plane;
 the starting cell is never cleared. Without sufficiently stable classified floor
 evidence, a rejected mount fit retains the existing global-floor fallback.
 

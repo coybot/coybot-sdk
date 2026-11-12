@@ -176,6 +176,8 @@ struct FollowMotionFailureResolution {
                 switch context.failureCause {
                 case .pursuitStartBlocked:
                     return "Rover's starting area is blocked in the map. Clear nearby obstacles or reposition the rover, then restart following."
+                case .pursuitMapGeometryConflict:
+                    return "Map geometry conflicts near the rover. Keep the camera steady and rescan the nearby floor, then restart following."
                 case .pursuitGoalBlocked:
                     return "Following destination is blocked in the map. Move to a clear area and restart following."
                 case .pursuitDisconnectedPath:

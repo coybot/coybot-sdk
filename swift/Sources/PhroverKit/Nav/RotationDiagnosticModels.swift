@@ -55,6 +55,7 @@ enum FollowMotionFailureCause: String, Sendable {
     case pursuitAuthorizationExpired = "pursuit_authorization_expired"
     case pursuitRecoveryExhausted = "pursuit_recovery_exhausted"
     case pursuitStartBlocked = "pursuit_start_blocked"
+    case pursuitMapGeometryConflict = "pursuit_map_geometry_conflict"
     case pursuitGoalBlocked = "pursuit_goal_blocked"
     case pursuitDisconnectedPath = "pursuit_disconnected_path"
     case pursuitOutsideMap = "pursuit_outside_map"

@@ -1,8 +1,8 @@
 import Foundation
 import RoverNav
 
-/// A local mesh plane corroborated by an independently supplied mounted-camera
-/// floor reference. It never labels geometry as self-mesh or clears cells.
+/// A local mesh plane corroborated by mounted-camera height or stable classified
+/// floor geometry. It never labels geometry as self-mesh or clears cells.
 struct LocalGroundPlane: Sendable {
     static func mountedReference(captures: [(time: Double, height: Double)], cameraHeight: Double) -> Float? {
         guard cameraHeight.isFinite, cameraHeight > 0,
@@ -33,7 +33,23 @@ struct LocalGroundPlane: Sendable {
         return Float(height + xSlope * x + zSlope * z)
     }
 
-    static func assess(vertices: [SIMD3<Float>], center: Vec2, expectedFloorY: Float?)
+    static func assess(vertices: [SIMD3<Float>], center: Vec2, expectedFloorY: Float?, classifiedFloorY: Float? = nil)
+        -> (plane: Self?, diagnostics: [String: String]) {
+        let mounted = assessReferenced(vertices: vertices, center: center, expectedFloorY: expectedFloorY)
+        var result = mounted
+        if mounted.plane == nil, let classifiedFloorY, classifiedFloorY.isFinite {
+            result = assessReferenced(vertices: vertices, center: center, expectedFloorY: classifiedFloorY)
+            result.diagnostics["mounted_floor_rejection"] = mounted.diagnostics["local_floor_rejection"]
+            result.diagnostics["local_floor_reference_source"] = "classified_floor"
+        } else {
+            result.diagnostics["local_floor_reference_source"] = "mounted_camera"
+        }
+        result.diagnostics["mounted_floor_reference_y_m"] = expectedFloorY.map { String($0) } ?? "unavailable"
+        result.diagnostics["classified_floor_reference_y_m"] = classifiedFloorY.map { String($0) } ?? "unavailable"
+        return result
+    }
+
+    private static func assessReferenced(vertices: [SIMD3<Float>], center: Vec2, expectedFloorY: Float?)
         -> (plane: Self?, diagnostics: [String: String]) {
         var fields = ["local_floor_status": "rejected", "mounted_floor_reference_y_m": expectedFloorY.map { String($0) } ?? "unavailable"]
         var fitCells: [SIMD3<Double>] = []

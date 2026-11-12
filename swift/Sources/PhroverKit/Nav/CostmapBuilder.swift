@@ -11,6 +11,7 @@ public enum CostmapBuilder {
     struct MeshSnapshot: Sendable {
         let worldVertices: [SIMD3<Float>]
         var expectedFloorY: Float? = nil
+        var classifiedFloorY: Float? = nil
     }
 
     /// Owns copied bytes, never ARKit or Metal storage. Coordinate transformation
@@ -75,7 +76,7 @@ public enum CostmapBuilder {
 
     @MainActor
     static func planFollowAsync(from anchors: [ARMeshAnchor], start: Vec2, goal: Vec2,
-                                expectedFloorY: Float? = nil) async -> FollowPursuitPlan? {
+                                expectedFloorY: Float? = nil, classifiedFloorY: Float? = nil) async -> FollowPursuitPlan? {
         let began = ProcessInfo.processInfo.systemUptime
         var local: [LocalMeshSnapshot] = []
         for anchor in anchors {
@@ -98,7 +99,8 @@ public enum CostmapBuilder {
         let captured = ProcessInfo.processInfo.systemUptime
         let worker = Task.detached(priority: .utility) {
             guard !Task.isCancelled else { return nil as FollowPursuitPlan? }
-            let snapshot = MeshSnapshot(worldVertices: capturedLocal.flatMap { $0.worldVertices() }, expectedFloorY: expectedFloorY)
+            let snapshot = MeshSnapshot(worldVertices: capturedLocal.flatMap { $0.worldVertices() },
+                expectedFloorY: expectedFloorY, classifiedFloorY: classifiedFloorY)
             guard !Task.isCancelled else { return nil }
             return computeFollowPlan(snapshot, start: start, goal: goal)
         }
@@ -217,7 +219,7 @@ public enum CostmapBuilder {
         let worldHeights = snapshot.worldVertices.map(\.y)
         let floorY = estimatedFloorHeight(fromWorldHeights: worldHeights)
         let localFloor = LocalGroundPlane.assess(vertices: snapshot.worldVertices, center: center,
-            expectedFloorY: snapshot.expectedFloorY)
+            expectedFloorY: snapshot.expectedFloorY, classifiedFloorY: snapshot.classifiedFloorY)
         var localDropVertices = 0
 
         var nearbyObstacleCount = 0

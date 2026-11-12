@@ -110,6 +110,38 @@ and wraparound. Device verification must establish why the physical response
 disagreed with the request; this check prevents repeated wrong-way commands but
 does not establish a corrected physical turn calibration.
 
+### Geometry-backed fallback for a disagreeing mount reference
+
+Follow planning can now retry a rejected mount-referenced local floor fit using
+independent ARKit-classified floor geometry. Horizontal plane detection is enabled
+on LiDAR devices as well. Only horizontal anchors classified as floor and below
+the camera contribute; arbitrary horizontal/table planes do not provide this
+reference. Legacy non-LiDAR object grounding remains separate.
+
+The classified-floor tracker requires three distinct geometry updates spanning
+at least 150 ms, all within two seconds, agreeing in height within 2 cm at the
+rover position. Each observed boundary must contain the rover center with a
+25 cm inset. Competing overlapping floor levels, steep/invalid geometry, stale
+tracking, removed or reclassified anchors, interruption, pause and reset revoke
+the reference. Merely reading the same anchor on later camera frames does not
+renew the evidence. Tracker storage is bounded to 32 anchors and three updates
+per anchor, with at most 128 boundary vertices.
+
+The independent reference is captured with the planning snapshot. The local
+mesh must still pass the existing spatial support, 70% candidate consistency,
+slope, reference agreement, residual, surrounding-support and conflicting-lower-
+level checks. Raised geometry is still classified against the accepted plane;
+the starting cell is never cleared. Without sufficiently stable classified floor
+evidence, a rejected mount fit retains the existing global-floor fallback.
+
+Diagnostics retain `mounted_floor_reference_y_m` and the original
+`mounted_floor_rejection` when the classified fallback is attempted. They also
+record `classified_floor_reference_y_m` and `local_floor_reference_source`
+(`mounted_camera` or `classified_floor`). On device, verify that a new session
+collects stable floor anchors and uses the fallback when the mount disagrees.
+This does not guarantee that the November 12 blocking samples become traversable:
+some remain over 10 cm above even the independently fitted floor.
+
 ### Depth control cost and November 11 follow-up
 
 The November 11 11:24 local run recovered once, then exhausted the next 600 ms

@@ -98,6 +98,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     public private(set) var pose: Pose2D?
     public var meshAnchors: [ARMeshAnchor] { meshStore.anchors }
     private var meshStore = MeshAnchorStore<ARMeshAnchor>()
+    @ObservationIgnored var classifiedFloors = ClassifiedFloorTracker()
     /// Nearest obstacle distance (m) in a forward cone from the latest depth frame.
     private(set) var latestDepthSafetySnapshot: DepthSafetySnapshot? {
         didSet {
@@ -333,6 +334,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     }
 
     func resetTracking(generation: UInt64, runSession: Bool) {
+        classifiedFloors.clear()
         revokeFollowSearchClearances()
         depthProcessor.invalidate()
         hasResetTracking = true
@@ -381,16 +383,15 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
             config.frameSemantics.insert(.smoothedSceneDepth)
         }
-        // Without LiDAR there is no depth map; the floor plane is what everything is
-        // placed on instead (see `groundPoint(boundingBox:label:)`).
-        if !hasLiDAR {
-            config.planeDetection = [.horizontal]
-        }
+        // Classified floor anchors provide independent local-ground evidence on
+        // LiDAR devices too. Non-LiDAR grounding still uses horizontal planes.
+        config.planeDetection = [.horizontal]
         session.run(config, options: [.resetTracking, .removeExistingAnchors])
         acceptsObservations = true
     }
 
     public func pause() {
+        classifiedFloors.clear()
         acceptsObservations = false
         revokeFollowSearchClearances()
         depthProcessor.invalidate()
@@ -511,6 +512,13 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         return LocalGroundPlane.mountedReference(captures: captures, cameraHeight: RoverConfig.cameraMountCalibration.cameraHeight)
     }
 
+    func classifiedFloorReference(at position: Vec2, now: Double) -> Float? {
+        guard acceptsObservations, trackingQuality == .normal, let frame = latestSnapshot,
+              frame.trackingQuality == .normal, frame.id.generation == sessionGeneration,
+              now.isFinite, now >= frame.timestamp, now - frame.timestamp <= 0.5 else { return nil }
+        return classifiedFloors.reference(at: position, now: now)
+    }
+
     func depthSafetyObservation(
         for command: WheelCommand,
         at timestamp: TimeInterval = ProcessInfo.processInfo.systemUptime
@@ -591,6 +599,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
             return false
         }
         let observedAt = ProcessInfo.processInfo.systemUptime
+        if observation.trackingQuality != .normal { classifiedFloors.clear() }
         for grant in followSearchClearances.compactMap(\.value) { grant.observeIngress(observation, now: observedAt) }
         followSearchClearances.removeAll { $0.value == nil || $0.value?.revoked == true }
         latestObservation = observation
@@ -603,6 +612,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     }
 
     private func suspendObservations() {
+        classifiedFloors.clear()
         revokeFollowSearchClearances()
         depthProcessor.invalidate()
         turnEvidence.clear()
@@ -707,6 +717,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     }
 
     public func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
+        classifiedFloors.remove(Set(anchors.map(\.identifier)))
         // Removal is valid even during tracking loss. It is not a new trusted
         // geometry observation and must not satisfy a recovery refresh gate.
         let removed = meshStore.remove(identifiers: Set(anchors.map(\.identifier)))
@@ -720,7 +731,28 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     }
 
     private func collectFloor(_ anchors: [ARAnchor]) {
-        guard let cameraY = latestCamera?.transform.columns.3.y else { return }
+        if acceptsObservations, trackingQuality == .normal, let snapshot = latestSnapshot,
+           snapshot.trackingQuality == .normal {
+            for anchor in anchors.compactMap({ $0 as? ARPlaneAnchor }) {
+                let transform = anchor.transform
+                let origin = SIMD3<Double>(Double(transform.columns.3.x), Double(transform.columns.3.y), Double(transform.columns.3.z))
+                let normal = SIMD3<Double>(Double(transform.columns.1.x), Double(transform.columns.1.y), Double(transform.columns.1.z))
+                let boundary = anchor.geometry.boundaryVertices.map { vertex -> Vec2 in
+                    let world = transform * SIMD4<Float>(vertex.x, vertex.y, vertex.z, 1)
+                    return Vec2(Double(world.x), Double(world.z))
+                }
+                let classified = anchor.classification == .floor && anchor.alignment == .horizontal &&
+                    origin.y < Double(snapshot.cameraTransform.columns.3.y) - 0.05
+                let plane = classified ? ClassifiedFloorTracker.Plane(origin: origin, normal: normal, boundary: boundary) : nil
+                classifiedFloors.record(id: anchor.identifier, timestamp: snapshot.timestamp, plane: plane)
+            }
+        } else {
+            classifiedFloors.clear()
+        }
+        // The legacy unclassified horizontal-plane grounding is for cameras
+        // without depth. Enabling classified planes must not turn a LiDAR
+        // tabletop into the floor used by object/person projection fallbacks.
+        guard !hasLiDAR, let cameraY = latestCamera?.transform.columns.3.y else { return }
         let heights = anchors
             .compactMap { $0 as? ARPlaneAnchor }
             .filter { $0.alignment == .horizontal }

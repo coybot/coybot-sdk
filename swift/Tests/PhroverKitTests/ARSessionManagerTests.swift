@@ -281,6 +281,32 @@ final class ARSessionManagerTests: XCTestCase {
         XCTAssertNotNil(strict.coverage, "Full-volume policy must still evaluate coverage")
     }
 
+    func testClassifiedFloorReferenceIsRevokedByTrackingAndLifecycleChanges() throws {
+        for fault in ["tracking", "pause", "reset", "remove"] {
+            let ar = ARSessionManager()
+            ar.resetTracking(generation: 1, runSession: false)
+            ar.ingestForTesting(image: makeImage(), timestamp: 10.2, cameraTransform: matrix_identity_float4x4,
+                intrinsics: matrix_identity_float3x3, imageResolution: CGSize(width: 8, height: 6),
+                depthMap: nil, trackingQuality: .normal)
+            let anchor = ARAnchor(transform: matrix_identity_float4x4)
+            let plane = try XCTUnwrap(ClassifiedFloorTracker.Plane(origin: SIMD3(0, -0.4, 0), normal: SIMD3(0, 1, 0),
+                boundary: [Vec2(-1, -1), Vec2(1, -1), Vec2(1, 1), Vec2(-1, 1)]))
+            for time in [10.0, 10.1, 10.2] { ar.classifiedFloors.record(id: anchor.identifier, timestamp: time, plane: plane) }
+            XCTAssertNotNil(ar.classifiedFloorReference(at: .zero, now: 10.3))
+            XCTAssertNil(ar.classifiedFloorReference(at: .zero, now: 10.8), "Fresh floor evidence cannot revive stale tracking")
+            switch fault {
+            case "tracking":
+                ar.ingestForTesting(image: makeImage(), timestamp: 10.3, cameraTransform: matrix_identity_float4x4,
+                    intrinsics: matrix_identity_float3x3, imageResolution: CGSize(width: 8, height: 6),
+                    depthMap: nil, trackingQuality: .limited)
+            case "pause": ar.pause()
+            case "reset": ar.resetTracking(generation: 2, runSession: false)
+            default: ar.session(ar.session, didRemove: [anchor])
+            }
+            XCTAssertNil(ar.classifiedFloorReference(at: .zero, now: 10.4), fault)
+        }
+    }
+
     func testSnapshotPreservesDepthConfidenceOrientationAndIngressEvidence() throws {
         var image: CVPixelBuffer?
         var confidence: CVPixelBuffer?

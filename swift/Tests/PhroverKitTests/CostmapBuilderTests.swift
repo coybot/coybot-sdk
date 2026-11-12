@@ -3,6 +3,34 @@ import RoverNav
 @testable import PhroverKit
 
 final class CostmapBuilderTests: XCTestCase {
+    func testClassifiedFloorCanReplaceDisagreeingMountWithoutClearingRaisedGeometry() {
+        for reference: Float? in [-1.25, nil] {
+            let vertices = recordedHeightFixture()
+            let result = CostmapBuilder.buildWithObserved(from: .init(worldVertices: vertices,
+                expectedFloorY: reference, classifiedFloorY: -1.084145), center: .zero)
+            XCTAssertEqual(result.diagnostics["local_floor_reference_source"], "classified_floor")
+            XCTAssertEqual(result.diagnostics["raw_start_cost"], "0")
+            let blocked = CostmapBuilder.buildWithObserved(from: .init(worldVertices: recordedHeightFixture(raisedObstacle: true),
+                expectedFloorY: reference, classifiedFloorY: -1.084145), center: .zero)
+            XCTAssertEqual(blocked.diagnostics["raw_start_cost"], "255")
+        }
+    }
+
+    func testClassifiedFallbackStillRejectsUnsupportedAndConflictingMesh() {
+        let floor: Float = -1.084145
+        let base = recordedHeightFixture()
+        let lowerPatch = base + [SIMD3<Float>(0.41, -1.213, 0.41), SIMD3<Float>(0.51, -1.213, 0.41), SIMD3<Float>(0.61, -1.213, 0.41)]
+        let steep = base.map { SIMD3<Float>($0.x, floor + $0.x * 0.12, $0.z) }
+        for vertices in [base.filter { $0.x >= 0 }, lowerPatch, steep] {
+            let result = LocalGroundPlane.assess(vertices: vertices, center: .zero,
+                expectedFloorY: -1.25, classifiedFloorY: floor)
+            XCTAssertNil(result.plane)
+            XCTAssertEqual(result.diagnostics["local_floor_status"], "rejected")
+        }
+        XCTAssertNil(LocalGroundPlane.assess(vertices: base, center: .zero,
+            expectedFloorY: -1.25, classifiedFloorY: .nan).plane)
+    }
+
     func testRecordedInflatedStartDoesNotClearOneMetreHighNearbyGeometry() {
         // Nov 11 11:22:14: ground near Y=0, mount reference Y=0.256,
         // and a blocking vertex 4.5 cm lateral / 7.5 cm behind the start.

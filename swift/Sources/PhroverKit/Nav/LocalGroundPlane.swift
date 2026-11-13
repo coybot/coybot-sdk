@@ -46,8 +46,14 @@ struct LocalGroundPlane: Sendable {
         let mounted = assessReferenced(vertices: vertices, center: center, expectedFloorY: expectedFloorY)
         var result = mounted
         if mounted.plane == nil, let classifiedFloorY, classifiedFloorY.isFinite {
+            // Permit only a marginal support shortfall when two independent
+            // references agree. The classified reference is already stabilized
+            // across distinct geometry updates by ClassifiedFloorTracker.
+            let corroborated = expectedFloorY.map {
+                $0.isFinite && abs($0 - classifiedFloorY) <= 0.02
+            } ?? false
             result = assessReferenced(vertices: vertices, center: center, expectedFloorY: classifiedFloorY,
-                localizeLowerConflicts: true)
+                localizeLowerConflicts: true, corroboratedSupport: corroborated)
             result.diagnostics["mounted_floor_rejection"] = mounted.diagnostics["local_floor_rejection"]
             result.diagnostics["local_floor_reference_source"] = "classified_floor"
         } else {
@@ -59,7 +65,7 @@ struct LocalGroundPlane: Sendable {
     }
 
     private static func assessReferenced(vertices: [SIMD3<Float>], center: Vec2, expectedFloorY: Float?,
-                                         localizeLowerConflicts: Bool = false)
+                                          localizeLowerConflicts: Bool = false, corroboratedSupport: Bool = false)
         -> (plane: Self?, diagnostics: [String: String]) {
         var fields = ["local_floor_status": "rejected", "mounted_floor_reference_y_m": expectedFloorY.map { String($0) } ?? "unavailable"]
         var fitCells: [SIMD3<Double>] = []
@@ -91,7 +97,9 @@ struct LocalGroundPlane: Sendable {
         fitCells = all
         let eligible = all.filter { abs($0.y - Double(expectedFloorY)) <= 0.06 }
         let minimumSupportCells = 24
-        let requiredSupportFraction = 0.7
+        let requiredSupportFraction = corroboratedSupport ? 0.68 : 0.7
+        fields["local_floor_required_support_fraction"] = String(requiredSupportFraction)
+        fields["local_floor_support_policy"] = corroboratedSupport ? "corroborated_marginal_support" : "standard"
         fields["local_floor_spatial_cells"] = String(all.count)
         fields["local_floor_reference_consistent_cells"] = String(eligible.count)
         // Consistency is measured among independently mount-consistent floor
@@ -112,7 +120,9 @@ struct LocalGroundPlane: Sendable {
         fields["local_floor_candidate_y_at_start_m"] = String(c)
         fields["local_floor_candidate_x_slope"] = String(a)
         fields["local_floor_candidate_z_slope"] = String(b)
-        guard hypot(a, b) <= 0.08, abs(c - Double(expectedFloorY)) <= 0.04 else { return reject("slope_or_mount_mismatch") }
+        let usedMarginalSupport = inliers.count < max(minimumSupportCells, Int(ceil(Double(eligible.count) * 0.7)))
+        let referenceTolerance = usedMarginalSupport ? 0.02 : 0.04
+        guard hypot(a, b) <= 0.08, abs(c - Double(expectedFloorY)) <= referenceTolerance else { return reject("slope_or_mount_mismatch") }
         let rms = sqrt(inliers.reduce(0.0) { $0 + pow($1.y - (c + a * $1.x + b * $1.z), 2) } / Double(inliers.count))
         guard rms <= 0.01 else { return reject("high_residual") }
         let minX = inliers.map(\.x).min()!, maxX = inliers.map(\.x).max()!

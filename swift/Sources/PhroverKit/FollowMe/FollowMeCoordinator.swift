@@ -2,12 +2,13 @@ import Foundation
 import RoverNav
 
 public enum FollowMeState: Equatable {
+    case waitingForReturn(String)
     case idle, pausing, searching, aligning, waitingForClearance, recoveringReadyPath, signalingReady, waitingForMovement, following, holdingDistance, reacquiring, stopped
     case failed(String)
 
     public var isActive: Bool {
         switch self {
-        case .pausing, .searching, .aligning, .waitingForClearance, .recoveringReadyPath, .signalingReady, .waitingForMovement, .following, .holdingDistance, .reacquiring: true
+        case .pausing, .searching, .aligning, .waitingForClearance, .recoveringReadyPath, .signalingReady, .waitingForMovement, .following, .holdingDistance, .reacquiring, .waitingForReturn: true
         default: false
         }
     }
@@ -67,6 +68,7 @@ public final class FollowMeCoordinator {
     private let failureEmitter: FollowDiagnosticEmitter
     // At most one terminal delivery window; prune after stream/result/cleanup drain.
     private var failureResolution: FollowMotionFailureResolution?
+    private var returnWaitVersion: UInt64 = 0
     private var searchClearance: FollowSearchClearanceGrant?
     private var activeRequest: FollowMotionRequestContext?
     private var summaryBudget = FollowSummaryBudget()
@@ -207,6 +209,7 @@ public final class FollowMeCoordinator {
 
     private func startSession(commandReceivedAt: TimeInterval?, confirmation: FollowSearchClearanceConfirmation? = nil) async -> Bool {
         guard !isActive, stopTask == nil, !stopBlocked else { return isActive }
+        returnWaitVersion &+= 1
         guard perception.detectorReady, perception.personLabelAvailable else {
             state = .failed("Person detector unavailable.")
             return false
@@ -341,11 +344,15 @@ public final class FollowMeCoordinator {
     }
 
     @discardableResult
-    public func stop() async -> Bool { await finish(.stopped) }
+    public func stop() async -> Bool {
+        returnWaitVersion &+= 1
+        return await finish(.stopped)
+    }
 
     /// Synchronously fence observations and goals when the app is leaving the foreground
     /// or Talk. The caller must subsequently await stop() before handing off motion.
     public func inhibitMotion() {
+        returnWaitVersion &+= 1
         searchClearance?.revoke()
         guard isActive, stopTask == nil else { return }
         emitRecovery("fenced", reason: "lifecycle_inhibition", stop: "pending")
@@ -380,7 +387,9 @@ public final class FollowMeCoordinator {
         }
     }
 
-    private func finish(_ result: FollowMeState, resolvingFailure: Bool = false) async -> Bool {
+    private func finish(_ result: FollowMeState, resolvingFailure: Bool = false,
+                        returnWaitReason: FollowReturnWaitReason? = nil) async -> Bool {
+        let waitVersion = returnWaitVersion
         searchClearance?.revoke()
         if let stopTask {
             // Only one waiter publishes terminal state and clears the task.
@@ -479,9 +488,84 @@ public final class FollowMeCoordinator {
         }
         stopTask = nil
         stopCleanupOwned = false
+        let failureAllowsReturn = !resolvingFailure || failureResolution.map {
+            Self.returnReason(for: $0) != nil && $0.stopOutcome == .confirmed
+        } == true
         pruneFailureResolution()
         if let terminalRecovery { emitRecoveryTermination(terminalRecovery, confirmed: confirmed) }
+        if confirmed, !stopBlocked, config.waitForUserReturn, waitVersion == returnWaitVersion,
+           failureAllowsReturn, let returnWaitReason, case .failed = state {
+            beginReturnWait(reason: returnWaitReason)
+        }
         return confirmed
+    }
+
+    private static func returnReason(for record: FollowMotionFailureResolution) -> FollowReturnWaitReason? {
+        guard record.context.purpose == .followGoal || record.context.request?.purpose == .followGoal else { return nil }
+        switch record.primaryReason {
+        case .depthUnavailable(.staleRawDepth), .depthUnavailable(.missingRawDepth): return .depthUnstable
+        default: return nil
+        }
+    }
+
+    private func beginReturnWait(reason: FollowReturnWaitReason) {
+        guard let arGeneration = latestBatch?.frameID.generation,
+              motion is any FollowMeReturnReadiness else { return }
+        let token = generation, version = returnWaitVersion
+        let stoppedAt = clock.now, deadline = stoppedAt + 60
+        guard stoppedAt.isFinite, deadline.isFinite else { return }
+        locked = nil; resetTrack(); recoveryEpisode = nil; recoveryStopBoundary = nil
+        scanning = false; lastGoal = nil
+        state = .waitingForReturn(reason.message)
+        failureEmitter.emit(.init(event: "follow_return.waiting", context: .init(sessionGeneration: token,
+            phase: "waitingForReturn"), payload: ["deadline_s": .number(deadline), "guidance": .string(reason.message)]))
+        let events = perception.events()
+        framesTask = Task { [weak self] in
+            var gate = FollowReturnGate(generation: arGeneration, stoppedAt: stoppedAt, reason: reason)
+            for await event in events {
+                guard !Task.isCancelled, let self, self.generation == token, self.returnWaitVersion == version,
+                      case .waitingForReturn = self.state, !self.stopBlocked else { return }
+                guard self.clock.now < deadline else {
+                    _ = await self.finish(.failed("Return wait expired. Come into view and say follow me to restart.")); return
+                }
+                switch event {
+                case .interrupted:
+                    _ = await self.finish(.failed("AR session interrupted.")); return
+                case .failed(let message):
+                    _ = await self.finish(.failed(message)); return
+                case .frame(let batch):
+                    guard batch.frameID.generation == arGeneration else {
+                        _ = await self.finish(.failed("AR session reset while waiting for your return.")); return
+                    }
+                    guard gate.observe(batch, now: self.clock.now, ready: self.failureResolution == nil,
+                        configuration: self.config) else { continue }
+                    let ready = await (self.motion as? any FollowMeReturnReadiness)?.canResumeAfterUserReturn() ?? false
+                    guard !Task.isCancelled, self.generation == token, self.returnWaitVersion == version,
+                          case .waitingForReturn = self.state, !self.stopBlocked, self.stopTask == nil else { return }
+                    guard self.clock.now < deadline else {
+                        _ = await self.finish(.failed("Return wait expired. Come into view and say follow me to restart.")); return
+                    }
+                    if ready, self.failureResolution == nil,
+                       FollowFrameHealth.issue(batch, now: self.clock.now, configuration: self.config) == nil {
+                        self.failureEmitter.emit(.init(event: "follow_return.reacquired", context: .init(
+                            sessionGeneration: token, phase: "waitingForReturn")))
+                        self.framesTask = nil
+                        self.startupTask?.cancel()
+                        self.state = .stopped
+                        _ = await self.startSession(commandReceivedAt: self.clock.now)
+                        return
+                    }
+                }
+            }
+            if !Task.isCancelled, let self, self.generation == token, case .waitingForReturn = self.state {
+                _ = await self.finish(.failed("Perception ended while waiting. Restart following."))
+            }
+        }
+        startupTask = Task { [weak self, clock] in
+            await clock.sleep(seconds: max(0, deadline - clock.now))
+            guard !Task.isCancelled, let self, self.generation == token, case .waitingForReturn = self.state else { return }
+            _ = await self.finish(.failed("Return wait expired. Come into view and say follow me to restart."))
+        }
     }
 
     private func matches(_ context: FollowMotionOperationContext, _ other: FollowMotionOperationContext) -> Bool {
@@ -518,14 +602,20 @@ public final class FollowMeCoordinator {
             // escalate immediately, even while independent confirmation is pending.
             // Other stale deliveries cannot publish or create a second stop owner.
             if !delivery.stale || (stopTask != nil && delivery.stopOutcome == .failed) {
-                state = .failed(record.message)
+                if case .waitingForReturn = state, Self.returnReason(for: record) != nil, record.stopOutcome == .confirmed {
+                    // Confirmed duplicate deliveries may drain the old failure,
+                    // but cannot cancel a stationary human-return wait.
+                } else {
+                    if case .waitingForReturn = state { framesTask?.cancel(); startupTask?.cancel() }
+                    state = .failed(record.message)
+                }
                 if record.stopOutcome == .failed { stopBlocked = true }
             }
             pruneFailureResolution()
             return
         }
         guard isActive else { return }
-        _ = await finish(.failed(record.message), resolvingFailure: true)
+        _ = await finish(.failed(record.message), resolvingFailure: true, returnWaitReason: Self.returnReason(for: record))
     }
 
     private func pruneFailureResolution() {
@@ -1734,7 +1824,7 @@ public final class FollowMeCoordinator {
             return
         }
         if state == .searching && scanRotation >= limit - 0.0001 {
-            finishSearch("No person found.", generation: token)
+            finishSearch("No person found.", generation: token, returnWaitReason: .targetLost)
             return
         }
         if scanAttempts >= config.maximumScanAttempts || scanInterruptions >= config.maximumScanInterruptions {
@@ -1824,10 +1914,10 @@ public final class FollowMeCoordinator {
         scanDeferredFrame = nil
     }
 
-    private func finishSearch(_ message: String, generation token: UInt64) {
+    private func finishSearch(_ message: String, generation token: UInt64, returnWaitReason: FollowReturnWaitReason? = nil) {
         Task { [weak self] in
             guard let self, self.generation == token, self.state == .searching else { return }
-            _ = await self.finish(.failed(message))
+            _ = await self.finish(.failed(message), returnWaitReason: returnWaitReason)
         }
     }
 
@@ -1869,7 +1959,7 @@ public final class FollowMeCoordinator {
         guard generation == token, isActive, let episode = recoveryEpisode,
               (validationTime ?? clock.now) >= episode.deadline else { return false }
         emitRecovery("expired", reason: "original_deadline_reached", episode: episode)
-        _ = await finish(.failed("Person lost."))
+        _ = await finish(.failed("Person lost."), returnWaitReason: .targetLost)
         return true
     }
 

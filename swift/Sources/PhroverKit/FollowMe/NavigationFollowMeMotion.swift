@@ -14,13 +14,18 @@ protocol FollowNavigationRuntime: AnyObject {
     func followMotionFailures() -> AsyncStream<FollowMotionFailureDelivery>
     func inhibitFollowScanContinuation(origin: FollowMotionStopOrigin)
     func updateFollowGoal(_ goal: Vec2) -> Bool
+    func canResumeFollowAfterUserReturn() async -> Bool
 }
 
 extension NavigationController: FollowNavigationRuntime {}
 extension FollowNavigationController: FollowNavigationRuntime {}
 
+extension FollowNavigationRuntime {
+    func canResumeFollowAfterUserReturn() async -> Bool { false }
+}
+
 @MainActor
-public final class NavigationFollowMeMotion: FollowMeContextualMotion, FollowMeAbsoluteHeadingMotion {
+public final class NavigationFollowMeMotion: FollowMeContextualMotion, FollowMeAbsoluteHeadingMotion, FollowMeReturnReadiness {
     private let navigation: any FollowNavigationRuntime
 
     public init(navigation: NavigationController) { self.navigation = navigation }
@@ -49,6 +54,7 @@ public final class NavigationFollowMeMotion: FollowMeContextualMotion, FollowMeA
     }
 
     public func safetyStates() -> AsyncStream<NavigationSafetyState> { navigation.safetyStates() }
+    public func canResumeAfterUserReturn() async -> Bool { await navigation.canResumeFollowAfterUserReturn() }
 
     func perform(_ request: FollowMotionRequest, context: FollowMotionRequestContext) async -> FollowMotionResult {
         await navigation.performFollowMotion(request, context: context)

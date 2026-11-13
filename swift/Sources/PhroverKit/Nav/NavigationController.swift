@@ -303,6 +303,12 @@ public final class NavigationController {
         }
     }
 
+    func canResumeFollowAfterUserReturn() async -> Bool {
+        guard loop == nil, !followNeedsConfirmedStop else { return false }
+        let ready = await followNavigation.canResumeFollowAfterUserReturn()
+        return ready && loop == nil && !followNeedsConfirmedStop
+    }
+
     /// Begin autonomously driving to a nav-plane goal.
     public func navigate(to goal: Vec2) {
         startNavigation(to: goal, stoppingAtForwardClearance: nil, policy: nil)

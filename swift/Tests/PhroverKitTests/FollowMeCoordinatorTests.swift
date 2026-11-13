@@ -3001,7 +3001,7 @@ final class FollowMeCoordinatorTests: XCTestCase {
         motion.releaseRotation()
     }
 
-    private func setup() -> (FollowMeCoordinator, FollowPerceptionFake, FollowMotionFake, ManualFollowClock) {
+    private func setup(waitForUserReturn: Bool = false) -> (FollowMeCoordinator, FollowPerceptionFake, FollowMotionFake, ManualFollowClock) {
         let perception = FollowPerceptionFake()
         let motion = FollowMotionFake()
         let clock = ManualFollowClock()
@@ -3011,6 +3011,7 @@ final class FollowMeCoordinatorTests: XCTestCase {
         config.scanIncrement = .pi / 6
         config.stationaryPauseSeconds = 0
         config.departureRangeIncrease = 0
+        config.waitForUserReturn = waitForUserReturn
         return (FollowMeCoordinator(perception: perception, motion: motion, clock: clock,
                                     configuration: config,
                                     eventSink: { _, _ in }), perception, motion, clock)
@@ -3229,6 +3230,51 @@ final class FollowMeCoordinatorTests: XCTestCase {
         await drain()
         XCTAssertEqual(motion.rotations.count, rotationsBeforeDeadline, "Late scan completion cannot extend the deadline")
         XCTAssertEqual(motion.goals.count, 1)
+    }
+
+    func testLostTargetCanWaitStoppedForUserReturnWhenEnabled() async {
+        let (coordinator, perception, motion, clock) = setup(waitForUserReturn: true)
+        motion.suspendRotation = true
+        _ = await coordinator.start()
+        perception.send(frame(1, people: [person(1)]))
+        await drain()
+        perception.send(frame(2))
+        await drain()
+        for step in 1...20 {
+            let time = Double(step) / 2
+            clock.advance(to: time)
+            perception.send(frame(UInt64(step + 2), at: time))
+            await drain()
+        }
+        guard case .waitingForReturn(let guidance) = coordinator.state else {
+            motion.releaseRotation()
+            return XCTFail("Expected a confirmed-stopped return wait, got \(coordinator.state)")
+        }
+        XCTAssertTrue(guidance.contains("Come back into view"))
+        XCTAssertTrue(coordinator.isActive)
+        XCTAssertEqual(motion.goals.count, 1)
+        motion.releaseRotation()
+        await drain()
+        // A real restart must leave the waiting stream, subscribe again, and
+        // accept fresh observations through the normal session entry point.
+        for step in 1...3 {
+            let time = 10 + Double(step) * 0.15
+            let id = ARFrameID(generation: 1, sequence: UInt64(30 + step))
+            let observation = FollowPersonObservation(frameID: id, timestamp: time, confidence: 0.9,
+                boundingBox: CGRect(x: 0.45, y: 0.4, width: 0.1, height: 0.2),
+                position: Vec2(0, 2), pose: Pose2D(position: .zero, yaw: 0), bodyVerified: true)
+            clock.advance(to: time)
+            perception.send(frame(id.sequence, at: time, people: [observation]))
+            await drain()
+        }
+        XCTAssertEqual(coordinator.state, .searching)
+        XCTAssertEqual(motion.goals.count, 1, "Returning first starts normal readiness")
+        clock.advance(to: 10.6)
+        perception.send(frame(34, at: 10.6, people: [person(34, at: 10.6, y: 2)]))
+        await drain()
+        XCTAssertEqual(coordinator.state, .following)
+        XCTAssertEqual(motion.goals.count, 2)
+        _ = await coordinator.stop()
     }
 
     func testReacquisitionScansRequireFreshPerceptionAfterStopAndCompletion() async {

@@ -5,6 +5,24 @@ import RoverNav
 
 @MainActor
 final class ConversationViewModelTests: XCTestCase {
+    func testReturnGuidanceIsSpokenOnceAndClearedOnRestart() {
+        let guidance = "Come back into view and stand still."
+        var state = FollowMeState.waitingForReturn(guidance)
+        let model = ConversationViewModel(followState: { state })
+        var spoken: [String] = []
+        model.announceDisplayedErrors { spoken.append($0) }
+        model.announceDisplayedErrors { spoken.append($0) }
+        XCTAssertEqual(spoken, [guidance])
+        XCTAssertEqual(model.status, guidance)
+        XCTAssertTrue(model.showsStopFollowing)
+        state = .pausing
+        model.announceDisplayedErrors { spoken.append($0) }
+        XCTAssertTrue(model.displayedErrors.isEmpty)
+        state = .waitingForReturn(guidance)
+        model.announceDisplayedErrors { spoken.append($0) }
+        XCTAssertEqual(spoken, [guidance, guidance])
+    }
+
     func testEachRejectedOperatorActionAnnouncesEvenWhenTextIsUnchanged() async {
         let message = "Rover stop could not be confirmed."
         let model = ConversationViewModel(submit: { _ in .rejected(message) }, stop: { .rejected(message) })

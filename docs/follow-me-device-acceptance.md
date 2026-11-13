@@ -7,11 +7,91 @@ Automated simulator tests do not establish LiDAR projection accuracy or prove th
 1. With cloud connectivity disabled, press and hold the Talk microphone and say `follow me`. Verify rear-camera acquisition stops on a person or after at most 360°.
 2. Verify the rover maintains approximately 1.5 m distance and does not drive backward when the person is too close.
 3. Introduce a second person in the image centre. Verify the original track remains locked, or the rover pauses on ambiguity.
-4. Briefly hide the person. Verify forward motion stops before reacquisition rotation; keep the person lost and verify follow mode stops within 10 seconds.
+4. Briefly hide the person. Verify forward motion stops before reacquisition rotation; keep the person lost and verify motion stops within 10 seconds. In Talk, verify the stationary return guidance and one-minute wait described below.
 5. In each active state, press Stop Following; also test spoken `stop`. Verify motor stop acknowledgement and no delayed restart.
 6. Leave Talk, background the app, and trigger a navigation failure. Verify the rover stops before another mode can drive.
 
 Record the tested phone, rover, build revision, pass/fail per step, and redacted runtime-log evidence here after the supervised run. Do not attach camera images or raw transcripts.
+
+## Corroborated marginal floor support (November 13)
+
+The 11:44 device failure rejected a local floor with 170 inliers among 248
+reference-consistent cells: 68.55% support, just below the 70% requirement. Both
+the mounted reference (-0.9811032 m) and stable classified reference (-0.9652927 m)
+agreed within 2 cm. Falling back to the global estimate (-1.0490329 m) classified
+logged start samples at -0.879088 m as obstacles rather than near-floor geometry.
+
+Replaying all 361 captured reduced fit cells through `LocalGroundPlane.assess`
+reproduced `inconsistent_surface`. The fix permits 68% support in the classified
+fallback only when a finite mounted reference agrees within 2 cm. Fits using
+this allowance must also agree with the classified reference within 2 cm (tighter
+than the ordinary 4 cm fit tolerance). The minimum 24 inliers, surrounding support,
+8% slope limit, 1 cm RMS limit, local footprint, raised-obstacle checks and per-cell
+lower-geometry validation remain enforced. Classified references still require
+the existing fresh, distinct, temporally stable observations.
+
+The original captured fit passes after the change. Rebuilding reduced geometry
+with the two logged start samples produces raw start cost 0. A portable 41-cell
+fixture was minimized from the capture and retained in `LocalFloorReplayTests`.
+Tests verify rejection without corroboration and preserve 11.5 cm / 14.5 cm /
+30 cm obstacles, lower hazards, competing surfaces, insufficient support, and
+steep or one-sided geometry. All 1,579 SDK tests passed without retries in the
+12:02 run. No temporary replay test or external-log dependency remains.
+The signed Debug update was installed on `HungIphone` (iPhone 15 Pro Max) at
+12:11 local time, installation database sequence 6216.
+
+This fixes the reproduced marginal floor rejection, not every possible no-path
+failure. The later 11:45 `path_join_blocked` event includes a complete costmap and
+25 waypoints but not the full originating mesh. The floor change cannot be
+retroactively applied to that costmap alone. Physical acceptance must confirm
+that a freshly built map now permits a safe path; collision thresholds, the 2 cm
+join margin and depth freshness limits have not been relaxed.
+
+## Stationary user-return guidance (November 13)
+
+Talk enables `FollowMeConfiguration.waitForUserReturn`; SDK clients default to off.
+After target-loss recovery expires, a completed search finds nobody, or a pursuit
+fails with missing/stale raw depth, confirmed stop may enter `waitingForReturn`.
+The phone speaks the displayed guidance once and keeps Stop Following available.
+The deadline is fixed at one minute, with no scan or drive commands while waiting.
+
+For target loss, return about two metres in front of the camera and stand still.
+For transient depth failure, first leave view (or move beyond 2.5 m) for at least
+0.5 seconds, then return. Ambiguous, partial, unverified or unhealthy detections
+cannot establish departure. Return requires one body-verified person at the
+configured safe distance (normally 1.5–2.5 m), three increasing fresh captures
+spanning at least 0.25 seconds, and position stability within 0.25 m. Gaps beyond
+the observation-age limit discard consecutive evidence. This reacquires a single
+person; it does not establish biometric identity.
+
+Before restarting, navigation checks pose, forward clearance, depth, connection
+and motion ownership. An expired connection acknowledgement is refreshed only
+through a genuine serialized stop command. No drive command is sent by this
+check. A successful return starts a new normal readiness sequence, including
+spoken readiness and departure gating in Talk; it does not continue old motion
+or extend an old motor-recovery deadline. Existing final transport admission and
+250 ms raw-depth limits remain in force.
+
+Communication, map/obstacle and structural tracking failures are not eligible for
+automatic return. Failed stop, Stop Following, leaving Talk, AR reset, interruption
+and expiry prevent a delayed restart. After expiry, say “follow me” to start again.
+
+Validation: 1,576 SDK tests passed, with one existing transport cancellation test
+(`testPublicCancelWaitsForPendingBurstBeforeItsIndependentStop`) failing its first
+run and passing the automatic retry. All 36 ConversationViewModel tests passed
+without retry. New coverage includes actual return/restart, depth-failure delivery
+draining, rejected failure categories, ambiguous/partial detections, frame gaps,
+timeout, AR reset, stop failure, cancellation during suspended readiness, expired
+acknowledgement refresh, and once-per-occurrence guidance speech.
+
+The signed Debug build was installed on `HungIphone` (iPhone 15 Pro Max) on
+November 13 at 11:32 local time; installation database sequence 6208. That build
+included the then-uncommitted return-wait changes on top of `5a95e63`.
+
+Physical acceptance remains pending: verify audible guidance, stationary wheels
+throughout the wait, successful return after a prolonged wait, one readiness cue,
+and no restart after Stop Following or leaving Talk. The depth freshness failures
+seen in the previous device run still require a new physical trial.
 
 ## Spoken readiness in PhroverOperator
 

@@ -231,13 +231,15 @@ struct ConversationView: View {
                 missionTelemetry: telemetry
             ) { brain }
             let followClock = SystemFollowClock()
+            var followConfiguration = FollowMeConfiguration.continuous
+            followConfiguration.waitForUserReturn = true
             let follow = FollowMeCoordinator(
                 perception: ARFollowMePerceptionSource(ar: ar, detector: detector),
                 motion: NavigationFollowMeMotion(navigation: nav),
                 stationaryReadyAnnouncement: { text in
                     speechOut.stopSpeaking()
                     speechOut.speak(text, useIndependentAudioSession: true)
-                }, clock: followClock, configuration: .continuous
+                }, clock: followClock, configuration: followConfiguration
             )
             guard let agent else { return }
             let router = OperatorCommandRouter(mission: agent, follow: follow,

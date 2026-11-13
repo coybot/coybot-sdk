@@ -4,6 +4,50 @@ import RoverNav
 
 @MainActor
 final class NavigationFollowSafetyTests: XCTestCase {
+    func testUserReturnRefreshesExpiredAcknowledgementOnlyWithRealStop() async {
+        for stopSucceeds in [true, false] {
+            let date = Date()
+            var ack = date.addingTimeInterval(-60)
+            var stops = 0
+            var sends = 0
+            let nav = FollowNavigationController(currentPose: { .init(position: .zero, yaw: 0) },
+                forwardClearance: { 5 }, depthSafetyObservation: { command in
+                    .init(state: .clear, clearance: 5, supportCount: 10, sampleAge: 0,
+                        requiredStoppingDistance: 0.4, motionClass: .classify(command), speedLimit: nil)
+                }, plan: { _, goal in [goal] }, lastAckAt: { ack }, sendCommand: { _ in sends += 1 },
+                stopRover: {
+                    stops += 1
+                    if !stopSucceeds { throw URLError(.timedOut) }
+                    ack = date
+                }, sleep: { _ in }, now: { date })
+            let ready = await nav.canResumeFollowAfterUserReturn()
+            XCTAssertEqual(ready, stopSucceeds)
+            XCTAssertEqual(stops, 1)
+            XCTAssertEqual(sends, 0)
+            let repeated = await nav.canResumeFollowAfterUserReturn()
+            XCTAssertEqual(repeated, stopSucceeds)
+            XCTAssertEqual(stops, 1, "A failed stop stays latched; a fresh acknowledgement needs no probe")
+        }
+    }
+
+    func testUserReturnRejectsStaleDepthAndReplacedOwner() async {
+        for replaceOwner in [true, false] {
+            var nav: FollowNavigationController!
+            var sends = 0
+            nav = FollowNavigationController(currentPose: { .init(position: .zero, yaw: 0) },
+                forwardClearance: { 5 }, depthSafetyObservation: { command in
+                    if replaceOwner { nav.inhibitForHandoff() }
+                    return .init(state: .clear, clearance: 5, supportCount: 10,
+                        sampleAge: replaceOwner ? 0 : 0.3, requiredStoppingDistance: 0.4,
+                        motionClass: .classify(command), speedLimit: nil)
+                }, plan: { _, goal in [goal] }, lastAckAt: { Date() }, sendCommand: { _ in sends += 1 },
+                stopRover: {}, sleep: { _ in })
+            let ready = await nav.canResumeFollowAfterUserReturn()
+            XCTAssertFalse(ready)
+            XCTAssertEqual(sends, 0)
+        }
+    }
+
     func testFollowPursuitAndReadyRejectUnavailableDepthAndLimitCaution() async {
         for request: FollowMotionRequest in [.following(Vec2(4, 0), 1.25), .ready] {
             for state: DepthSafetyState in [.unavailable(.missingRawDepth), .unavailable(.staleRawDepth), .caution] {

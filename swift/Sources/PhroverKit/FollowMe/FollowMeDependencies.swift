@@ -1,4 +1,10 @@
 import Foundation
+/// Optional capability for stopped user-return recovery. This reads fresh
+/// navigation safety evidence and never issues movement commands.
+@MainActor
+public protocol FollowMeReturnReadiness: AnyObject {
+    func canResumeAfterUserReturn() async -> Bool
+}
 import RoverNav
 
 public enum FollowPerceptionIssue: String, Equatable, Sendable {

@@ -99,6 +99,9 @@ public struct FollowMeConfiguration {
     /// Share the follow turn profile's stopped-alignment and ready-admission window (radians).
     public var alignmentAngularTolerance: Double = FollowTurnBurstPlanner.Profile(purpose: .alignment).tolerance
     public var reacquisitionSeconds: TimeInterval = 10
+    /// After a confirmed stop for target loss or transient depth failure, wait
+    /// for a fresh human return before starting a new readiness sequence.
+    public var waitForUserReturn = false
 
     // MARK: Continuous following (all off by default; `.continuous` turns them on)
 

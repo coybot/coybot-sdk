@@ -607,6 +607,35 @@ final class FollowNavigationController {
         return result
     }
 
+    func canResumeFollowAfterUserReturn() async -> Bool {
+        guard !Task.isCancelled, loop == nil, !stopUnconfirmed else { return false }
+        let owner = operationGeneration
+        var ack = await currentLastAck()
+        guard !Task.isCancelled, operationGeneration == owner, loop == nil, !stopUnconfirmed else { return false }
+        if ack.map({ now().timeIntervalSince($0) >= RoverConfig.commsWatchdogTimeout }) ?? true {
+            // A stationary wait naturally ages out the last drive acknowledgement.
+            // Refresh it with a real serialized stop, never a synthetic timestamp.
+            do { try await confirmStop(origin: "user_return") }
+            catch { return false }
+            ack = await currentLastAck()
+        }
+        guard !Task.isCancelled, operationGeneration == owner, loop == nil, !stopUnconfirmed,
+              let ack else { return false }
+        let ackAge = now().timeIntervalSince(ack)
+        guard ackAge.isFinite, ackAge >= 0, ackAge < RoverConfig.commsWatchdogTimeout,
+              readFollowPose().rejection(at: sourceNow()) == nil,
+              case .go = guardLayer.evaluate(forwardClearance: currentForwardClearance(), lastAckAt: ack,
+                now: now(), feedback: nil) else { return false }
+        let evaluatedAt = sourceNow()
+        let observation = searchDepthObservation(.init(left: 0.1, right: 0.1))
+        let ageAtReturn = observation.sampleAge + max(0, sourceNow() - evaluatedAt)
+        guard !Task.isCancelled, operationGeneration == owner, loop == nil, !stopUnconfirmed,
+              ageAtReturn.isFinite, ageAtReturn >= 0,
+              ageAtReturn <= DepthSafetyEvaluator.maximumRawDepthAge - 0.05 else { return false }
+        if case .allow = guardLayer.evaluate(command: .init(left: 0.1, right: 0.1), depthSafety: observation) { return true }
+        return false
+    }
+
     /// A bounded, pose-controlled 10 cm ready signal, independent of pursuit's 20 cm tolerance.
     public func navigateForFollowReadySignal() async -> NavigationResult {
         guard !stopUnconfirmed else { return .failed(.commandFailed) }

@@ -39,7 +39,13 @@ final class FollowPerceptionFake: FollowMePerception {
 }
 
 @MainActor
-final class FollowMotionFake: FollowMeSourceClockMotion {
+final class FollowMotionFake: FollowMeSourceClockMotion, FollowMeReturnReadiness {
+    var returnReadiness = true
+    var returnReadinessHandler: (() async -> Void)?
+    func canResumeAfterUserReturn() async -> Bool {
+        await returnReadinessHandler?()
+        return returnReadiness
+    }
     private var syntheticClock: ManualFollowClock?
     var sourceUptime: TimeInterval? { syntheticClock?.now }
     init(clock: ManualFollowClock? = nil) { syntheticClock = clock }
@@ -118,8 +124,9 @@ final class FollowMotionFake: FollowMeSourceClockMotion {
 
 /// A contextual companion over the legacy fake; controller facts remain unknown.
 @MainActor
-final class ContextualFollowMotionFake: FollowMeContextualMotion {
+final class ContextualFollowMotionFake: FollowMeContextualMotion, FollowMeReturnReadiness {
     let legacy = FollowMotionFake()
+    func canResumeAfterUserReturn() async -> Bool { await legacy.canResumeAfterUserReturn() }
     var sourceUptime: TimeInterval? { legacy.sourceUptime }
     private(set) var requests: [FollowMotionRequest] = []
     private(set) var contexts: [FollowMotionRequestContext] = []

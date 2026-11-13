@@ -41,6 +41,7 @@ final class ConversationViewModel {
     var displayedErrors: [String] {
         var messages: [String] = []
         if case .failed(let message) = followState() { messages.append(message) }
+        if case .waitingForReturn(let message) = followState() { messages.append(message) }
         if let errorMessage, !messages.contains(errorMessage) { messages.append(errorMessage) }
         if let speechErrorMessage, !messages.contains(speechErrorMessage) { messages.append(speechErrorMessage) }
         return messages.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -149,6 +150,7 @@ final class ConversationViewModel {
         case .following: return "Following — 1.5 m"
         case .holdingDistance: return "Holding distance"
         case .reacquiring: return "Person lost — searching…"
+        case .waitingForReturn(let message): return message
         case .stopped: return "Stopped"
         case .failed(let message): return message
         }

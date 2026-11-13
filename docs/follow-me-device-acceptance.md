@@ -110,6 +110,55 @@ and wraparound. Device verification must establish why the physical response
 disagreed with the request; this check prevents repeated wrong-way commands but
 does not establish a corrected physical turn calibration.
 
+### Publication-to-control and transport scheduling
+
+The November 13 09:49 local run exhausted depth recovery despite clear depth.
+Acknowledgement reads took up to about 55 ms; one command was checked 132 ms
+after its original authorization expired. A driver regression combines 150 ms
+publication age, a 60 ms queued acknowledgement read, 2 ms evaluation and 37 ms
+admission cost. It failed before the change and now completes without stopping.
+
+Production follow now reads the last genuine HTTP acknowledgement from a locked
+snapshot, without queueing an actor read before each depth evaluation. The
+actor-facing acknowledgement API reads the same store. Failures do not refresh
+the timestamp; missing/future/expired acknowledgement evidence still blocks.
+Legacy injected async providers retain their existing behavior.
+
+Follow transport uses the same retry/receipt implementation but inherits the
+control executor. Main-actor safety validation no longer requires a return hop
+to the rover actor before final HTTP admission. Each attempt still revalidates
+the exact command and checks cancellation, ownership and the original absolute
+deadline immediately before HTTP. Stop requests bypass motion authorization.
+The pursuit task uses user-initiated priority, matching depth publication work.
+No freshness threshold, retry count or recovery deadline is increased.
+
+`depth_notification_to_evaluation_s` measures the delay from the most recent
+depth publication notification to evaluation. `acknowledgement_snapshot` identifies
+the synchronous read path. `follow_pursuit.admission_timing` breaks admission into
+`queued_before_validation_s`, `validation_s`, `validation_to_http_s` and
+`total_admission_s`; unavailable HTTP entry remains null. These records are emitted
+after the send completes, not inside final eligibility checks. Device acceptance
+must compare these boundaries and confirm sustained driving; deterministic
+scheduling replays do not establish physical-device latency guarantees.
+
+### Stable caution-speed checks
+
+The November 12 12:03 local run passed planning and followed for about seven
+seconds. Both obstacle-labelled failures occurred at `pursuit_transport_scaled`
+with depth still reporting caution, 55–63 cm clearance, and a 30 cm stopping
+distance. A deterministic real-controller replay reproduces this failure:
+scaling a ramped request such as 0.1337 to a 0.12 m/s cap can produce
+0.12000000000000001. The transport recheck rescales it, producing a different
+command that fails exact-command authorization.
+
+The caution limiter now clamps each scaled wheel to the exact signed cap.
+Repeated checks with unchanged evidence return the identical command. No epsilon
+is used to authorize an above-limit request; even a one-ULP stricter cap still
+rejects the previously prepared command. Nonfinite limits/requests fail closed.
+Driver/transport regression tests fail before the change and pass afterward.
+This fixes the reproduced rounding failure, but does not turn a genuinely
+stricter live safety decision into permission to send an older command.
+
 ### Reconciling lower mesh against a classified floor
 
 The November 12 11:21 local attempt had a classified floor at -0.84197 m and

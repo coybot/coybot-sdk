@@ -5,6 +5,88 @@ import CoreVideo
 
 final class RoverControlTests: XCTestCase {
     @MainActor
+    func testFollowAdmissionStillChecksExpiryRevocationAndCancellationAfterSuspension() async {
+        for mode in ["expired", "revoked", "cancelled"] {
+            StubURLProtocol.reset()
+            let control = RoverControl(session: URLSession(configuration: .stubbed))
+            let clock = BurstTestClock(10)
+            let gate = BurstAttemptAdmissionGate()
+            let authorization = FollowTurnBurstAuthorization(operationID: 1, sendEntryUptime: 10,
+                requestedBudget: 0.05, uptime: { clock.now }, isAuthorized: { mode != "revoked" },
+                authorizeAttempt: { @MainActor in await gate.wait(); return true })
+            let task = Task { @MainActor in
+                await FollowTurnBurstTransportScope.$authorization.withValue(authorization) {
+                    await control.sendFollowNavigationWithReceipt(.init(left: 0.1, right: 0.1))
+                }
+            }
+            for _ in 0..<2000 { if await gate.isWaiting { break }; await Task.yield() }
+            let waiting = await gate.isWaiting
+            XCTAssertTrue(waiting)
+            if mode == "expired" { clock.set(10.05) }
+            if mode == "cancelled" { task.cancel() }
+            await gate.release()
+            let result = await task.value
+            XCTAssertEqual(result.receipt.outcome, mode == "revoked" ? "fenced" : mode)
+            XCTAssertEqual(result.receipt.attempts, 0)
+            XCTAssertEqual(StubURLProtocol.requestCount, 0)
+            XCTAssertNil(control.lastAcknowledgementSnapshot)
+        }
+    }
+
+    @MainActor
+    func testAcknowledgementSnapshotRecordsOnlyRealSuccessAndStopBypassesExpiredAuthority() async throws {
+        StubURLProtocol.reset()
+        let response = HTTPURLResponse(url: URL(string: "http://192.168.4.1/js")!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        StubURLProtocol.results = [.success((Data(), response)), .failure(URLError(.badServerResponse)), .success((Data(), response))]
+        let control = RoverControl(session: URLSession(configuration: .stubbed))
+        XCTAssertNil(control.lastAcknowledgementSnapshot)
+        let first = await control.sendFollowNavigationWithReceipt(.init(left: 0.1, right: 0.1))
+        let acknowledged = try XCTUnwrap(first.receipt.acknowledgementUTC)
+        XCTAssertEqual(control.lastAcknowledgementSnapshot, acknowledged)
+        let actorValue = await control.lastAckAt
+        XCTAssertEqual(actorValue, acknowledged)
+        let failed = await control.sendFollowNavigationWithReceipt(.init(left: 0.1, right: 0.1))
+        XCTAssertNotNil(failed.failure)
+        XCTAssertEqual(control.lastAcknowledgementSnapshot, acknowledged)
+        let expired = FollowTurnBurstAuthorization(operationID: 1, sendEntryUptime: 10, requestedBudget: 0.05,
+            uptime: { 11 }, isAuthorized: { false })
+        let stop = await FollowTurnBurstTransportScope.$authorization.withValue(expired) { await control.stopFollowWithReceipt() }
+        XCTAssertEqual(stop.receipt.acknowledged, true)
+        XCTAssertEqual(control.lastAcknowledgementSnapshot, stop.receipt.acknowledgementUTC)
+        XCTAssertEqual(StubURLProtocol.requestCount, 3)
+    }
+
+    @MainActor
+    func testFollowValidationDoesNotHopAwayBeforeFinalHTTPAdmission() async throws {
+        StubURLProtocol.reset()
+        StubURLProtocol.results = [.success((Data(), HTTPURLResponse(url: URL(string: "http://192.168.4.1/js")!,
+            statusCode: 200, httpVersion: nil, headerFields: nil)!))]
+        let control = RoverControl(session: URLSession(configuration: .stubbed))
+        let clock = BurstTestClock(10)
+        let authorization = FollowTurnBurstAuthorization(operationID: 1, sendEntryUptime: 10,
+            requestedBudget: 0.05, uptime: { clock.now }, isAuthorized: {
+                // Model the recorded scheduling cost of leaving the validated
+                // control executor before the final transport check.
+                if !Thread.isMainThread { clock.set(10.06) }
+                return clock.now < 10.05
+            }, authorizeAttempt: { @MainActor in
+                XCTAssertTrue(Thread.isMainThread)
+                return true
+            })
+        let result = await FollowTurnBurstTransportScope.$authorization.withValue(authorization) {
+            await control.sendFollowNavigationWithReceipt(.init(left: 0.1, right: 0.09))
+        }
+        XCTAssertNil(result.failure)
+        XCTAssertEqual(result.receipt.acknowledged, true)
+        XCTAssertEqual(StubURLProtocol.requestCount, 1)
+        let request = try XCTUnwrap(StubURLProtocol.requests.first)
+        let json = try XCTUnwrap(URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?.queryItems?.first?.value)
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        XCTAssertEqual(payload["L"] as? Double, 0.09)
+        XCTAssertEqual(payload["R"] as? Double, 0.1)
+    }
+
+    @MainActor
     func testReadyPulseExpiringInSenderQueueNeverEntersMotorHTTP() async throws {
         StubURLProtocol.reset()
         StubURLProtocol.results = Array(repeating: .success((Data(), HTTPURLResponse(

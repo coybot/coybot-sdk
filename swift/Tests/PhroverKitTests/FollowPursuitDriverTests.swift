@@ -5,6 +5,90 @@ import simd
 
 @MainActor
 final class FollowPursuitDriverTests: XCTestCase {
+    func testFreshDepthDoesNotWaitBehindAcknowledgementActorBeforeEverySend() async {
+        let f = Fixture()
+        var capture = f.time - 0.15
+        var queuedReads = 0
+        f.acknowledgementSnapshot = { Date(timeIntervalSince1970: f.time) }
+        f.acknowledgement = {
+            queuedReads += 1
+            f.time += 0.06 // Recorded 32–55 ms acknowledgement scheduling delay.
+            return Date(timeIntervalSince1970: f.time)
+        }
+        f.depthProvider = { _ in
+            let age = f.time - capture
+            f.time += 0.002
+            return f.observation(age: age)
+        }
+        f.waitHandler = { duration in
+            f.time += Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
+            f.sequence += 1
+            capture = f.time - 0.15
+            await Task.yield()
+        }
+        f.onSend = { _ in
+            f.time += 0.037146375
+            f.sendAdmissionDuration = 0.037146375
+            XCTAssertLessThan(f.time - capture, 0.25)
+            if f.commands.count == 5 { f.position = Vec2(5, 0) }
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertEqual(f.commands.count, 5)
+        XCTAssertEqual(f.stops, 0)
+        XCTAssertEqual(queuedReads, 0)
+    }
+
+    func testSynchronousAcknowledgementCannotInventOrRenewFreshness() async {
+        for offset: Double? in [nil, -2.1, 0.1] {
+            let f = Fixture()
+            f.acknowledgementSnapshot = { offset.map { Date(timeIntervalSince1970: f.time + $0) } }
+            f.acknowledgement = { XCTFail("Do not substitute another acknowledgement for invalid snapshot evidence"); return Date() }
+            let result = await f.driver.run()
+            XCTAssertEqual(result, .failed(.commsLost))
+            XCTAssertTrue(f.commands.isEmpty)
+        }
+    }
+
+    func testCautionRampRoundingCannotBecomeTransportObstacleFailure() async {
+        let f = ControllerFixture()
+        f.caution = true
+        f.arrival = .zero
+        f.sleepHandler = { _ in
+            if f.commands.count == 1, let entry = f.firstSendTime {
+                // Pick a real ramp timestamp whose multiply/divide limiting
+                // rounds one ULP above 0.12 before the fix.
+                let next = (801...1900).map { entry + Double($0) / 10000 }.first { time in
+                    let peak = 0.1 + 0.25 * (time - entry)
+                    return peak * (0.12 / peak) > 0.12
+                }
+                XCTAssertNotNil(next)
+                f.clock.value = next ?? (entry + 0.15)
+            } else { f.clock.value += 0.02 }
+            f.sequence += 1
+            await Task.yield()
+        }
+        f.afterSend = { if f.commands.count == 2 { f.position = Vec2(5, 0) } }
+        let result = await f.run()
+        XCTAssertEqual(result.result, .arrived)
+        XCTAssertEqual(f.commands.count, 2)
+        XCTAssertTrue(f.commands.allSatisfy { max(abs($0.left), abs($0.right)) <= 0.12 })
+        XCTAssertEqual(result.stopOutcome, .confirmed)
+    }
+
+    func testTransportStillRejectsPreparedCommandWhenCautionLimitTightens() async {
+        for limit in [0.08, 0.12.nextDown] {
+            let f = ControllerFixture()
+            f.caution = true
+            f.arrival = .zero
+            f.beforeAttempt = { if !f.commands.isEmpty { f.cautionLimit = limit } }
+            let result = await f.run()
+            XCTAssertEqual(result.result, .failed(.obstacle))
+            XCTAssertEqual(f.commands.count, 1, "The request prepared for the older cap must not enter transport")
+            XCTAssertEqual(result.stopOutcome, .confirmed)
+        }
+    }
+
     func testUnresolvedStartingGeometryHasDistinctFailureWithoutMotion() async {
         let f = Fixture()
         f.planProvider = { _, _ in .init(path: [], rejection: .startBlocked,
@@ -1290,6 +1374,7 @@ final class FollowPursuitDriverTests: XCTestCase {
         var freshAt = 0.0
         var obstacle = false
         var caution = false
+        var cautionLimit = 0.12
         var planningFailure: PathPlanningFailure?
         var position = Vec2.zero
         var arrival = Vec2(5, 0)
@@ -1319,7 +1404,7 @@ final class FollowPursuitDriverTests: XCTestCase {
                     }
                     return .init(state: self.caution ? .caution : .clear, clearance: self.caution ? 0.49 : 5,
                         supportCount: 0, sampleAge: 0.01,
-                        requiredStoppingDistance: 0.3, motionClass: .classify(command), speedLimit: self.caution ? 0.12 : nil)
+                        requiredStoppingDistance: 0.3, motionClass: .classify(command), speedLimit: self.caution ? self.cautionLimit : nil)
                 }, plan: { _, _ in XCTFail("Production-style pursuit must not call the synchronous planner"); return nil },
                 lastAckAt: { Date(timeIntervalSince1970: clock.value) }, sendCommand: { _ in XCTFail("Receipt sender required") },
                 stopRover: {
@@ -1391,6 +1476,7 @@ final class FollowPursuitDriverTests: XCTestCase {
         var notifications = false
         var waitHandler: ((Duration) async -> Void)?
         var acknowledgement: (@MainActor () async -> Date?)?
+        var acknowledgementSnapshot: (@MainActor () -> Date?)?
         func observation(age: Double) -> DepthSafetyObservation {
             .init(state: .clear, clearance: 5, supportCount: 0, sampleAge: age,
                 requiredStoppingDistance: 0.3, motionClass: .forward, speedLimit: nil)
@@ -1424,7 +1510,8 @@ final class FollowPursuitDriverTests: XCTestCase {
             self.events.append(name)
             self.records.append((name, fields))
         },
-            admissionDuration: { self.sendAdmissionDuration }, depthNotificationsEnabled: notifications))
+            admissionDuration: { self.sendAdmissionDuration }, depthNotificationsEnabled: notifications,
+            acknowledgementSnapshot: acknowledgementSnapshot))
         }
     }
 }

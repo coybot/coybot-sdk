@@ -17,7 +17,10 @@ public actor RoverControl {
     private let retrySleep: @Sendable (TimeInterval) async -> Void
 
     /// Timestamp of the last successful command; the comms watchdog reads this.
-    public private(set) var lastAckAt: Date?
+    public var lastAckAt: Date? { acknowledgementStore.latest }
+    private nonisolated let acknowledgementStore = RoverAcknowledgementStore()
+    /// Same genuine acknowledgement as the actor API, without a scheduling hop.
+    nonisolated var lastAcknowledgementSnapshot: Date? { acknowledgementStore.latest }
 
     public init(host: String = RoverConfig.defaultHost, session: URLSession = .shared) {
         self.baseURL = URL(string: "http://\(host)")!
@@ -33,6 +36,21 @@ public actor RoverControl {
     }
 
     // MARK: - Motion
+
+    @MainActor
+    func sendFollowNavigationWithReceipt(_ cmd: WheelCommand) async -> RoverCommandDiagnosticResult {
+        let authorization = cmd.left != 0 || cmd.right != 0 ? FollowTurnBurstTransportScope.authorization : nil
+        if let authorization {
+            authorization.transportCapture?.recordTiming(.init(boundary: .actorEntry, uptime: authorization.uptime()))
+        }
+        return await sendJSONDiagnostic(["T": RoverConfig.Opcode.speedControl, "L": cmd.right, "R": cmd.left],
+            authorization: authorization)
+    }
+
+    @MainActor
+    func stopFollowWithReceipt() async -> RoverCommandDiagnosticResult {
+        await sendJSONDiagnostic(["T": RoverConfig.Opcode.speedControl, "L": 0.0, "R": 0.0])
+    }
 
     func sendNavigationWithReceipt(_ cmd: WheelCommand) async -> RoverCommandDiagnosticResult {
         let authorization = cmd.left != 0 || cmd.right != 0 ? FollowTurnBurstTransportScope.authorization : nil
@@ -120,8 +138,12 @@ public actor RoverControl {
         _ = try await sendJSONDiagnostic(payload).get()
     }
 
+    // Inherit the caller's executor: follow validation and the final HTTP gates
+    // stay on MainActor, while the existing manual API remains on RoverControl.
+    // Both paths share the exact same retry, receipt, expiry and cancellation logic.
     private func sendJSONDiagnostic(_ payload: [String: Any],
-                                    authorization: FollowTurnBurstAuthorization? = nil) async -> RoverCommandDiagnosticResult {
+                                    authorization: FollowTurnBurstAuthorization? = nil,
+                                    isolation: isolated (any Actor)? = #isolation) async -> RoverCommandDiagnosticResult {
         let data: Data
         do { data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) }
         catch { return .init(receipt: .unknown, failure: error) }
@@ -222,9 +244,9 @@ public actor RoverControl {
                 guard (200...299).contains(http.statusCode) else {
                     throw RoverControlError.serverError(http.statusCode)
                 }
-                lastAckAt = Date()
+                let acknowledgement = acknowledgementStore.recordSuccess()
                 return .init(receipt: .init(httpStatus: http.statusCode, acknowledged: true,
-                    acknowledgementUTC: lastAckAt, attempts: attempt, outcome: "acknowledged"), failure: nil)
+                    acknowledgementUTC: acknowledgement, attempts: attempt, outcome: "acknowledged"), failure: nil)
             } catch {
                 recordActualAttempt()
                 lastError = error
@@ -306,6 +328,21 @@ public actor RoverControl {
             return true
         default:
             return false
+        }
+    }
+}
+
+/// All access is locked; creating the timestamp inside the lock preserves
+/// completion ordering across manual and follow transport executors.
+private final class RoverAcknowledgementStore: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Date?
+    var latest: Date? { lock.withLock { value } }
+    func recordSuccess() -> Date {
+        lock.withLock {
+            let acknowledgedAt = Date()
+            value = acknowledgedAt
+            return acknowledgedAt
         }
     }
 }

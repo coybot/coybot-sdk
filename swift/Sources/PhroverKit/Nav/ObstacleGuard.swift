@@ -45,7 +45,8 @@ public struct ObstacleGuard: Sendable {
         case .clear:
             return .allow(command, depthSafety: depthSafety)
         case .caution:
-            guard let limit = depthSafety.speedLimit, limit > 0 else {
+            guard let limit = depthSafety.speedLimit, limit.isFinite, limit > 0,
+                  command.left.isFinite, command.right.isFinite else {
                 return .stopDepth(depthSafety)
             }
             let maximum = max(abs(command.left), abs(command.right))
@@ -53,8 +54,12 @@ public struct ObstacleGuard: Sendable {
                 return .allow(command, depthSafety: depthSafety)
             }
             let scale = limit / maximum
+            // Multiplication can round the peak one ULP above the limit. Clamp
+            // the result so repeated driver/transport checks are exactly stable,
+            // without accepting an over-limit command via an epsilon comparison.
             return .allow(
-                WheelCommand(left: command.left * scale, right: command.right * scale),
+                WheelCommand(left: max(-limit, min(limit, command.left * scale)),
+                             right: max(-limit, min(limit, command.right * scale))),
                 depthSafety: depthSafety
             )
         case .stop, .unavailable:

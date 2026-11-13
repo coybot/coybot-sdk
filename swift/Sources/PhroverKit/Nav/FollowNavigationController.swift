@@ -59,6 +59,7 @@ final class FollowNavigationController {
     private var pursuitCommandFence: FollowTurnBurstFence?
     private let readySignalCostmap: (@MainActor (Vec2) async -> Costmap?)?
     private let currentLastAck: () async -> Date?
+    private var currentAcknowledgementSnapshot: (@MainActor @Sendable () -> Date?)?
     private let sendCommand: (WheelCommand) async throws -> Void
     private let sendFollowBurstCommand: (WheelCommand) async -> RoverCommandDiagnosticResult
     private let transportUptime: @Sendable () -> TimeInterval
@@ -278,13 +279,14 @@ final class FollowNavigationController {
                 expectedFloorY: reference, classifiedFloorY: classified, groundDepth: groundDepth)
         }
         readySignalCostmap = { await CostmapBuilder.buildAsync(from: ar.meshAnchors, center: $0) }
-        currentLastAck = { await control.lastAckAt }
+        currentLastAck = { control.lastAcknowledgementSnapshot }
+        currentAcknowledgementSnapshot = { control.lastAcknowledgementSnapshot }
         sendCommand = Self.diagnosticSender(legacy: { try await control.sendNavigation($0) },
-            receipt: { await control.sendNavigationWithReceipt($0) })
-        sendFollowBurstCommand = { await control.sendNavigationWithReceipt($0) }
+            receipt: { await control.sendFollowNavigationWithReceipt($0) })
+        sendFollowBurstCommand = { await control.sendFollowNavigationWithReceipt($0) }
         transportUptime = { ProcessInfo.processInfo.systemUptime }
         stopRover = Self.diagnosticStopper(legacy: { try await control.stop() },
-            receipt: { await control.stopWithReceipt() })
+            receipt: { await control.stopFollowWithReceipt() })
         sleep = { try? await Task.sleep(for: $0) }
         now = Date.init
         diagnosticEmitter = Self.runtimeDiagnosticEmitter()
@@ -482,6 +484,7 @@ final class FollowNavigationController {
                                    planner: @escaping @MainActor (Vec2, Vec2) async -> FollowPursuitPlan?) async -> NavigationResult {
         let evidence = FollowMotionTaskScope.evidence
         var admissionDuration: Double?
+        var lastAdmissionDiagnostic = -Double.infinity
         func owned() -> Bool {
             operationGeneration == owner && evidence?.fenced != true && !stopUnconfirmed &&
                 activeFollowEvidence === evidence && recoveryAuthorized
@@ -549,6 +552,26 @@ final class FollowNavigationController {
                 }
                 evidence?.recordCommandReceipt(result.receipt)
                 admissionDuration = transport.attempts.first.map { max(0, $0.entryUptime - transportEntry) }
+                let completed = self.transportUptime()
+                if completed - lastAdmissionDiagnostic >= 0.5 || result.failure != nil {
+                    lastAdmissionDiagnostic = completed
+                    let timings = transport.timings
+                    let validationStart = timings.first { $0.boundary == .authorizationStart && $0.attempt == 1 }?.uptime
+                    let validationEnd = timings.first { $0.boundary == .authorizationEnd && $0.attempt == 1 }?.uptime
+                    let httpEntry = transport.attempts.first?.entryUptime
+                    func interval(_ start: Double?, _ end: Double?) -> FollowDiagnosticValue {
+                        guard let start, let end, start.isFinite, end.isFinite, end >= start else { return .null }
+                        return .number(end - start)
+                    }
+                    self.diagnosticEmitter?.emit(.init(event: "follow_pursuit.admission_timing", context: .init(
+                        sessionGeneration: evidence?.context.request?.sessionGeneration,
+                        operationID: evidence?.context.controllerOperationID, purpose: "followGoal", phase: "following"), payload: [
+                            "queued_before_validation_s": interval(transportEntry, validationStart),
+                            "validation_s": interval(validationStart, validationEnd),
+                            "validation_to_http_s": interval(validationEnd, httpEntry),
+                            "total_admission_s": interval(transportEntry, httpEntry),
+                            "transport_outcome": .string(result.receipt.outcome)]))
+                }
                 if let error = result.failure {
                     let denial = error as? FollowTurnBurstTransportDenial
                     let unsent = (denial == .expired || denial == .fenced || denial == .cancelled) &&
@@ -564,11 +587,12 @@ final class FollowNavigationController {
                 self.diagnosticEmitter?.emit(.init(event: "follow_pursuit." + stage, context: .init(
                     sessionGeneration: evidence?.context.request?.sessionGeneration,
                     operationID: evidence?.context.controllerOperationID, purpose: "followGoal", phase: "following"), payload: fields))
-            }, admissionDuration: { admissionDuration }, depthNotificationsEnabled: observeDepthSafety != nil))
+            }, admissionDuration: { admissionDuration }, depthNotificationsEnabled: observeDepthSafety != nil,
+            acknowledgementSnapshot: currentAcknowledgementSnapshot))
         pursuitDriver = driver
         let removePursuitDepthObserver = observeDepthSafety? { [weak driver] _ in driver?.depthPublished() }
         state = .planning
-        let task = Task { await driver.run() }
+        let task = Task(priority: .userInitiated) { await driver.run() }
         loop = task
         defer { removePursuitDepthObserver?(); if pursuitDriver === driver { pursuitDriver = nil } }
         let result = await task.value

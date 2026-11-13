@@ -64,6 +64,7 @@ final class FollowPursuitDriver {
         let emit: @MainActor (String, [String: FollowDiagnosticValue]) -> Void
         var admissionDuration: @MainActor () -> Double? = { nil }
         var depthNotificationsEnabled = false
+        var acknowledgementSnapshot: (@MainActor () -> Date?)? = nil
     }
 
     private final class Job {
@@ -109,10 +110,12 @@ final class FollowPursuitDriver {
     private var job: Job?
     private var active = true
     private var depthRevision: UInt64 = 0
+    private var depthPublishedAt: Double?
     private var depthWaiter: (id: UUID, continuation: CheckedContinuation<Void, Never>)?
 
     func depthPublished() {
         depthRevision &+= 1
+        depthPublishedAt = environment.uptime()
         wakeDepthWaiter()
     }
 
@@ -388,11 +391,12 @@ final class FollowPursuitDriver {
             // never manufacture an acknowledgement or renew its timestamp.
             let ackReadStarted = environment.uptime()
             let cachedAge = stoppedAcknowledgement.map { environment.date().timeIntervalSince($0) }
-            let reuseAck = refreshAfter != nil && !movementActive && cachedAge.map {
+            let reuseAck = environment.acknowledgementSnapshot == nil && refreshAfter != nil && !movementActive && cachedAge.map {
                 $0.isFinite && $0 >= 0 && $0 + max(Self.minimumFreshnessMargin, maximumAdmissionDuration + 0.01) < RoverConfig.commsWatchdogTimeout
             } == true
             let ack: Date?
-            if reuseAck { ack = stoppedAcknowledgement }
+            if let snapshot = environment.acknowledgementSnapshot { ack = snapshot() }
+            else if reuseAck { ack = stoppedAcknowledgement }
             else {
                 ack = await environment.acknowledgement()
                 stoppedAcknowledgement = refreshAfter != nil && !movementActive ? ack : nil
@@ -455,6 +459,10 @@ final class FollowPursuitDriver {
             var depthExpiry = -Double.infinity
             let assessmentStarted = environment.uptime()
             let observedDepthRevision = depthRevision
+            let notificationLag: FollowDiagnosticValue = depthPublishedAt.map {
+                let elapsed = assessmentStarted - $0
+                return elapsed.isFinite && elapsed >= 0 ? .number(elapsed) : .null
+            } ?? .null
             do {
                 let readStarted = environment.uptime()
                 let observation = environment.depth(safeCommand)
@@ -507,6 +515,8 @@ final class FollowPursuitDriver {
                 }
                 environment.emit("freshness_margin_wait", ["remaining_s": .number(remaining),
                     "acknowledgement_read_s": .number(ackReadDuration), "acknowledgement_reused": .bool(reuseAck),
+                    "acknowledgement_snapshot": .bool(environment.acknowledgementSnapshot != nil),
+                    "depth_notification_to_evaluation_s": notificationLag,
                     "required_s": .number(requiredMargin), "observed_admission_s": .number(maximumAdmissionDuration),
                     "depth_capture_s": .number(captureTime),
                     "confirmed_stop_s": refreshAfter.map { .number($0.time) } ?? .null,
@@ -560,6 +570,8 @@ final class FollowPursuitDriver {
             if sendTime - lastDiagnostic >= 0.5 {
                 lastDiagnostic = sendTime
                 environment.emit("drive_tick", ["goal_x": .number(routeGoal.x), "goal_z": .number(routeGoal.y),
+                    "acknowledgement_snapshot": .bool(environment.acknowledgementSnapshot != nil),
+                    "depth_notification_to_evaluation_s": notificationLag,
                     "acknowledgement_read_s": .number(ackReadDuration), "acknowledgement_reused": .bool(reuseAck),
                     "requested_goal_x": .number(goal.x), "requested_goal_z": .number(goal.y),
                     "revision": .number(Double(revision)), "path_revision": .number(Double(routeRevision ?? 0)),

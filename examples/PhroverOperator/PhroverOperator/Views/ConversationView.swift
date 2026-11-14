@@ -233,6 +233,7 @@ struct ConversationView: View {
             let followClock = SystemFollowClock()
             var followConfiguration = FollowMeConfiguration.continuous
             followConfiguration.waitForUserReturn = true
+            followConfiguration.planningMode = .reactiveDepth
             let follow = FollowMeCoordinator(
                 perception: ARFollowMePerceptionSource(ar: ar, detector: detector),
                 motion: NavigationFollowMeMotion(navigation: nav),
@@ -558,7 +559,7 @@ private struct LiveCameraDebugPanel: View {
         previewFrame = evaluation.snapshot.id
         let age = ProcessInfo.processInfo.systemUptime - evaluation.snapshot.timestamp
         previewAge = age.isFinite && age >= 0 ? age : nil
-        visibleObjects = PerceptionDebugSummary.visibleObjects(predictions.map {
+        visibleObjects = evaluation.receipt.isTrackedContinuation ? "person (tracked target only)" : PerceptionDebugSummary.visibleObjects(predictions.map {
             PerceivedObject(label: $0.label, confidence: $0.confidence,
                 normalizedPoint: CGPoint(x: $0.boundingBox.midX, y: $0.boundingBox.midY))
         })

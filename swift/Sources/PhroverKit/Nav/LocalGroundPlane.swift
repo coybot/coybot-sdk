@@ -54,6 +54,20 @@ struct LocalGroundPlane: Sendable {
             } ?? false
             result = assessReferenced(vertices: vertices, center: center, expectedFloorY: classifiedFloorY,
                 localizeLowerConflicts: true, corroboratedSupport: corroborated)
+            if result.plane == nil, result.diagnostics["local_floor_rejection"] == "inconsistent_surface" {
+                // A stable classified floor is independent of mount calibration.
+                // Try a tightly reference-seeded consensus before falling back
+                // to the global low tail. Require stronger absolute support,
+                // residual, slope and height agreement in this branch.
+                let consensus = assessReferenced(vertices: vertices, center: center, expectedFloorY: classifiedFloorY,
+                    localizeLowerConflicts: true, classifiedConsensus: true)
+                if consensus.plane != nil {
+                    result = consensus
+                    result.diagnostics["classified_standard_rejection"] = "inconsistent_surface"
+                } else {
+                    result.diagnostics["classified_consensus_rejection"] = consensus.diagnostics["local_floor_rejection"]
+                }
+            }
             result.diagnostics["mounted_floor_rejection"] = mounted.diagnostics["local_floor_rejection"]
             result.diagnostics["local_floor_reference_source"] = "classified_floor"
         } else {
@@ -65,7 +79,8 @@ struct LocalGroundPlane: Sendable {
     }
 
     private static func assessReferenced(vertices: [SIMD3<Float>], center: Vec2, expectedFloorY: Float?,
-                                          localizeLowerConflicts: Bool = false, corroboratedSupport: Bool = false)
+                                          localizeLowerConflicts: Bool = false, corroboratedSupport: Bool = false,
+                                          classifiedConsensus: Bool = false)
         -> (plane: Self?, diagnostics: [String: String]) {
         var fields = ["local_floor_status": "rejected", "mounted_floor_reference_y_m": expectedFloorY.map { String($0) } ?? "unavailable"]
         var fitCells: [SIMD3<Double>] = []
@@ -96,13 +111,14 @@ struct LocalGroundPlane: Sendable {
         let all = cells.values.sorted { $0.x == $1.x ? $0.z < $1.z : $0.x < $1.x }
         fitCells = all
         let eligible = all.filter { abs($0.y - Double(expectedFloorY)) <= 0.06 }
-        let minimumSupportCells = 24
-        let requiredSupportFraction = corroboratedSupport ? 0.68 : 0.7
+        let minimumSupportCells = classifiedConsensus ? 48 : 24
+        let requiredSupportFraction = classifiedConsensus ? 2.0 / 3.0 : (corroboratedSupport ? 0.68 : 0.7)
         fields["local_floor_required_support_fraction"] = String(requiredSupportFraction)
-        fields["local_floor_support_policy"] = corroboratedSupport ? "corroborated_marginal_support" : "standard"
+        fields["local_floor_support_policy"] = classifiedConsensus ? "classified_reference_consensus" :
+            (corroboratedSupport ? "corroborated_marginal_support" : "standard")
         fields["local_floor_spatial_cells"] = String(all.count)
         fields["local_floor_reference_consistent_cells"] = String(eligible.count)
-        // Consistency is measured among independently mount-consistent floor
+        // Consistency is measured among independently reference-consistent floor
         // candidates. Raised clutter is still classified by the costmap, but
         // cannot increase the number of floor inliers required to fit a plane.
         let requiredInliers = max(minimumSupportCells, Int(ceil(Double(eligible.count) * requiredSupportFraction)))
@@ -110,7 +126,9 @@ struct LocalGroundPlane: Sendable {
         fields["local_floor_required_inlier_cells"] = String(requiredInliers)
         guard eligible.count >= minimumSupportCells else { return reject("insufficient_reference_consistent_support") }
         let median = eligible.map(\.y).sorted()[eligible.count / 2]
-        let seed = eligible.filter { abs($0.y - median) <= 0.03 }
+        let seedCenter = classifiedConsensus ? Double(expectedFloorY) : median
+        let seedRadius = classifiedConsensus ? 0.015 : 0.03
+        let seed = eligible.filter { abs($0.y - seedCenter) <= seedRadius }
         fields["local_floor_seed_cells"] = String(seed.count)
         guard let initial = fit(seed) else { return reject("degenerate_support") }
         let inliers = eligible.filter { abs($0.y - (initial.2 + initial.0 * $0.x + initial.1 * $0.z)) <= 0.015 }
@@ -121,10 +139,11 @@ struct LocalGroundPlane: Sendable {
         fields["local_floor_candidate_x_slope"] = String(a)
         fields["local_floor_candidate_z_slope"] = String(b)
         let usedMarginalSupport = inliers.count < max(minimumSupportCells, Int(ceil(Double(eligible.count) * 0.7)))
-        let referenceTolerance = usedMarginalSupport ? 0.02 : 0.04
-        guard hypot(a, b) <= 0.08, abs(c - Double(expectedFloorY)) <= referenceTolerance else { return reject("slope_or_mount_mismatch") }
+        let referenceTolerance = classifiedConsensus ? 0.01 : (usedMarginalSupport ? 0.02 : 0.04)
+        let slopeLimit = classifiedConsensus ? 0.04 : 0.08
+        guard hypot(a, b) <= slopeLimit, abs(c - Double(expectedFloorY)) <= referenceTolerance else { return reject("slope_or_mount_mismatch") }
         let rms = sqrt(inliers.reduce(0.0) { $0 + pow($1.y - (c + a * $1.x + b * $1.z), 2) } / Double(inliers.count))
-        guard rms <= 0.01 else { return reject("high_residual") }
+        guard rms <= (classifiedConsensus ? 0.005 : 0.01) else { return reject("high_residual") }
         let minX = inliers.map(\.x).min()!, maxX = inliers.map(\.x).max()!
         let minZ = inliers.map(\.z).min()!, maxZ = inliers.map(\.z).max()!
         let quadrants = (0..<4).map { quadrant in

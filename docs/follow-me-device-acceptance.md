@@ -13,6 +13,308 @@ Automated simulator tests do not establish LiDAR projection accuracy or prove th
 
 Record the tested phone, rover, build revision, pass/fail per step, and redacted runtime-log evidence here after the supervised run. Do not attach camera images or raw transcripts.
 
+## Basic direct following with live depth (November 13, 21:21 validation)
+
+The 21:09 failure had a free raw start cell but an inflated blocked cell from
+nearby reconstructed geometry; a prior attempt also timed out in mesh planning.
+Talk now explicitly selects `FollowPlanningMode.reactiveDepth` for pursuit.
+This basic flat-floor mode produces a single finite target waypoint without
+reading historical mesh, estimating a map floor, invoking A*, or fabricating a
+free-space costmap. Live target changes replace the direct endpoint. The current
+pose controls every wheel request, so this explicit one-waypoint mode does not
+apply the small unmapped-plan pose-shift limit used by ordinary unverified paths.
+Pose generation/freshness, target freshness, actual progress and ownership checks
+remain in the shared driver.
+
+Every command still needs current raw depth, obstacle clearance and exact-command
+transport authorization. The mode stops for obstacles; it does not route around
+them or validate terrain/drop-offs using historical mesh. Use a clear, flat test
+area for initial physical acceptance. Camera/body verification, yaw correction,
+holding distance, communication watchdogs, confirmed stops and recovery deadlines
+remain active. Person-loss and opposite-turn failures in this log are separate
+from the map rejection and are not removed by this planning mode.
+
+The SDK default remains `.mesh`; only Talk opts into reactive pursuit. Its spoken
+readiness is stationary. SDK clients using the legacy moving ready signal still
+have that signal's separate mesh preflight even when reactive pursuit is selected.
+Generic navigation/mission planning remains mesh-based. Task-local scope confines
+the choice to each follow-goal request. Session, plan and drive diagnostics expose
+`planning_mode=reactive_depth`.
+
+Tests verify no mesh closure is called in reactive mode, no invented free map,
+finite-goal validation, latest-goal retargeting after pose movement, and retained
+live-depth protection—including an obstacle appearing only at final transport
+admission. A later mesh-mode request still rejects its blocked start. All 1,627
+SDK tests passed without retries in the 21:21 run. Standards/spec review found no
+Talk-flow blocker; the legacy moving-readiness limitation is documented above.
+The signed Debug build was installed on `HungIphone` (iPhone 15 Pro Max) at
+21:25 local time, installation database sequence 6272.
+
+## Direct catch-up startup (November 13, 20:56 validation)
+
+The 20:43 device capture requested 0.35 for a target about 2.4 m away, but the
+acceleration layer reduced the first command to 0.18 and restarted that ramp after
+each depth recovery. Eligible catch-up now bypasses that additional acceleration
+layer: the target must be freshly verified, at least 0.6 m beyond configured
+stand-off, and moving outward at least 0.1 m/s. The target-derived command (up to
+the existing 0.35 nominal ceiling) proceeds directly to depth and transport gates.
+This also applies after a completed depth recovery when fresh target evidence
+still qualifies. `catchup_ramp_bypassed` identifies this in drive diagnostics.
+
+Near-target slowing, the hold/resume gap, conservative startup for other cases,
+the 500 ms target-evidence authorization deadline, caution speed limits, raw-depth
+freshness, and exact-command transport validation remain enforced. The requested
+wheel values are not calibrated physical speeds. Tests verify direct 0.35 initial
+and post-recovery requests, caution limiting to 0.12, and no movement on stale depth.
+All 1,623 SDK tests passed without retries in the 20:56 run. Physical startup and
+braking must be checked on the rover; this change does not remove sensor-fault stops.
+The signed Debug build was installed on `HungIphone` (iPhone 15 Pro Max) at
+20:59 local time, installation database sequence 6264, after retrying a tunnel timeout.
+
+## Target-aware catch-up and persistent perception pauses (November 13)
+
+The 16:46 device run had seven depth-refresh episodes and five pursuit owners in
+about twelve seconds. Target range grew from roughly 2.06 m to 3.42 m while
+repeated stops restarted the 0.10 wheel-command ramp. Sustained requests near 0.35
+did close the gap. These are requested wheel values, not calibrated ground speed.
+
+Production pursuit now pauses under the same owner for age-only person-frame
+loss, inhibits pending transport, and confirms stop inside the existing driver.
+Repeated pause requests and depth recovery can share a genuinely confirmed
+stationary state. A fresh post-pause capture must qualify before recovery clears;
+pre-pause captures cannot renew the original two-second outage deadline. The
+coordinator chooses turn/hold versus translation while still paused. For
+translation it commits the newest goal before resuming, and the driver waits for
+that goal's valid route. Terminal cleanup remains owned until failure/result
+delivery; a refused goal update cannot replace the terminating owner and renew
+its recovery budget.
+
+An expired replan candidate that completed during a confirmed perception pause
+is discarded once on resume of an already-moving pursuit. A fresh route is then
+required under the same owner. Startup and established depth-recovery deadlines
+remain enforced before this handling. Confirmed stationary intervals are excluded
+from the movement-progress watchdog's clock, without resetting accumulated
+progress or recovery counters. Terminal cleanup may reuse its own acknowledged
+stop only if both driver state and captured operation evidence still confirm it.
+
+Fresh, same-generation body-verified target samples now carry measured position
+and filtered world velocity into pursuit. The speed policy combines bounded
+radial target velocity with gap error, instead of braking twice toward a moving
+stand-off waypoint. A receding target at least 0.6 m beyond stand-off and moving
+outward at least 0.1 m/s can start at up to 0.18 rather than 0.10; the existing 0.25/s
+command-increase ramp and 0.35 nominal ceiling remain. Speed reductions are
+immediate, and a small final crawl prevents asymptotic non-arrival. Continuous
+body-verified following holds around stand-off plus 5 cm (normally 1.55 m) and
+resumes beyond the existing 1.75 m hold threshold. Target-facing corrections
+remember whether they began from a hold.
+
+Target-based speed authorization expires with the contributing capture at 500 ms;
+expired/future/invalid/different-generation samples cannot provide feed-forward.
+An unsent target-expiry rejection recomputes without consuming a depth retry.
+All actual motor requests still pass pose, ownership, acknowledgement, obstacle,
+and exact-command raw-depth admission. Raw depth remains valid for at most 250 ms;
+the depth recovery window remains 600 ms with its existing retry allowance.
+Diagnostics include target range, radial velocity, speed ceiling, speed-evidence
+expiry, perception pause/resume, and reused terminal stops.
+
+Fourteen new tests cover persistent ownership, paused goal changes, post-stop
+resumption, direction changes, failed stop, unchanged deadlines, native terminal
+cleanup, target-speed expiry, finite approach, and replans completing during a
+pause. Review findings on resume ordering, deadline retention, progress timing,
+final crawl, and paused-plan expiry were corrected and verified. The final 20:00
+SDK run passed all 1,621 tests without retries. An earlier full run could not save
+its result bundle because the host ran out of disk space; a 3.9 GB generated
+simulator test log was removed before the successful run. An initial pause-test
+fixture also needed its synthetic clock advanced to allow replanning to finish.
+The signed Debug update was installed on `HungIphone` (iPhone 15 Pro Max) at
+20:03 local time, installation database sequence 6256.
+
+Device acceptance must measure catch-up distance, slowing after a target stops,
+hold/resume hysteresis, and stop counts by cause. Safety stops remain necessary
+when sensor evidence is genuinely stale. The simulated finite-approach test does
+not establish the rover's PWM deadband, acceleration or physical braking distance.
+
+## Full-frame detection with verified visual continuation (November 13)
+
+Follow perception now uses a serial detect/track/revalidate pipeline. Acquisition,
+initial alignment, reacquisition, and return waits use full-frame detection. Once
+the coordinator permits continuation (following, distance holding, waiting for
+departure, or a target-facing correction), a single detected and body-verified
+person can seed `VNTrackObjectRequest` at fast tracking level. Multiple or
+unverified people do not seed a tracker.
+
+Full-frame detection revalidates at a 400 ms capture-time interval. Between those
+evaluations, tracking confidence must be at least 0.8 and a CURRENT-frame body
+pose check must still verify the tracked box. Historical body evidence is never
+relabelled as current. The detector stays configured for CPU/Neural Engine; the
+lightweight tracker uses supported CPU execution, preserving no-GPU wind-down.
+This reduces full-model evaluations, not the same-frame body-verification gate.
+
+The adaptive crop is a Vision region of interest in original upright-image
+coordinates. It expands with image-space movement. A significant direction change
+(at least 45 degrees, with both steps above 0.02 normalized units), ROI boundary,
+clipped box, confidence loss, size/position jump, tracker exception or failed body
+verification triggers full-frame re-detection on the same capture. Camera heading
+changes above 0.12 rad, gaps above 250 ms, source generation/orientation/resolution
+changes and reordered frames also force full detection. No optical lens switch or
+image rescaling changes AR camera intrinsics, pose, or depth alignment.
+
+Tracking state is scoped to both the source subscription and its mode epoch.
+Disable/re-enable between evaluations invalidates the old seed. In-flight tracked
+results from an obsolete mode are dropped, and queued tracked frames cannot
+acquire or reacquire a target. Preview labels tracked-only results explicitly;
+they are not represented as a complete scene inventory. Diagnostics add
+`vision_mode`, `vision_reason`, `vision_roi`, `detection_age_s`,
+`full_detection_count`, and `tracked_frame_count` to perception latency summaries.
+
+Raw depth projection now has its own serial user-interactive dispatch queue,
+independent of the Vision inference worker. It retains one running capture and
+the newest pending capture, preserves capture timestamps, and rejects results
+invalidated by tracking/session changes. Publication remains main-actor-owned.
+The motor's 250 ms raw-depth validity, exact-command admission and recovery
+deadlines remain unchanged; tracking does not authorize motion without depth.
+
+Validation: all 1,607 SDK tests passed without retries in the 16:16 run. New tests
+exercise the real Vision tracker with a textured moving object and a cropped ROI
+to check full-image coordinates; detect/track/revalidate transitions; sharp turns,
+clipping and confidence/body failures; source/mode/session invalidation; stale
+body receipts; and missing current depth. An integration test blocks detector
+inference while confirming depth delivery continues with its original timestamp.
+The initial targeted depth coalescing run timed out once; subsequent focused and
+full-suite runs passed. Standards and spec reviews identified an epoch-invalidation
+gap, sharp-turn crop behavior and preview provenance; these were corrected and
+verified in follow-up review.
+The signed Debug update was installed on `HungIphone` (iPhone 15 Pro Max) at
+16:26 local time, installation database sequence 6248.
+
+Physical acceptance must measure the ratio of tracking to full detection and
+compare inference/depth p95 latency, not assume faster execution from API choice.
+Test sideways changes, occlusion, a second person, return/reacquisition, and app
+backgrounding. Track-only frames still need same-frame body evidence, so achieved
+frame rate depends on body-pose cost and device load. Existing map and planning
+failures are not solved merely by faster target detection.
+
+## Stopped target-facing observation recovery (November 13, 15:08 validation)
+
+The 14:46 device run started the new target-facing turn, then perception age
+repeatedly crossed 500 ms. One frame was published at 310 ms but processed at
+664 ms (291 ms publication-to-ingress plus 63 ms ingress-to-processing). Inference
+was about 233 ms for that frame. Tracking and timestamps remained valid; the
+two-second perception recovery window eventually expired while aligning.
+
+A target-facing episode now retains its confirmed stop fence while stationary
+and waiting for a usable observation. Age-only expiry in that state does not
+request another stop or move the fence past delayed captures. A fresh matched
+post-stop observation may resume alignment against that same fence; it must
+still meet source generation, sequence, capture age, settling and health checks.
+The marker is revoked before admitting any turn and on a structural fault or
+episode teardown. Stop completions can publish it only for their current owner.
+`follow_facing.stop_reused` records the retained acknowledgement time.
+
+Perception producer/lifecycle, coordinator ingestion and frame-processing tasks
+now use explicit user-initiated priority. This removes reliance on inherited task
+priority, but its effect on measured device delivery latency remains to be checked.
+The fix does not relax the 500 ms observation limit, two-second perception outage
+deadline, ten-second target-facing deadline, depth limits, or failed-stop latch.
+
+Regression tests cover a delayed pre-stop capture expiring while already stopped,
+resumption from the original fence, a mandatory new stop after resumed motion,
+unchanged outage expiry, and structural depth loss escalating to a failed-stop
+latch. Focused source/mailbox/facing tests passed. All 1,595 SDK tests passed in
+the full run, with one automatic retry each for existing tests
+`NavigationSafetyTests.testReachedGoalWithStaleDepthWaitsForFreshSnapshotBeforeArrival`
+and `MissionAgentTests.testOfflineOtherRoomSearchStopsSuspendedScanWhenSessionGenerationChanges`.
+An earlier targeted run encountered a simulator boot timeout; serial targeted
+runs then completed successfully.
+The signed Debug update was installed on `HungIphone` (iPhone 15 Pro Max) at
+15:19 local time, installation database sequence 6240.
+
+On device, verify that a briefly delayed frame can resume the turn without a
+sequence of redundant stop acknowledgements. Check capture-to-publication and
+publication-to-ingress timings separately. A sustained genuinely stale stream
+must still stop following; simulator results do not establish device latency.
+
+## Target-facing turns during following and distance holding (November 13)
+
+The 14:06 run reached pursuit after the floor update. Target bearing grew from
+about 6 to 27 degrees while rover yaw changed only about one degree. At 1.75 m,
+the coordinator stopped in `holdingDistance` despite the off-centre target. The
+target subsequently became clipped/unverified. Predicted pursuit restarted with
+wheel commands around 0.027/0.040 and ended with insufficient measured progress.
+
+Continuous following now enters a target-facing alignment when a fresh matched,
+body-verified target exceeds 15 degrees of heading error, including while holding
+distance. Translation stops first. The existing pose-controlled alignment uses
+fresh post-stop observations, normal depth checks and the existing 5-degree finish
+tolerance. It is independent of the forward-approach speed taper. After another
+fresh post-stop match confirms alignment, the coordinator returns directly to
+holding or following without repeating readiness or resetting the departure
+baseline. A target direction change after a turn is recomputed from the new
+observation, including an opposite-direction correction.
+
+One target-facing episode has a fixed ten-second deadline. Stop, lifecycle
+inhibition, target loss and failure fence its pending work. For body-verified
+continuous tracking, a missed target while holding, or a last target position
+outside the central 15-degree window while driving, enters confirmed-stop bounded
+reacquisition rather than starting/continuing translation from prediction.
+Ambiguous full observations also enter reacquisition. Central-view continuation
+and legacy non-body-verified clients retain their existing coasting behavior.
+`follow_facing.started` and `follow_facing.completed` identify this transition.
+
+Eight new `FollowTargetFacingTests` cover both directions, post-stop admission,
+translation-stop ordering, hold/follow resumption, changed target direction,
+failed stop, explicit stop, target loss, and nonrenewable timeout. The two initial
+regressions failed before implementation. All 1,592 SDK tests passed in the 14:21
+run; the existing `ARSharedMissionFrameCalibratorTests.testSuccessfulEmptyScanClearsScannerFailureOnce`
+needed two automatic retries. The new target-facing tests passed on their first run.
+The signed Debug build was installed on `HungIphone` (iPhone 15 Pro Max) at
+14:30 local time, installation database sequence 6232.
+
+Device acceptance must verify actual left/right turning and target retention as
+the person moves sideways at 1.5–2 m, then changes direction while walking away.
+Confirm no repeated readiness announcement, no forward restart from an unverified
+target while holding, and no delayed turn after Stop Following or leaving Talk.
+Motor PWM response and physical catch-up performance remain device measurements.
+
+## Classified-floor consensus with mount disagreement (November 13, afternoon)
+
+The 13:24 capture had a classified floor near -1.187576 m, a mounted estimate near
+-1.253760 m, and a global low-tail estimate near -1.277397 m. The 6.6 cm mount
+disagreement disabled the earlier corroborated allowance. The ordinary local fit
+found 137 of 198 candidates (139 required) and rejected the surface. Logged
+blocking samples at -1.110777 m then appeared 16.6 cm above the global fallback,
+instead of about 7.7 cm above the classified floor.
+
+After an ordinary classified fit rejects inconsistent support, a new bounded
+consensus attempt seeds the fit within 1.5 cm of the independently stabilized
+classified reference. It requires at least 48 inliers, at least two-thirds of all
+reference-consistent candidates, surrounding spatial support, maximum 4% slope,
+maximum 5 mm RMS residual, and agreement within 1 cm of the classified reference.
+It does not depend on mount agreement and does not hard-code a height correction.
+Failure retains the original rejection plus `classified_consensus_rejection`;
+success logs `local_floor_support_policy=classified_reference_consensus`.
+
+The existing classified-floor tracker still requires three distinct geometry
+updates spanning at least 150 ms, agreement within 2 cm, freshness within two
+seconds, an observed boundary around the rover, and no competing classified level.
+The fitted correction is limited to supported local geometry. Raised obstacles
+and unverified lower geometry remain blocked by the existing costmap rules.
+
+The full reduced estimator capture failed before the fix and passed afterward:
+the fitted floor is about -1.187942 m, putting the samples about 7.72 cm above it.
+Rebuilding reduced geometry with the logged blocking points produces raw start
+cost 0. A minimized 69-cell capture is retained in
+`ClassifiedFloorReferenceReplayTests`, with tests for obstacle/depression retention,
+freshness, removal, sparse/one-sided/competing support, and stricter residual and
+height bounds. All 1,584 SDK tests passed without retries in the 13:39 run.
+The signed Debug build was installed on `HungIphone` (iPhone 15 Pro Max) at
+13:48 local time, installation database sequence 6224.
+
+Physical path acceptance still requires a device trial. This change addresses
+the floor-reference fallback; it does not extend planning deadlines or bypass
+path-connection collision checks. A reduced mesh replay is not proof that the
+complete device map has a traversable route.
+
 ## Corroborated marginal floor support (November 13)
 
 The 11:44 device failure rejected a local floor with 170 inliers among 248

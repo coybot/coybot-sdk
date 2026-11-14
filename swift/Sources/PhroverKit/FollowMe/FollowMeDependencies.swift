@@ -7,6 +7,23 @@ public protocol FollowMeReturnReadiness: AnyObject {
 }
 import RoverNav
 
+/// Optional fast visual continuation. Acquisition, loss and lifecycle changes
+/// must disable it so the next observation comes from full-frame detection.
+@MainActor
+public protocol FollowVisualTrackingControl: AnyObject {
+    func setVisualTrackingEnabled(_ enabled: Bool)
+}
+
+/// Keeps a production pursuit owner alive through an age-only perception pause.
+/// Nil means unsupported; false means the owned pause could not confirm stop.
+@MainActor
+protocol FollowMePursuitControl: AnyObject {
+    var preservesFollowGoalOwner: Bool { get }
+    func pauseFollowForPerception() async -> Bool?
+    func canResumeFollowAfterPerception(timestamp: Double) -> Bool
+    func resumeFollowAfterPerception(timestamp: Double) -> Bool
+}
+
 public enum FollowPerceptionIssue: String, Equatable, Sendable {
     case noFrames, staleFrame, poseUnavailable, depthUnavailable, trackingLimited, trackingUnavailable
 

@@ -4,9 +4,17 @@ import RoverNav
 
 /// Only detections and depth belonging to a single rear-camera AR snapshot may be combined.
 @MainActor
-public final class ARFollowMePerceptionSource: FollowMePerception {
+public final class ARFollowMePerceptionSource: FollowMePerception, FollowVisualTrackingControl {
     private let ar: ARSessionManager
     private let detector: Detector
+    private var visualTrackingEnabled = false
+    private var trackingModeVersion: UInt64 = 0
+
+    public func setVisualTrackingEnabled(_ enabled: Bool) {
+        guard enabled != visualTrackingEnabled else { return }
+        visualTrackingEnabled = enabled
+        trackingModeVersion &+= 1
+    }
 
     public var detectorReady: Bool { detector.isLoaded }
     public var personLabelAvailable: Bool { detector.supportedCanonicalLabels.contains("person") }
@@ -21,11 +29,13 @@ public final class ARFollowMePerceptionSource: FollowMePerception {
         let lifecycle = ar.lifecycleEvents()
         let mailbox = FollowPerceptionMailbox()
         let consumer = detector.beginFollowConsumer()
-        let frameTask = Task { [detector, ar] in
+        let frameTask = Task(priority: .userInitiated) { [weak self, detector, ar] in
             var lastLatencySummary = -Double.infinity
             var lastRequestedFrame: ARFrameID?
+            var forceFullDetection = false
+            var fullDetections = 0, trackedFrames = 0
             for await queued in frames {
-                guard !Task.isCancelled else { break }
+                guard !Task.isCancelled, let self else { break }
                 // Select before inference, then retain that exact image/depth/
                 // pose pairing through completion. Never re-age old detections.
                 let snapshot = Self.inferenceSnapshot(queued: queued, latest: ar.latestSnapshot)
@@ -34,19 +44,28 @@ public final class ARFollowMePerceptionSource: FollowMePerception {
                 // Diagnostic reason is live; eligibility uses the chosen snapshot.
                 let reason = ar.session.currentFrame.map { Self.trackingReason(from: $0.camera.trackingState) } ?? nil
                 if snapshot.trackingQuality != .normal {
+                    forceFullDetection = true
                     mailbox.publish(Self.batch(from: snapshot, detections: [], trackingReason: reason))
                     continue
                 }
                 let started = ProcessInfo.processInfo.systemUptime
-                guard let receipt = await detector.evaluateForFollowAsync(snapshot), !Task.isCancelled else { continue }
+                let version = self.trackingModeVersion
+                guard let receipt = await detector.evaluateAdaptiveForFollowAsync(snapshot, session: consumer,
+                    allowsTracking: self.visualTrackingEnabled && !forceFullDetection, epoch: version), !Task.isCancelled else { continue }
                 guard ar.sessionGeneration == snapshot.id.generation else { continue }
+                if receipt.visualTracking?.mode == .tracked, version != self.trackingModeVersion {
+                    forceFullDetection = true
+                    continue
+                }
                 let inferenceFinished = ProcessInfo.processInfo.systemUptime
+                if receipt.visualTracking?.mode == .tracked { trackedFrames += 1 } else { fullDetections += 1 }
                 let duration = inferenceFinished - started
                 var batch = Self.batch(from: snapshot, detections: receipt.frame.detections,
                     trackingReason: reason, inferenceDuration: duration,
-                    inferenceStatus: receipt.status == .executed ? .executed : .failed,
+                    inferenceStatus: receipt.status == .executed ? (receipt.visualTracking?.mode == .tracked ? .tracked : .executed) : .failed,
                     inferenceFailureReason: receipt.failureReason,
                     personVerification: receipt.personVerification ?? [])
+                forceFullDetection = batch.people.count != 1 || batch.people.first?.bodyVerified != true
                 let published = ProcessInfo.processInfo.systemUptime
                 batch.publishedUptime = published
                 mailbox.publish(batch)
@@ -56,6 +75,12 @@ public final class ARFollowMePerceptionSource: FollowMePerception {
                         "thermal_state": String(ProcessInfo.processInfo.thermalState.rawValue),
                         "low_power_mode": String(ProcessInfo.processInfo.isLowPowerModeEnabled),
                         "frame_id": "\(snapshot.id.generation):\(snapshot.id.sequence)",
+                        "vision_mode": receipt.visualTracking?.mode.rawValue ?? "full_detection",
+                        "vision_reason": receipt.visualTracking?.reason ?? "legacy",
+                        "full_detection_count": String(fullDetections),
+                        "tracked_frame_count": String(trackedFrames),
+                        "detection_age_s": String(receipt.visualTracking?.detectionAge ?? 0),
+                        "vision_roi": receipt.visualTracking.map { "\($0.region.minX),\($0.region.minY),\($0.region.width),\($0.region.height)" } ?? "0,0,1,1",
                         "capture_to_inference_start_s": String(started - snapshot.timestamp),
                         "inference_s": String(duration),
                         "projection_and_publish_s": String(published - inferenceFinished),
@@ -64,7 +89,7 @@ public final class ARFollowMePerceptionSource: FollowMePerception {
                 }
             }
         }
-        let lifecycleTask = Task {
+        let lifecycleTask = Task(priority: .userInitiated) {
             for await event in lifecycle {
                 guard !Task.isCancelled else { break }
                 switch event {

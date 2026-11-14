@@ -24,12 +24,19 @@ public final class Detector: @unchecked Sendable {
     private var workerRunning = false
     private var pendingJob: InferenceJob?
     private var followConsumers: Set<UUID> = []
+    private var visualPipeline: FollowVisualTrackingPipeline?
+    private var visualTrackingSession: UUID?
+    private var visualTrackingEpoch: UInt64?
+    private var makeObjectTracker: () -> any FollowObjectTracking = { VisionFollowObjectTracker() }
     private struct InferenceJob: Sendable {
         let snapshot: ARFrameSnapshot
         let cancellation: InferenceCancellation
         let continuation: CheckedContinuation<EvaluationReceipt?, Never>
         let previewOnly: Bool
         let includeScreenFallback: Bool
+        let trackingSession: UUID?
+        let allowsVisualTracking: Bool
+        let trackingEpoch: UInt64
     }
     private final class InferenceCancellation: @unchecked Sendable {
         private let lock = NSLock()
@@ -48,10 +55,18 @@ public final class Detector: @unchecked Sendable {
         /// Orientation actually evaluated for these boxes; nil for unknown legacy handlers/failure.
         public let orientation: CGImagePropertyOrientation?
         public let personVerification: [PersonBodyVerifier.Decision]?
+        let visualTracking: FollowVisualTrackingDiagnostics?
+        public var isTrackedContinuation: Bool { visualTracking?.mode == .tracked }
         init(frame: FrameDetections, status: EvaluationStatus, failureReason: FailureReason?,
-             orientation: CGImagePropertyOrientation?, personVerification: [PersonBodyVerifier.Decision]? = nil) {
+             orientation: CGImagePropertyOrientation?, personVerification: [PersonBodyVerifier.Decision]? = nil,
+             visualTracking: FollowVisualTrackingDiagnostics? = nil) {
             self.frame = frame; self.status = status; self.failureReason = failureReason
             self.orientation = orientation; self.personVerification = personVerification
+            self.visualTracking = visualTracking
+        }
+        func withTracking(_ diagnostics: FollowVisualTrackingDiagnostics) -> Self {
+            .init(frame: frame, status: status, failureReason: failureReason, orientation: orientation,
+                personVerification: personVerification, visualTracking: diagnostics)
         }
     }
     public struct FollowEvaluation: Sendable {
@@ -139,7 +154,8 @@ public final class Detector: @unchecked Sendable {
 
     init(supportedLabels: Set<String>, detectionHandler: @escaping (CVPixelBuffer) throws -> [Detection],
          bodyPoseHandler: ((CVPixelBuffer, CGImagePropertyOrientation) throws -> [PersonBodyVerifier.Body])? = nil,
-         inferenceQueue: DispatchQueue? = nil) {
+         inferenceQueue: DispatchQueue? = nil,
+         objectTrackerFactory: @escaping () -> any FollowObjectTracking = { VisionFollowObjectTracker() }) {
         worker = inferenceQueue ?? Self.inferenceWorker()
         screenLocalizer = nil
         now = { ProcessInfo.processInfo.systemUptime }
@@ -148,6 +164,7 @@ public final class Detector: @unchecked Sendable {
         self.detectionHandler = detectionHandler
         self.bodyPoseHandler = bodyPoseHandler
         supportedCanonicalLabels = supportedLabels
+        makeObjectTracker = objectTrackerFactory
     }
 
     /// Exercises the same orientation selection as the production Vision request.
@@ -238,9 +255,20 @@ public final class Detector: @unchecked Sendable {
         inferenceLock.lock()
         defer { inferenceLock.unlock() }
         let result = evaluate(snapshot.image, orientation: snapshot.imageOrientation, includeScreenFallback: false)
-        let people = result.detections.filter { $0.label.lowercased() == "person" }
+        let verification = verifyPeople(result.detections, snapshot: snapshot, failed: result.reason != nil)
+        let receipt = EvaluationReceipt(frame: .init(frameID: snapshot.id, monotonicTimestamp: snapshot.timestamp,
+                                              detections: result.detections),
+                                  status: result.reason == nil ? .executed : .failed,
+                                  failureReason: result.reason, orientation: result.orientation,
+                                  personVerification: verification)
+        cacheLock.withLock { cachedFollowEvaluation = .init(snapshot: snapshot, receipt: receipt) }
+        return receipt
+    }
+
+    private func verifyPeople(_ detections: [Detection], snapshot: ARFrameSnapshot, failed: Bool = false) -> [PersonBodyVerifier.Decision] {
+        let people = detections.filter { $0.label.lowercased() == "person" }
         let verification: [PersonBodyVerifier.Decision]
-        if result.reason != nil || people.isEmpty { verification = [] }
+        if failed || people.isEmpty { verification = [] }
         else if let bodyPoseHandler {
             do {
                 let bodies = try bodyPoseHandler(snapshot.image, snapshot.imageOrientation)
@@ -255,13 +283,33 @@ public final class Detector: @unchecked Sendable {
             verification = people.indices.map { .init(rawPersonID: $0, accepted: false,
                 reason: "body_verification_unavailable", matchingBodies: 0) }
         }
-        let receipt = EvaluationReceipt(frame: .init(frameID: snapshot.id, monotonicTimestamp: snapshot.timestamp,
-                                              detections: result.detections),
-                                  status: result.reason == nil ? .executed : .failed,
-                                  failureReason: result.reason, orientation: result.orientation,
-                                  personVerification: verification)
+        return verification
+    }
+
+    private func evaluateAdaptiveForFollow(_ snapshot: ARFrameSnapshot, session: UUID, epoch: UInt64, allowsTracking: Bool) -> EvaluationReceipt {
+        inferenceLock.lock()
+        defer { inferenceLock.unlock() }
+        if visualTrackingSession != session || visualTrackingEpoch != epoch {
+            visualPipeline?.reset()
+            visualPipeline = FollowVisualTrackingPipeline(tracker: makeObjectTracker())
+            visualTrackingSession = session
+            visualTrackingEpoch = epoch
+        }
+        let receipt = visualPipeline!.evaluate(snapshot, allowsTracking: allowsTracking,
+            detect: { self.evaluateForFollow(snapshot) }, verify: { box, confidence in
+                let detections = [Detection(label: "person", confidence: confidence, boundingBox: box)]
+                return EvaluationReceipt(frame: .init(frameID: snapshot.id, monotonicTimestamp: snapshot.timestamp,
+                    detections: detections), status: .executed, failureReason: nil, orientation: snapshot.imageOrientation,
+                    personVerification: self.verifyPeople(detections, snapshot: snapshot))
+            })
         cacheLock.withLock { cachedFollowEvaluation = .init(snapshot: snapshot, receipt: receipt) }
         return receipt
+    }
+
+    @MainActor func evaluateAdaptiveForFollowAsync(_ snapshot: ARFrameSnapshot, session: UUID,
+                                                  allowsTracking: Bool, epoch: UInt64 = 0) async -> EvaluationReceipt? {
+        await evaluateAsync(snapshot, previewOnly: false, trackingSession: session, allowsVisualTracking: allowsTracking,
+            trackingEpoch: epoch)
     }
 
     @MainActor public func evaluateForFollowAsync(_ snapshot: ARFrameSnapshot) async -> EvaluationReceipt? {
@@ -287,16 +335,31 @@ public final class Detector: @unchecked Sendable {
         return token
     }
 
-    func endFollowConsumer(_ token: UUID) { _ = jobLock.withLock { followConsumers.remove(token) } }
+    func endFollowConsumer(_ token: UUID) {
+        _ = jobLock.withLock { followConsumers.remove(token) }
+        worker.async { [weak self] in
+            guard let self else { return }
+            self.inferenceLock.lock()
+            defer { self.inferenceLock.unlock() }
+            if self.visualTrackingSession == token {
+                self.visualPipeline?.reset()
+                self.visualPipeline = nil
+                self.visualTrackingSession = nil
+                self.visualTrackingEpoch = nil
+            }
+        }
+    }
 
     @MainActor private func evaluateAsync(_ snapshot: ARFrameSnapshot, previewOnly: Bool,
-                                         includeScreenFallback: Bool = false) async -> EvaluationReceipt? {
+                                         includeScreenFallback: Bool = false, trackingSession: UUID? = nil,
+                                         allowsVisualTracking: Bool = false, trackingEpoch: UInt64 = 0) async -> EvaluationReceipt? {
         let cancellation = InferenceCancellation()
         return await withTaskCancellationHandler {
             guard !Task.isCancelled else { return nil }
             return await withCheckedContinuation { continuation in
                 let job = InferenceJob(snapshot: snapshot, cancellation: cancellation, continuation: continuation,
-                    previewOnly: previewOnly, includeScreenFallback: includeScreenFallback)
+                    previewOnly: previewOnly, includeScreenFallback: includeScreenFallback,
+                    trackingSession: trackingSession, allowsVisualTracking: allowsVisualTracking, trackingEpoch: trackingEpoch)
                 var superseded: InferenceJob?
                 var skipped = false
                 let start = jobLock.withLock {
@@ -319,7 +382,9 @@ public final class Detector: @unchecked Sendable {
         let permitted = jobLock.withLock { !job.previewOnly || followConsumers.isEmpty }
         let receipt: EvaluationReceipt?
         if !permitted || job.cancellation.cancelled { receipt = nil }
-        else { receipt = job.includeScreenFallback ? evaluate(job.snapshot) : evaluateForFollow(job.snapshot) }
+        else if let session = job.trackingSession {
+            receipt = evaluateAdaptiveForFollow(job.snapshot, session: session, epoch: job.trackingEpoch, allowsTracking: job.allowsVisualTracking)
+        } else { receipt = job.includeScreenFallback ? evaluate(job.snapshot) : evaluateForFollow(job.snapshot) }
         inferenceLock.unlock()
         job.continuation.resume(returning: job.cancellation.cancelled ? nil : receipt)
         let next: InferenceJob? = jobLock.withLock {

@@ -42,6 +42,7 @@ struct FollowPursuitPlanDiagnostics {
             "startup_deadline_s": .number(startupDeadline),
             "has_sent_motion": .bool(sent),
             "plan_available": .bool(plan != nil),
+            "planning_mode": plan.map { .string($0.planningMode.rawValue) } ?? .null,
             "waypoint_count": plan.map { .number(Double($0.path.count)) } ?? .null,
             "path_endpoint_xz": Self.point(endpoint),
             "endpoint_tolerance_m": plan.map { .number($0.endpointTolerance) } ?? .null,

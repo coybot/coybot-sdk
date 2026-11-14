@@ -242,6 +242,28 @@ public final class NavigationController {
         return followNavigation.updateFollowGoal(goal)
     }
 
+    var preservesFollowGoalOwner: Bool {
+        guard let owner = followOperation, isCurrentOperation(owner), loop?.isCancelled == false else { return false }
+        return followNavigation.preservesFollowGoalOwner
+    }
+
+    func pauseFollowForPerception() async -> Bool? {
+        guard let owner = followOperation, isCurrentOperation(owner), loop?.isCancelled == false else { return nil }
+        let result = await followNavigation.pauseFollowForPerception()
+        guard isCurrentOperation(owner), loop?.isCancelled == false else { return false }
+        return result
+    }
+
+    func resumeFollowAfterPerception(timestamp: Double) -> Bool {
+        guard let owner = followOperation, isCurrentOperation(owner), loop?.isCancelled == false else { return false }
+        return followNavigation.resumeFollowAfterPerception(timestamp: timestamp)
+    }
+
+    func canResumeFollowAfterPerception(timestamp: Double) -> Bool {
+        guard let owner = followOperation, isCurrentOperation(owner), loop?.isCancelled == false else { return false }
+        return followNavigation.canResumeFollowAfterPerception(timestamp: timestamp)
+    }
+
     func inhibitFollowScanContinuation(origin: FollowMotionStopOrigin) {
         followNavigation.inhibitFollowScanContinuation(origin: origin)
     }

@@ -15,6 +15,10 @@ protocol FollowNavigationRuntime: AnyObject {
     func inhibitFollowScanContinuation(origin: FollowMotionStopOrigin)
     func updateFollowGoal(_ goal: Vec2) -> Bool
     func canResumeFollowAfterUserReturn() async -> Bool
+    var preservesFollowGoalOwner: Bool { get }
+    func pauseFollowForPerception() async -> Bool?
+    func canResumeFollowAfterPerception(timestamp: Double) -> Bool
+    func resumeFollowAfterPerception(timestamp: Double) -> Bool
 }
 
 extension NavigationController: FollowNavigationRuntime {}
@@ -22,10 +26,14 @@ extension FollowNavigationController: FollowNavigationRuntime {}
 
 extension FollowNavigationRuntime {
     func canResumeFollowAfterUserReturn() async -> Bool { false }
+    var preservesFollowGoalOwner: Bool { false }
+    func pauseFollowForPerception() async -> Bool? { nil }
+    func canResumeFollowAfterPerception(timestamp: Double) -> Bool { false }
+    func resumeFollowAfterPerception(timestamp: Double) -> Bool { false }
 }
 
 @MainActor
-public final class NavigationFollowMeMotion: FollowMeContextualMotion, FollowMeAbsoluteHeadingMotion, FollowMeReturnReadiness {
+public final class NavigationFollowMeMotion: FollowMeContextualMotion, FollowMeAbsoluteHeadingMotion, FollowMeReturnReadiness, FollowMePursuitControl {
     private let navigation: any FollowNavigationRuntime
 
     public init(navigation: NavigationController) { self.navigation = navigation }
@@ -55,6 +63,10 @@ public final class NavigationFollowMeMotion: FollowMeContextualMotion, FollowMeA
 
     public func safetyStates() -> AsyncStream<NavigationSafetyState> { navigation.safetyStates() }
     public func canResumeAfterUserReturn() async -> Bool { await navigation.canResumeFollowAfterUserReturn() }
+    var preservesFollowGoalOwner: Bool { navigation.preservesFollowGoalOwner }
+    func pauseFollowForPerception() async -> Bool? { await navigation.pauseFollowForPerception() }
+    func canResumeFollowAfterPerception(timestamp: Double) -> Bool { navigation.canResumeFollowAfterPerception(timestamp: timestamp) }
+    func resumeFollowAfterPerception(timestamp: Double) -> Bool { navigation.resumeFollowAfterPerception(timestamp: timestamp) }
 
     func perform(_ request: FollowMotionRequest, context: FollowMotionRequestContext) async -> FollowMotionResult {
         await navigation.performFollowMotion(request, context: context)

@@ -102,6 +102,9 @@ public struct FollowMeConfiguration {
     /// After a confirmed stop for target loss or transient depth failure, wait
     /// for a fresh human return before starting a new readiness sequence.
     public var waitForUserReturn = false
+    /// Pursuit mode: direct live-depth-gated following on flat floors, or mesh
+    /// routing. Legacy moving readiness retains its separate mesh preflight.
+    public var planningMode: FollowPlanningMode = .mesh
 
     // MARK: Continuous following (all off by default; `.continuous` turns them on)
 

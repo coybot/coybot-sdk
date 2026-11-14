@@ -28,7 +28,9 @@ final class ManualFollowClock: FollowMeClock {
 }
 
 @MainActor
-final class FollowPerceptionFake: FollowMePerception {
+final class FollowPerceptionFake: FollowMePerception, FollowVisualTrackingControl {
+    private(set) var visualTrackingEnabled = false
+    func setVisualTrackingEnabled(_ enabled: Bool) { visualTrackingEnabled = enabled }
     var detectorReady = true
     var personLabelAvailable = true
     private var continuation: AsyncStream<FollowPerceptionEvent>.Continuation?
@@ -124,8 +126,17 @@ final class FollowMotionFake: FollowMeSourceClockMotion, FollowMeReturnReadiness
 
 /// A contextual companion over the legacy fake; controller facts remain unknown.
 @MainActor
-final class ContextualFollowMotionFake: FollowMeContextualMotion, FollowMeReturnReadiness {
+final class ContextualFollowMotionFake: FollowMeContextualMotion, FollowMeReturnReadiness, FollowMePursuitControl {
     let legacy = FollowMotionFake()
+    var preservesFollowGoalOwner = false
+    var pauseHandler: (() async -> Bool?)?
+    var resumeHandler: ((Double) -> Bool)?
+    var canResumeHandler: ((Double) -> Bool)?
+    var goalUpdateHandler: ((Vec2) -> Bool)?
+    func pauseFollowForPerception() async -> Bool? { await pauseHandler?() }
+    func canResumeFollowAfterPerception(timestamp: Double) -> Bool { canResumeHandler?(timestamp) ?? false }
+    func resumeFollowAfterPerception(timestamp: Double) -> Bool { resumeHandler?(timestamp) ?? false }
+    func updateFollowGoal(_ goal: Vec2) -> Bool { goalUpdateHandler?(goal) ?? false }
     func canResumeAfterUserReturn() async -> Bool { await legacy.canResumeAfterUserReturn() }
     var sourceUptime: TimeInterval? { legacy.sourceUptime }
     private(set) var requests: [FollowMotionRequest] = []

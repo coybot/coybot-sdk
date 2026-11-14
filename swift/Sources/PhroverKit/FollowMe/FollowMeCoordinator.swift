@@ -20,6 +20,7 @@ public final class FollowMeCoordinator {
     public private(set) var state: FollowMeState = .idle {
         didSet {
             if state != oldValue {
+                (perception as? any FollowVisualTrackingControl)?.setVisualTrackingEnabled(allowsVisualTracking)
                 if state != .searching { clearScanAdmissionWait() }
                 if state == .signalingReady || state == .following || state == .reacquiring {
                     searchClearance?.revoke()
@@ -48,6 +49,10 @@ public final class FollowMeCoordinator {
     }
     public private(set) var perceptionIssue: FollowPerceptionIssue?
     public var isActive: Bool { state.isActive }
+    private var allowsVisualTracking: Bool {
+        state == .following || state == .holdingDistance || state == .waitingForMovement ||
+            (state == .aligning && targetFacing != nil)
+    }
     /// Display-only current lock provenance, not independent motion authority.
     public var trackedPersonFrameID: ARFrameID? {
         guard isActive, !stopBlocked, perceptionIssue == nil, recoveryEpisode == nil,
@@ -69,6 +74,14 @@ public final class FollowMeCoordinator {
     // At most one terminal delivery window; prune after stream/result/cleanup drain.
     private var failureResolution: FollowMotionFailureResolution?
     private var returnWaitVersion: UInt64 = 0
+    private var targetFacing: (id: UUID, deadline: TimeInterval, wasHolding: Bool)?
+    private var pursuitTargetFeed = FollowTargetSpeedFeed()
+    private var pursuitPerceptionPaused = false
+    private var targetFacingTimeoutTask: Task<Void, Never>?
+    // Valid only while this target-facing episode is confirmed stationary.
+    // Revoked before admitting a turn or escalating a structural fault.
+    private var targetFacingStopFence: FollowTurnStopFence?
+    private static let targetFacingEntryAngle = Double.pi / 12
     private var searchClearance: FollowSearchClearanceGrant?
     private var activeRequest: FollowMotionRequestContext?
     private var summaryBudget = FollowSummaryBudget()
@@ -209,6 +222,9 @@ public final class FollowMeCoordinator {
 
     private func startSession(commandReceivedAt: TimeInterval?, confirmation: FollowSearchClearanceConfirmation? = nil) async -> Bool {
         guard !isActive, stopTask == nil, !stopBlocked else { return isActive }
+        clearTargetFacing()
+        pursuitTargetFeed = FollowTargetSpeedFeed()
+        pursuitPerceptionPaused = false
         returnWaitVersion &+= 1
         guard perception.detectorReady, perception.personLabelAvailable else {
             state = .failed("Person detector unavailable.")
@@ -278,7 +294,7 @@ public final class FollowMeCoordinator {
             phase: String(describing: state)), payload: sessionTimingPayload))
         updatePerceptionIssue(.noFrames)
         let events = perception.events()
-        framesTask = Task { [weak self] in
+        framesTask = Task(priority: .userInitiated) { [weak self] in
             for await event in events {
                 guard !Task.isCancelled, let self, self.generation == token, self.isActive else { break }
                 await self.receive(event, generation: token)
@@ -352,7 +368,11 @@ public final class FollowMeCoordinator {
     /// Synchronously fence observations and goals when the app is leaving the foreground
     /// or Talk. The caller must subsequently await stop() before handing off motion.
     public func inhibitMotion() {
+        pursuitTargetFeed.sample = nil
+        pursuitPerceptionPaused = false
+        (perception as? any FollowVisualTrackingControl)?.setVisualTrackingEnabled(false)
         returnWaitVersion &+= 1
+        clearTargetFacing()
         searchClearance?.revoke()
         guard isActive, stopTask == nil else { return }
         emitRecovery("fenced", reason: "lifecycle_inhibition", stop: "pending")
@@ -389,6 +409,9 @@ public final class FollowMeCoordinator {
 
     private func finish(_ result: FollowMeState, resolvingFailure: Bool = false,
                         returnWaitReason: FollowReturnWaitReason? = nil) async -> Bool {
+        pursuitTargetFeed.sample = nil
+        pursuitPerceptionPaused = false
+        clearTargetFacing()
         let waitVersion = returnWaitVersion
         searchClearance?.revoke()
         if let stopTask {
@@ -713,7 +736,7 @@ public final class FollowMeCoordinator {
             pendingFrame = batch
             wakeAlignmentSourceWaiter()
             guard frameProcessorTask == nil else { return }
-            frameProcessorTask = Task { [weak self] in
+            frameProcessorTask = Task(priority: .userInitiated) { [weak self] in
                 guard let self else { return }
                 defer {
                     // An old processor must never clear a newer generation's task.
@@ -732,6 +755,13 @@ public final class FollowMeCoordinator {
 
     private func receive(_ batch: FollowFrameBatch, generation token: UInt64, preservingHealthFault: Bool = false) async {
         guard generation == token, isActive, !stopBlocked else { return }
+        // A tracked result may already be queued when loss changes the phase.
+        // It cannot acquire/reacquire a target; structural faults still drain.
+        if batch.perceptionDiagnostics?.inferenceStatus == .tracked, !allowsVisualTracking,
+           frameIssue(batch, now: clock.now) == nil { return }
+        if let targetFacing, clock.now >= targetFacing.deadline {
+            _ = await finish(.failed("Target-facing turn timed out. Stop and restart following.")); return
+        }
         if recoveryExpired { _ = await expireRecovery(generation: token); return }
         if state != .pausing, !perceptionReady, let deadline = readinessDeadline, clock.now >= deadline {
             _ = await finish(.failed(perceptionFailureMessage))
@@ -809,10 +839,12 @@ public final class FollowMeCoordinator {
             await perceptionUnavailable(issue, generation: token)
             return
         }
-        poseDeadline = nil
-        perceptionStopRequested = false
-        poseTask?.cancel()
-        poseTask = nil
+        if pursuitPerceptionPaused {
+            guard (motion as? any FollowMePursuitControl)?.canResumeFollowAfterPerception(timestamp: batch.timestamp) == true else {
+                updatePerceptionIssue(.staleFrame)
+                return
+            }
+        } else { clearPerceptionOutage() }
         // Alignment owns its pre/post-stop waits. Keep healthy frame association
         // flowing during those acknowledgements without launching other motion.
         if confirmationTask != nil, !(state == .aligning && alignmentTask != nil) {
@@ -891,6 +923,10 @@ public final class FollowMeCoordinator {
                     clearAcquisitionHold()
                     log("follow_acquisition.hold_resumed")
                 }
+                if state == .waitingForMovement {
+                    seedTrackIfNeeded(from: locked)
+                    noteMeasurement(selected)
+                }
                 self.locked = selected
                 adoptMemory(selected, batch: batch, association: .continued)
                 if state == .waitingForMovement {
@@ -945,7 +981,16 @@ public final class FollowMeCoordinator {
                        confirmed.generation == batch.frameID.generation, batch.frameID.sequence > confirmed.sequence,
                        abs(normalizeAngle(heading - batch.pose!.yaw)) <= config.alignmentAngularTolerance {
                         if recoveryEpisode != nil, !recoveryFrameEligible(selected, batch: batch) { return }
-                        if !readySignalAttempted {
+                        if targetFacing != nil {
+                            guard await restoreRecovery(selected, phase: .following) else { return }
+                            let wasHolding = targetFacing?.wasHolding == true
+                            clearTargetFacing()
+                            noteMeasurement(selected)
+                            state = wasHolding ? .holdingDistance : .following
+                            log("follow_facing.completed")
+                            await follow(selected, rover: batch.pose!.position, generation: token,
+                                lead: trackVelocity(at: batch.timestamp))
+                        } else if !readySignalAttempted {
                             await signalReady(generation: token)
                         } else if readySignalSucceeded {
                             if departureBaseline == nil {
@@ -1006,8 +1051,16 @@ public final class FollowMeCoordinator {
                 adoptMemory(selected, batch: batch, association: .continued)
                 await follow(selected, rover: batch.pose!.position, generation: token,
                              lead: trackVelocity(at: batch.timestamp))
-            case .lost, .ambiguous:
+            case .lost:
+                if pursuitPerceptionPaused {
+                    clearPerceptionOutage()
+                    await loseTarget(generation: token)
+                    return
+                }
                 if await coast(batch, generation: token, now: now) { return }
+                await loseTarget(generation: token)
+            case .ambiguous:
+                if pursuitPerceptionPaused { clearPerceptionOutage() }
                 await loseTarget(generation: token)
             }
         case .reacquiring:
@@ -1090,8 +1143,41 @@ public final class FollowMeCoordinator {
         }
         let distance = rover.distance(to: selected.position)
         guard distance.isFinite else { await loseTarget(generation: token); return }
-        guard distance > config.maximumHoldDistance else {
-            if lastGoal != nil { _ = await confirmStop(generation: token) }
+        let measured = currentAssociation.map { association in
+            guard association.generation == token, association.frameID == selected.frameID,
+                  case .matched = association.decision else { return false }
+            return true
+        } ?? false
+        if config.continuousGoals, selected.bodyVerified, measured {
+            pursuitTargetFeed.sample = .init(frameID: selected.frameID, timestamp: selected.timestamp,
+                position: selected.position, velocity: lead ?? trackVelocity(at: selected.timestamp) ?? .zero,
+                standOff: config.standOffDistance, minimumDistance: config.minimumHoldDistance)
+        }
+        if pursuitPerceptionPaused {
+            guard measured, let control = motion as? any FollowMePursuitControl,
+                  control.canResumeFollowAfterPerception(timestamp: selected.timestamp) else { return }
+        }
+        if config.continuousGoals, state == .following || state == .holdingDistance,
+           selected.bodyVerified, let batch = latestBatch, let pose = batch.pose,
+           selected.frameID == batch.frameID, frameIssue(batch, now: clock.now) == nil,
+           let association = currentAssociation, association.generation == token,
+           association.frameID == batch.frameID, case .matched = association.decision {
+            let bearing = normalizeAngle(atan2(selected.position.y - pose.position.y,
+                selected.position.x - pose.position.x) - pose.yaw)
+            if abs(bearing) > Self.targetFacingEntryAngle {
+                if pursuitPerceptionPaused {
+                    clearPerceptionOutage()
+                    pursuitPerceptionPaused = false
+                }
+                beginTargetFacing(generation: token, bearing: bearing)
+                return
+            }
+        }
+        let holdDistance = config.continuousGoals && selected.bodyVerified && state == .following
+            ? max(config.minimumHoldDistance, config.standOffDistance + 0.05) : config.maximumHoldDistance
+        guard distance > holdDistance else {
+            if pursuitPerceptionPaused { clearPerceptionOutage() }
+            if lastGoal != nil || pursuitPerceptionPaused { _ = await confirmStop(generation: token) }
             guard generation == token else { return }
             if recoveryExpired { _ = await expireRecovery(generation: token); return }
             guard await restoreRecovery(selected, phase: .holdingDistance) else { return }
@@ -1102,6 +1188,17 @@ public final class FollowMeCoordinator {
         }
         let aim = leadPoint(selected.position, velocity: lead)
         guard let goal = tracker.standOffGoal(rover: rover, person: aim) else { return }
+        if pursuitPerceptionPaused {
+            guard let control = motion as? any FollowMePursuitControl,
+                  (motion as? any FollowMeContextualMotion)?.updateFollowGoal(goal) == true,
+                  control.resumeFollowAfterPerception(timestamp: selected.timestamp) else { return }
+            pursuitPerceptionPaused = false
+            clearPerceptionOutage()
+            lastGoal = goal
+            lastGoalTime = clock.now
+            log("follow_pursuit.perception_resumed")
+            return
+        }
         if recoveryEpisode == nil { state = .following }
         let minimumChange = config.continuousGoals ? config.continuousMinimumGoalChange : config.minimumGoalChange
         let maximumRate = config.continuousGoals ? config.continuousMaximumGoalUpdatesPerSecond
@@ -1116,6 +1213,12 @@ public final class FollowMeCoordinator {
             // The follow drive is still running: steer it, don't stop it.
             lastGoal = goal
             lastGoalTime = clock.now
+            return
+        }
+        if config.continuousGoals, activeRequest?.purpose == .followGoal,
+           (motion as? any FollowMePursuitControl)?.preservesFollowGoalOwner == true {
+            // Initial admission or terminal cleanup still owns this request.
+            // A newer goal must not replace it and renew recovery budgets.
             return
         }
         if confirmedStop == nil {
@@ -1134,12 +1237,42 @@ public final class FollowMeCoordinator {
         state = .following
         lastGoal = goal
         lastGoalTime = clock.now
-        launchMovement(generation: token, purpose: .followGoal) { [motion] context in
-            await motion.performContextual(.following(goal, self.config.minimumHoldDistance), context: context)
+        launchMovement(generation: token, purpose: .followGoal) { [motion, feed = pursuitTargetFeed, mode = config.planningMode] context in
+            await FollowPlanningScope.$mode.withValue(mode) {
+                await FollowTargetSpeedScope.$feed.withValue(feed) {
+                    await motion.performContextual(.following(goal, self.config.minimumHoldDistance), context: context)
+                }
+            }
         }
     }
 
     // MARK: Track, coasting and tolerant continuation
+
+    private func beginTargetFacing(generation token: UInt64, bearing: Double) {
+        guard generation == token, targetFacing == nil else { return }
+        let id = UUID(), deadline = min(clock.now + 10, recoveryEpisode?.deadline ?? .infinity)
+        targetFacing = (id, deadline, state == .holdingDistance)
+        pursuitTargetFeed.sample = nil
+        lastGoal = nil
+        state = .aligning
+        log("follow_facing.started", extra: ["bearing_rad": String(bearing), "deadline_s": String(deadline)])
+        targetFacingTimeoutTask = Task { [weak self, clock] in
+            await clock.sleep(seconds: max(0, deadline - clock.now))
+            guard !Task.isCancelled, let self, self.generation == token, self.targetFacing?.id == id else { return }
+            _ = await self.finish(.failed("Target-facing turn timed out. Stop and restart following."))
+        }
+        // Reuse the pose-controlled turn and its post-stop source fences. Turning
+        // is independent of the pursuit approach-speed taper, never an unguarded
+        // minimum wheel speed or a new translation command.
+        align(generation: token)
+    }
+
+    private func clearTargetFacing() {
+        targetFacing = nil
+        targetFacingStopFence = nil
+        targetFacingTimeoutTask?.cancel()
+        targetFacingTimeoutTask = nil
+    }
 
     private func resetTrack() {
         track = nil
@@ -1208,6 +1341,14 @@ public final class FollowMeCoordinator {
     private func coast(_ batch: FollowFrameBatch, generation token: UInt64, now: TimeInterval) async -> Bool {
         guard config.coastSeconds > 0, var filter = track, let locked, let lastMeasurementAt,
               let lastPositionAt, let pose = batch.pose else { return false }
+        if config.continuousGoals, locked.bodyVerified {
+            // Do not launch translation from a stopped hold using only a
+            // predicted target, or keep driving when the target leaves the
+            // central view. Confirm stop and use bounded reacquisition instead.
+            let bearing = normalizeAngle(atan2(locked.position.y - pose.position.y,
+                locked.position.x - pose.position.x) - pose.yaw)
+            guard state != .holdingDistance, abs(bearing) <= Self.targetFacingEntryAngle else { return false }
+        }
         if config.tolerantContinuation, now - lastPositionAt <= config.maximumBearingOnlySeconds,
            let partial = bearingMatch(batch, filter: filter, pose: pose) {
             filter.predict(to: partial.timestamp)
@@ -1249,6 +1390,7 @@ public final class FollowMeCoordinator {
 
     private func align(generation token: UInt64) {
         guard alignmentTask == nil else { return }
+        let retainedFacingFence = targetFacing != nil ? stationaryObservationFence : nil
         alignmentSerial &+= 1
         let serial = alignmentSerial
         let capturedPhase = String(describing: state)
@@ -1259,8 +1401,15 @@ public final class FollowMeCoordinator {
             defer {
                 if self.generation == token, self.alignmentSerial == serial { self.alignmentTask = nil }
             }
-            guard await self.confirmStop(generation: token, origin: capturedStopOrigin), self.alignmentSerial == serial,
-                  self.state == .aligning else { return }
+            if let retainedFacingFence {
+                guard self.generation == token, self.targetFacingStopFence?.identity == retainedFacingFence.identity,
+                      self.newestStopFence?.identity == retainedFacingFence.identity,
+                      self.stopTask == nil, self.confirmationTask == nil, !self.stopBlocked else { return }
+                self.log("follow_facing.stop_reused", extra: ["stop_acknowledgement_s": String(retainedFacingFence.acknowledgementUptime)])
+            } else {
+                guard await self.confirmStop(generation: token, origin: capturedStopOrigin) else { return }
+            }
+            guard self.alignmentSerial == serial, self.state == .aligning else { return }
             self.scanning = false
             guard let snapshot = await self.awaitAlignmentMatch(generation: token, serial: serial) else { return }
             guard self.commitAlignmentSnapshot(snapshot, generation: token) else { return }
@@ -1276,6 +1425,7 @@ public final class FollowMeCoordinator {
                 purpose: .followAlignment, phase: capturedPhase, searchClearance: self.recoveryEpisode == nil ? self.searchClearance : nil,
                 allowsAcquisitionRotationWithoutDepth: self.acquisitionRotationIgnoresDepth)
             self.activeRequest = context
+            self.targetFacingStopFence = nil
             let contextualResult = await self.motion.performContextual(.alignment(angle), context: context,
                 recovery: self.recoveryAuthorization(generation: token, operation: id))
             if await self.consumeResult(contextualResult) { return }
@@ -1594,7 +1744,9 @@ public final class FollowMeCoordinator {
 
     private func confirmStop(generation token: UInt64, origin: FollowMotionStopOrigin = .independent) async -> Bool {
         guard generation == token, !stopBlocked, stopTask == nil else { return false }
+        pursuitPerceptionPaused = false
         operation &+= 1
+        let stoppedOperation = operation
         movementTask?.cancel()
         movementTask = nil
         if let confirmationTask {
@@ -1604,6 +1756,10 @@ public final class FollowMeCoordinator {
             if confirmed, generation == token, recoveryExpired {
                 _ = await expireRecovery(generation: token)
                 return false
+            }
+            if confirmed, generation == token, operation == stoppedOperation, confirmationID == id,
+               targetFacing != nil, state == .aligning, !stopBlocked, stopTask == nil {
+                targetFacingStopFence = newestStopFence
             }
             return confirmed && generation == token && !stopBlocked && stopTask == nil
         }
@@ -1651,6 +1807,7 @@ public final class FollowMeCoordinator {
         diagnosticStopState = confirmed ? "confirmed" : "failed"
         if confirmationID == id { confirmationTask = nil }
         if !confirmed {
+            clearTargetFacing()
             generation &+= 1
             operation &+= 1
             stopBlocked = true
@@ -1675,6 +1832,9 @@ public final class FollowMeCoordinator {
         if generation == token, recoveryExpired {
             _ = await expireRecovery(generation: token)
             return false
+        }
+        if generation == token, operation == stoppedOperation, targetFacing != nil, state == .aligning {
+            targetFacingStopFence = newestStopFence
         }
         return generation == token && !stopBlocked && stopTask == nil
     }
@@ -1767,7 +1927,7 @@ public final class FollowMeCoordinator {
     /// reacquisition turns retain the policy until the ready signal succeeds.
     /// Translation/readiness still require real depth and clearance.
     private var acquisitionRotationIgnoresDepth: Bool {
-        !readySignalSucceeded && (state == .searching ||
+        targetFacing == nil && !readySignalSucceeded && (state == .searching ||
             (config.departureRangeIncrease > 0 &&
                 (state == .aligning || state == .reacquiring || state == .waitingForClearance))) &&
             motion is any FollowMeContextualMotion
@@ -1779,7 +1939,8 @@ public final class FollowMeCoordinator {
     }
 
     private var canScan: Bool {
-        guard isActive, !recoveryExpired, !awaitingDepthReobservation, perceptionReady, !stopBlocked, stopTask == nil, confirmationTask == nil,
+        guard isActive, !recoveryExpired, targetFacing.map({ clock.now < $0.deadline }) ?? true,
+              !awaitingDepthReobservation, perceptionReady, !stopBlocked, stopTask == nil, confirmationTask == nil,
               pendingHealthFrame == nil,
               perceptionIssue == nil, poseDeadline == nil, let batch = latestBatch,
               batch.pose != nil, batch.depthAvailable || acquisitionRotationIgnoresDepth,
@@ -1923,6 +2084,9 @@ public final class FollowMeCoordinator {
 
     private func loseTarget(generation token: UInt64) async {
         guard generation == token, state != .reacquiring else { return }
+        pursuitTargetFeed.sample = nil
+        pursuitPerceptionPaused = false
+        clearTargetFacing()
         resetTrack()
         if recoveryEpisode == nil {
             recoveryHasProvisionalLock = false
@@ -2176,8 +2340,10 @@ public final class FollowMeCoordinator {
         let recovering = state == .reacquiring && recoveryStopBoundary != nil && recoveryEpisode != nil
         let spokenReady = state == .signalingReady && stationaryReadyAnnouncement != nil &&
             (stationaryReadyPending || readySignalSucceeded)
-        guard recovering || spokenReady,
-              !scanning, movementTask == nil, alignmentTask == nil,
+        let stoppedFacing = state == .aligning && targetFacing != nil && targetFacingStopFence != nil &&
+            targetFacingStopFence?.identity == newestStopFence?.identity
+        guard recovering || spokenReady || stoppedFacing,
+              !scanning, movementTask == nil, alignmentTask == nil || stoppedFacing,
               !stopBlocked, stopTask == nil, confirmationTask == nil,
               pendingAdmission == nil, activeReadyAdmission == nil,
               let fence = newestStopFence,
@@ -2186,6 +2352,14 @@ public final class FollowMeCoordinator {
               fence.sourceGeneration == latestFrame?.generation else { return nil }
         if let episode = recoveryEpisode, fence.sourceGeneration != episode.anchor?.frameID.generation { return nil }
         return fence
+    }
+
+    private func clearPerceptionOutage() {
+        poseDeadline = nil
+        perceptionStopRequested = false
+        poseTask?.cancel()
+        poseTask = nil
+        updatePerceptionIssue(nil)
     }
 
     private func perceptionUnavailable(_ issue: FollowPerceptionIssue, generation token: UInt64) async {
@@ -2226,6 +2400,19 @@ public final class FollowMeCoordinator {
         // fence while waiting for fresh post-stop continuity. Re-stopping here
         // would move the fence past each delayed observation indefinitely.
         if waitingWhileStopped { return }
+        if issue == .staleFrame, config.continuousGoals, state == .following,
+           activeRequest?.purpose == .followGoal, let control = motion as? any FollowMePursuitControl {
+            perceptionStopRequested = true
+            pursuitPerceptionPaused = true
+            if let confirmed = await control.pauseFollowForPerception() {
+                guard generation == token else { return }
+                if confirmed { return }
+                _ = await finish(.failed("Rover stop could not be confirmed."))
+                return
+            }
+            pursuitPerceptionPaused = false
+        }
+        targetFacingStopFence = nil
         cancelAlignment()
         if state == .signalingReady { state = .aligning }
         perceptionStopRequested = true
@@ -2332,6 +2519,7 @@ public final class FollowMeCoordinator {
             "phase_started_at_s": phaseStartedAt.map { .number($0) } ?? .null,
             "phase_elapsed_s": phaseStartedAt.map { .number(now - $0) } ?? .null,
             "stationary_pause_seconds": .number(config.stationaryPauseSeconds),
+            "planning_mode": .string(config.planningMode.rawValue),
             "maximum_observation_age_s": .number(config.maximumObservationAge),
             "alignment_angular_tolerance_rad": .number(config.alignmentAngularTolerance),
             "ready_signal_clearance_m": .number(config.readySignalClearance),

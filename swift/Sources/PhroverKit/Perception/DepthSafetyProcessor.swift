@@ -17,6 +17,9 @@ final class DepthSafetyProcessor {
 
     private let evaluate: @Sendable (Input) -> DepthSafetySnapshot
     private let didProcess: @MainActor (DepthSafetySnapshot) -> Void
+    // Depth must not queue behind the serial Vision/Core ML worker. Its safety
+    // projection has a dedicated high-QoS lane; publication remains actor-owned.
+    private let projectionQueue = DispatchQueue(label: "us.coybot.depth-safety", qos: .userInteractive)
     private var pending: (input: Input, generation: UInt64, submitted: Double)?
     private var lastTimingLog = -Double.infinity
     private var task: Task<Void, Never>?
@@ -49,11 +52,13 @@ final class DepthSafetyProcessor {
             while let job = pending {
                 pending = nil
                 let evaluate = evaluate
-                let (snapshot, started, finished) = await Task.detached(priority: .userInitiated) {
-                    let started = ProcessInfo.processInfo.systemUptime
-                    let result = evaluate(job.input)
-                    return (result, started, ProcessInfo.processInfo.systemUptime)
-                }.value
+                let (snapshot, started, finished) = await withCheckedContinuation { continuation in
+                    projectionQueue.async {
+                        let started = ProcessInfo.processInfo.systemUptime
+                        let result = evaluate(job.input)
+                        continuation.resume(returning: (result, started, ProcessInfo.processInfo.systemUptime))
+                    }
+                }
                 // Resets, interruptions and missing raw depth revoke old results, even
                 // if their native computation could not be cancelled mid-frame.
                 guard job.generation == generation else { continue }

@@ -11,7 +11,7 @@ public enum FollowProjectionRejection: String, Sendable {
 
 public enum FollowConfidenceAvailability: String, Sendable { case unavailable, available, invalid }
 public enum FollowInferenceStatus: String, Sendable {
-    case executed, skippedTracking = "skipped_tracking", failed, unknown
+    case executed, tracked, skippedTracking = "skipped_tracking", failed, unknown
 }
 
 /// Bounded facts from one evaluation; no images, buffers, or sample arrays are retained.

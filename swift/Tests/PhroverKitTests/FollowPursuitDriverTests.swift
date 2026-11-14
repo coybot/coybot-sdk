@@ -5,6 +5,259 @@ import simd
 
 @MainActor
 final class FollowPursuitDriverTests: XCTestCase {
+    func testReactiveModeBypassesMeshButStillRequiresLiveDepth() async {
+        for scenario in 0..<4 {
+            let f = ControllerFixture()
+            f.usePlanningPolicy = true
+            f.planningFailure = .startBlocked
+            f.obstacle = scenario == 1
+            if scenario == 2 { f.freshAt = 100 }
+            if scenario == 3 { f.beforeAttempt = { f.obstacle = true } }
+            let result = await FollowPlanningScope.$mode.withValue(.reactiveDepth) { await f.run() }
+            XCTAssertEqual(f.meshPlanningCalls, 0)
+            if scenario == 0 {
+                XCTAssertEqual(result.result, .arrived)
+                XCTAssertFalse(f.commands.isEmpty)
+            } else {
+                XCTAssertEqual(result.result, scenario == 2 ? .failed(.depthUnavailable(.staleRawDepth)) : .failed(.obstacle))
+                XCTAssertTrue(f.commands.isEmpty)
+            }
+            XCTAssertEqual(result.stopOutcome, .confirmed)
+        }
+        let mesh = ControllerFixture()
+        mesh.usePlanningPolicy = true
+        mesh.planningFailure = .startBlocked
+        let result = await mesh.run()
+        XCTAssertEqual(result.result, .failed(.noPath))
+        XCTAssertEqual(mesh.meshPlanningCalls, 1, "Reactive mode must not leak into later requests")
+        XCTAssertTrue(mesh.commands.isEmpty)
+    }
+
+    func testDirectDepthPlanUsesCurrentPoseAndLatestTargetWithoutMeshJoin() async {
+        let f = Fixture()
+        f.planProvider = { _, goal in
+            if f.plannedGoals.count == 1 {
+                f.position = Vec2(0.1, 0)
+                f.sequence += 1
+                _ = f.driver.updateGoal(Vec2(6, 0))
+            }
+            return .init(path: [goal], planningMode: .reactiveDepth)
+        }
+        f.onSend = { _ in
+            XCTAssertEqual(f.paths.last?.last, Vec2(6, 0))
+            f.position = Vec2(6, 0)
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertEqual(f.plannedGoals.count, 1)
+        XCTAssertEqual(f.commands.count, 1)
+    }
+    func testCatchupStartsAtRequestedSpeedAndDoesNotRerampAfterDepthRecovery() async {
+        let f = Fixture()
+        var stale = false
+        f.targetSample = {
+            .init(frameID: .init(generation: 1, sequence: f.sequence), timestamp: f.time,
+                position: Vec2(6.5, 0), velocity: Vec2(0.2, 0), standOff: 1.5, minimumDistance: 1.25)
+        }
+        f.depthProvider = { _ in stale ? .unavailable(.staleRawDepth, sampleAge: 0.3, motionClass: .forward) : f.observation(age: 0.01) }
+        f.onStop = { stale = false }
+        f.onSend = { command in
+            XCTAssertEqual(command.left, 0.35, accuracy: 1e-9)
+            XCTAssertEqual(command.right, 0.35, accuracy: 1e-9)
+            if f.commands.count == 1 { stale = true } else { f.position = Vec2(5, 0) }
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertEqual(f.commands.count, 2)
+        XCTAssertEqual(f.stops, 1)
+        XCTAssertTrue(f.events.contains("depth_wait_recovered"))
+    }
+
+    func testCatchupRampBypassStillHonorsCautionAndStaleDepth() async {
+        for stale in [false, true] {
+            let f = Fixture()
+            f.targetSample = {
+                .init(frameID: .init(generation: 1, sequence: f.sequence), timestamp: f.time,
+                    position: Vec2(6.5, 0), velocity: Vec2(0.2, 0), standOff: 1.5, minimumDistance: 1.25)
+            }
+            f.depthProvider = { command in
+                stale ? .unavailable(.staleRawDepth, sampleAge: 0.3, motionClass: .classify(command)) :
+                    .init(state: .caution, clearance: 0.49, supportCount: 10, sampleAge: 0.01,
+                        requiredStoppingDistance: 0.3, motionClass: .classify(command), speedLimit: 0.12)
+            }
+            f.onSend = { command in
+                XCTAssertLessThanOrEqual(max(command.left, command.right), 0.12)
+                f.position = Vec2(5, 0)
+            }
+            let result = await f.driver.run()
+            if stale {
+                XCTAssertEqual(result, .failed(.depthUnavailable(.staleRawDepth)))
+                XCTAssertTrue(f.commands.isEmpty)
+            } else {
+                XCTAssertEqual(result, .arrived)
+                XCTAssertEqual(f.commands.count, 1)
+            }
+        }
+    }
+
+    func testReplanCompletedDuringPauseIsRebuiltInsteadOfTimingOutOnResume() async {
+        let f = Fixture()
+        let sent = expectation(description: "first command")
+        let planning = expectation(description: "periodic replan entered")
+        let gate = FollowDiagnosticSuspension()
+        f.waitHandler = { _ in try? await Task.sleep(for: .milliseconds(1)) }
+        f.planProvider = { start, goal in
+            if f.plannedGoals.count == 2 { planning.fulfill(); await gate.suspend() }
+            return .init(path: [start, goal], map: Costmap(width: 100, height: 100, resolution: 0.1, origin: Vec2(-1, -1)))
+        }
+        f.onSend = { _ in if f.commands.count == 1 { sent.fulfill() } }
+        let running = Task { await f.driver.run() }
+        await fulfillment(of: [sent], timeout: 2)
+        f.time = 11.1
+        await fulfillment(of: [planning], timeout: 2)
+        let paused = await f.driver.pauseForPerception()
+        XCTAssertTrue(paused)
+        gate.release()
+        for _ in 0..<30 { await Task.yield() }
+        f.time = 12.4; f.sequence += 1
+        f.waitHandler = { _ in f.time += 0.02; f.sequence += 1; await Task.yield() }
+        f.onSend = { _ in
+            XCTAssertGreaterThanOrEqual(f.plannedGoals.count, 3)
+            f.position = f.driver.goal
+        }
+        XCTAssertTrue(f.driver.resumePerception(timestamp: 12.39))
+        let result = await running.value
+        XCTAssertEqual(result, .arrived)
+        XCTAssertEqual(f.stops, 1)
+        XCTAssertTrue(f.records.contains { $0.0 == "planning_superseded" &&
+            $0.1["acceptance_reason"] == .string("expired_plan_after_perception_pause") })
+    }
+    func testConfirmedPerceptionPauseDoesNotConsumeCommandedProgressTime() async {
+        let f = Fixture()
+        f.planProvider = { start, goal in
+            .init(path: [start, goal], map: Costmap(width: 100, height: 100, resolution: 0.1, origin: Vec2(-1, -1)))
+        }
+        let sent = expectation(description: "first command")
+        f.waitHandler = { _ in try? await Task.sleep(for: .milliseconds(1)) }
+        f.onSend = { _ in if f.commands.count == 1 { sent.fulfill() } }
+        let running = Task { await f.driver.run() }
+        await fulfillment(of: [sent], timeout: 2)
+        f.time += 2.0
+        let paused = await f.driver.pauseForPerception()
+        XCTAssertTrue(paused)
+        f.time += 1.8; f.sequence += 1
+        f.onSend = { _ in f.position = f.driver.goal }
+        XCTAssertTrue(f.driver.resumePerception(timestamp: f.time - 0.01))
+        let result = await running.value
+        XCTAssertEqual(result, .arrived, "Confirmed stationary time must not produce a false movement stall")
+    }
+
+    func testTargetSpeedExpiryBoundsAdmissionWithoutSpendingDepthRetry() async {
+        let f = Fixture()
+        f.time = 10.49
+        f.waitHandler = { _ in await Task.yield() }
+        f.targetSample = {
+            .init(frameID: .init(generation: 1, sequence: 1), timestamp: 10,
+                position: Vec2(6.5, 0), velocity: Vec2(0.2, 0), standOff: 1.5, minimumDistance: 1.25)
+        }
+        f.onSend = { _ in
+            if f.commands.count == 1 {
+                f.time = 10.51
+                throw FollowPursuitSendFailure(reason: .depthUnavailable(.staleRawDepth), definitelyUnsent: true, authorizationExpired: true)
+            }
+            f.position = Vec2(5, 0)
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertEqual(f.expiries.first ?? 0, 10.5, accuracy: 1e-9)
+        XCTAssertEqual(f.stops, 0)
+        XCTAssertFalse(f.events.contains("authorization_expired"))
+        XCTAssertLessThanOrEqual(f.commands.last?.left ?? 1, 0.1)
+    }
+
+    func testNativeOwnerIsPreservedWhileTerminalStopCancelsInnerLoop() async {
+        let f = ControllerFixture()
+        let stopping = expectation(description: "terminal stop held")
+        let gate = FollowDiagnosticSuspension()
+        var held = false
+        f.stopHandler = {
+            if !f.commands.isEmpty, !held {
+                held = true
+                stopping.fulfill()
+                await gate.suspend()
+            }
+        }
+        let running = Task { await f.run() }
+        await fulfillment(of: [stopping], timeout: 2)
+        XCTAssertTrue(f.controller.preservesFollowGoalOwner)
+        XCTAssertFalse(f.controller.updateFollowGoal(Vec2(6, 0)))
+        XCTAssertEqual(f.plannedGoals.count, 1)
+        gate.release()
+        let result = await running.value
+        XCTAssertEqual(result.result, .arrived)
+        XCTAssertFalse(f.controller.preservesFollowGoalOwner)
+    }
+    func testFailedPerceptionPauseStopsOwnerAndCannotResume() async {
+        let f = Fixture()
+        let sent = expectation(description: "first command")
+        f.waitHandler = { _ in try? await Task.sleep(for: .milliseconds(1)) }
+        f.onSend = { _ in if f.commands.count == 1 { sent.fulfill() } }
+        let running = Task { await f.driver.run() }
+        await fulfillment(of: [sent], timeout: 2)
+        f.stopError = true
+        let paused = await f.driver.pauseForPerception()
+        XCTAssertFalse(paused)
+        let result = await running.value
+        XCTAssertEqual(result, .failed(.commandFailed))
+        XCTAssertFalse(f.driver.resumePerception(timestamp: f.time))
+        XCTAssertFalse(f.driver.updateGoal(Vec2(6, 0)))
+    }
+    func testPerceptionPauseKeepsOneOwnerAndNewestGoalWithoutRepeatedStops() async {
+        let f = Fixture()
+        let sent = expectation(description: "first command")
+        f.autoAdvance = false
+        f.waitHandler = { _ in try? await Task.sleep(for: .milliseconds(1)) }
+        f.onSend = { _ in if f.commands.count == 1 { sent.fulfill() } }
+        let running = Task { await f.driver.run() }
+        await fulfillment(of: [sent], timeout: 2)
+        let paused = await f.driver.pauseForPerception()
+        XCTAssertTrue(paused)
+        let sends = f.commands.count
+        XCTAssertEqual(f.stops, 1)
+        XCTAssertTrue(f.driver.updateGoal(Vec2(6, 0)))
+        XCTAssertTrue(f.driver.updateGoal(Vec2(7, 0)))
+        let repeated = await f.driver.pauseForPerception()
+        XCTAssertTrue(repeated)
+        XCTAssertEqual(f.stops, 1)
+        XCTAssertEqual(f.commands.count, sends)
+        XCTAssertFalse(f.driver.resumePerception(timestamp: f.time - 0.1))
+        f.time += 0.1; f.sequence += 1
+        f.waitHandler = { _ in f.time += 0.02; f.sequence += 1; await Task.yield() }
+        f.onSend = { _ in
+            XCTAssertEqual(f.paths.last?.last, f.driver.goal, "Resume must wait for the newest paused goal's route")
+            f.position = f.driver.goal
+        }
+        XCTAssertTrue(f.driver.resumePerception(timestamp: f.time - 0.01))
+        let result = await running.value
+        XCTAssertEqual(result, .arrived)
+        XCTAssertEqual(f.driver.goal, Vec2(7, 0))
+        XCTAssertEqual(f.stops, 1)
+        XCTAssertGreaterThan(f.commands.count, sends)
+    }
+
+    func testFreshMovingTargetAvoidsStaticWaypointApproachBraking() async {
+        let f = Fixture()
+        f.position = Vec2(4.6, 0)
+        f.targetSample = {
+            .init(frameID: .init(generation: 1, sequence: f.sequence), timestamp: f.time,
+                position: Vec2(6.5, 0), velocity: Vec2(0.2, 0), standOff: 1.5, minimumDistance: 1.25)
+        }
+        f.onSend = { _ in if f.commands.count == 5 { f.position = Vec2(5, 0) } }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertGreaterThan(f.commands.map { max($0.left, $0.right) }.max() ?? 0, 0.15)
+        XCTAssertTrue(f.commands.allSatisfy { max($0.left, $0.right) <= 0.35 })
+    }
     func testFreshDepthDoesNotWaitBehindAcknowledgementActorBeforeEverySend() async {
         let f = Fixture()
         var capture = f.time - 0.15
@@ -1376,6 +1629,8 @@ final class FollowPursuitDriverTests: XCTestCase {
         var caution = false
         var cautionLimit = 0.12
         var planningFailure: PathPlanningFailure?
+        var usePlanningPolicy = false
+        var meshPlanningCalls = 0
         var position = Vec2.zero
         var arrival = Vec2(5, 0)
         var sequence: UInt64 = 1
@@ -1444,6 +1699,12 @@ final class FollowPursuitDriverTests: XCTestCase {
                     if (self.holdFirstPlan && self.plannedGoals.count == 1) || self.plannedGoals.count == self.holdPlanNumber {
                         await self.planGate.suspend()
                     }
+                    if self.usePlanningPolicy {
+                        return await FollowPlanningPolicy.plan(mode: FollowPlanningScope.mode, start: self.position, goal: goal) {
+                            self.meshPlanningCalls += 1
+                            return .init(path: self.planningFailure == nil ? [goal] : [], rejection: self.planningFailure)
+                        }
+                    }
                     return .init(path: self.planningFailure == nil ? [goal] : [], rejection: self.planningFailure)
                 })
         }
@@ -1467,7 +1728,9 @@ final class FollowPursuitDriverTests: XCTestCase {
         var paths: [[Vec2]] = []
         var events: [String] = []
         var records: [(String, [String: FollowDiagnosticValue])] = []
+        var expiries: [Double] = []
         var stops = 0
+        var stopError = false
         var planProvider: (@MainActor (Vec2, Vec2) async -> FollowPursuitPlan?)?
         var depthProvider: ((WheelCommand) -> DepthSafetyObservation)?
         var onSend: ((WheelCommand) throws -> Void)?
@@ -1477,6 +1740,7 @@ final class FollowPursuitDriverTests: XCTestCase {
         var waitHandler: ((Duration) async -> Void)?
         var acknowledgement: (@MainActor () async -> Date?)?
         var acknowledgementSnapshot: (@MainActor () -> Date?)?
+        var targetSample: (@MainActor () -> FollowTargetSpeedSample?)?
         func observation(age: Double) -> DepthSafetyObservation {
             .init(state: .clear, clearance: 5, supportCount: 0, sampleAge: age,
                 requiredStoppingDistance: 0.3, motionClass: .forward, speedLimit: nil)
@@ -1498,8 +1762,13 @@ final class FollowPursuitDriverTests: XCTestCase {
         send: { command, expiry in
             XCTAssertLessThan(self.time, expiry)
             self.commands.append(command)
+            self.expiries.append(expiry)
             try self.onSend?(command)
-        }, stop: { self.stops += 1; self.onStop?() }, sleep: { duration in
+        }, stop: {
+            self.stops += 1
+            if self.stopError { throw URLError(.timedOut) }
+            self.onStop?()
+        }, sleep: { duration in
             if let handler = self.waitHandler { await handler(duration); return }
             if self.autoAdvance {
                 self.time += Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
@@ -1511,7 +1780,7 @@ final class FollowPursuitDriverTests: XCTestCase {
             self.records.append((name, fields))
         },
             admissionDuration: { self.sendAdmissionDuration }, depthNotificationsEnabled: notifications,
-            acknowledgementSnapshot: acknowledgementSnapshot))
+            acknowledgementSnapshot: acknowledgementSnapshot, targetSample: { self.targetSample?() }))
         }
     }
 }

@@ -6,6 +6,37 @@ import XCTest
 
 @MainActor
 final class DepthSafetyProcessorTests: XCTestCase {
+    func testDepthDeliveryContinuesWhileDetectorWorkerIsBlocked() async throws {
+        let inferenceStarted = expectation(description: "inference is busy")
+        let depthDelivered = expectation(description: "depth bypasses inference worker")
+        let gate = DispatchSemaphore(value: 0)
+        defer { gate.signal() }
+        let detector = Detector(supportedLabels: ["person"], detectionHandler: { _ in
+            inferenceStarted.fulfill()
+            _ = gate.wait(timeout: .now() + 5)
+            return []
+        })
+        let input = try input(at: 37)
+        var image: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 20, 20, kCVPixelFormatType_32BGRA, nil, &image)
+        let frame = ARFrameSnapshot(id: .init(generation: 1, sequence: 1), timestamp: 37,
+            image: try XCTUnwrap(image), cameraTransform: matrix_identity_float4x4,
+            cameraIntrinsics: matrix_identity_float3x3, imageResolution: CGSize(width: 20, height: 20),
+            depthMap: input.rawDepthMap, pose: .init(position: .zero, yaw: 0), trackingQuality: .normal)
+        let inference = Task { await detector.evaluateForFollowAsync(frame) }
+        await fulfillment(of: [inferenceStarted], timeout: 2)
+        var capturedTimestamp: Double?
+        let processor = DepthSafetyProcessor(evaluate: Self.result) { depth in
+            capturedTimestamp = depth.timestamp
+            depthDelivered.fulfill()
+        }
+        processor.submit(input)
+        await fulfillment(of: [depthDelivered], timeout: 2)
+        XCTAssertEqual(capturedTimestamp, 37, "Publication must preserve capture age, not stamp depth as new")
+        gate.signal()
+        _ = await inference.value
+    }
+
     func testDefaultProjectorPreservesCapturedDepthAndTimestamp() async throws {
         let completed = expectation(description: "real projection delivered")
         let input = try input(at: 12)

@@ -272,11 +272,13 @@ final class FollowNavigationController {
             return planner.plan(from: start, to: goal, in: costmap)
         }
         makePursuitPlan = { start, goal in
-            let reference = ar.mountedFloorReference(at: ProcessInfo.processInfo.systemUptime)
-            let classified = ar.classifiedFloorReference(at: start, now: ProcessInfo.processInfo.systemUptime)
-            let groundDepth = ar.groundDepthEvidence(at: ProcessInfo.processInfo.systemUptime)
-            return await CostmapBuilder.planFollowAsync(from: ar.meshAnchors, start: start, goal: goal,
-                expectedFloorY: reference, classifiedFloorY: classified, groundDepth: groundDepth)
+            await FollowPlanningPolicy.plan(mode: FollowPlanningScope.mode, start: start, goal: goal) {
+                let reference = ar.mountedFloorReference(at: ProcessInfo.processInfo.systemUptime)
+                let classified = ar.classifiedFloorReference(at: start, now: ProcessInfo.processInfo.systemUptime)
+                let groundDepth = ar.groundDepthEvidence(at: ProcessInfo.processInfo.systemUptime)
+                return await CostmapBuilder.planFollowAsync(from: ar.meshAnchors, start: start, goal: goal,
+                    expectedFloorY: reference, classifiedFloorY: classified, groundDepth: groundDepth)
+            }
         }
         readySignalCostmap = { await CostmapBuilder.buildAsync(from: ar.meshAnchors, center: $0) }
         currentLastAck = { control.lastAcknowledgementSnapshot }
@@ -480,9 +482,33 @@ final class FollowNavigationController {
         return true
     }
 
+    var preservesFollowGoalOwner: Bool {
+        guard makePursuitPlan != nil, !stopUnconfirmed, let evidence = activeFollowEvidence,
+              !evidence.fenced, evidence.context.purpose == .followGoal,
+              evidence.ownedGeneration == operationGeneration else { return false }
+        return true
+    }
+
+    func pauseFollowForPerception() async -> Bool? {
+        guard preservesFollowGoalOwner, let driver = pursuitDriver else { return nil }
+        pursuitCommandFence?.inhibit()
+        return await driver.pauseForPerception()
+    }
+
+    func resumeFollowAfterPerception(timestamp: Double) -> Bool {
+        guard preservesFollowGoalOwner, let driver = pursuitDriver else { return false }
+        return driver.resumePerception(timestamp: timestamp)
+    }
+
+    func canResumeFollowAfterPerception(timestamp: Double) -> Bool {
+        guard preservesFollowGoalOwner, let driver = pursuitDriver else { return false }
+        return driver.canResumePerception(timestamp: timestamp)
+    }
+
     private func runPlannedPursuit(to goal: Vec2, owner: UInt,
                                    planner: @escaping @MainActor (Vec2, Vec2) async -> FollowPursuitPlan?) async -> NavigationResult {
         let evidence = FollowMotionTaskScope.evidence
+        let targetFeed = FollowTargetSpeedScope.feed
         var admissionDuration: Double?
         var lastAdmissionDiagnostic = -Double.infinity
         func owned() -> Bool {
@@ -498,7 +524,9 @@ final class FollowNavigationController {
             }, send: { command, expiry in
                 admissionDuration = nil
                 let transportEntry = self.transportUptime()
-                guard owned(), let driver = self.pursuitDriver else { throw FollowTurnBurstTransportDenial.fenced }
+                 guard owned(), let driver = self.pursuitDriver, !driver.perceptionPaused else {
+                     throw FollowPursuitSendFailure(reason: .cancelled, definitelyUnsent: true)
+                 }
                 let revision = driver.revision
                 let source = self.readFollowPose()
                 let fence = FollowTurnBurstFence()
@@ -523,7 +551,7 @@ final class FollowNavigationController {
                     sendEntryUptime: entry, requestedBudget: expiry - entry, uptime: uptime,
                     isAuthorized: { fence.authorized(at: uptime()) }, authorizeAttempt: { @MainActor [weak self, weak driver] in
                         guard let self, let driver, self.pursuitDriver === driver, driver.revision == revision,
-                              owned(), !Task.isCancelled,
+                               owned(), !driver.perceptionPaused, !Task.isCancelled,
                               self.readFollowPose().rejection(at: self.sourceNow(), expectedGeneration: source.frameID?.generation) == nil else {
                             fence.inhibit(); return false
                         }
@@ -540,7 +568,7 @@ final class FollowNavigationController {
                         case .stopCommsLost: depthFailure = .commsLost
                         case .stopTipping: depthFailure = .tipping
                         }
-                        guard depthFailure == nil, owned(), driver.revision == revision,
+                             guard depthFailure == nil, owned(), !driver.perceptionPaused, driver.revision == revision,
                               self.readFollowPose().rejection(at: self.sourceNow(), expectedGeneration: source.frameID?.generation) == nil else {
                             fence.inhibit(); return false
                         }
@@ -588,7 +616,8 @@ final class FollowNavigationController {
                     sessionGeneration: evidence?.context.request?.sessionGeneration,
                     operationID: evidence?.context.controllerOperationID, purpose: "followGoal", phase: "following"), payload: fields))
             }, admissionDuration: { admissionDuration }, depthNotificationsEnabled: observeDepthSafety != nil,
-            acknowledgementSnapshot: currentAcknowledgementSnapshot))
+             acknowledgementSnapshot: currentAcknowledgementSnapshot,
+             targetSample: { targetFeed?.sample }))
         pursuitDriver = driver
         let removePursuitDepthObserver = observeDepthSafety? { [weak driver] _ in driver?.depthPublished() }
         state = .planning
@@ -601,7 +630,14 @@ final class FollowNavigationController {
         guard operationGeneration == owner, activeFollowEvidence === evidence, evidence?.fenced != true else { return .cancelled }
         if stopUnconfirmed { finish(.failed(.commandFailed)); return .failed(.commandFailed) }
         if case .failed(let failure) = result { evidence?.recordFailure(failure, cause: driver.failureCause) }
-        do { try await confirmStop() } catch { return .failed(.commandFailed) }
+        if driver.stationaryStopConfirmed, evidence?.stopOutcome == .confirmed {
+            loop = nil
+            path = []
+            diagnosticEmitter?.emit(.init(event: "follow_pursuit.stop_reused", context: .init(
+                operationID: evidence?.context.controllerOperationID, purpose: "followGoal", reason: "terminal_cleanup")))
+        } else {
+            do { try await confirmStop() } catch { return .failed(.commandFailed) }
+        }
         guard operationGeneration == owner, activeFollowEvidence === evidence, evidence?.fenced != true else { return .cancelled }
         finish(result)
         return result

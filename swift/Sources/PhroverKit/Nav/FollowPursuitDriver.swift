@@ -7,6 +7,8 @@ struct FollowPursuitPlan: Sendable {
     var map: Costmap? = nil
     var rejection: PathPlanningFailure? = nil
     var diagnostics: [String: String] = [:]
+    var planningMode: FollowPlanningMode = .mesh
+    var isDirectDepthRoute: Bool { planningMode == .reactiveDepth && map == nil && path.count == 1 && rejection == nil }
     var endpointTolerance: Double { max(map?.resolution ?? 0, 1e-6) }
 
     func joined(from position: Vec2) -> Self? {
@@ -24,6 +26,10 @@ struct FollowPursuitPlan: Sendable {
     /// Replace only the final leg using the same captured collision map. This
     /// creates a plan for the latest goal; it does not authorize the old goal.
     func retargeted(to goal: Vec2, from capturedStart: Vec2) -> Self? {
+        if isDirectDepthRoute {
+            guard goal.x.isFinite, goal.y.isFinite else { return nil }
+            return .init(path: [goal], planningMode: .reactiveDepth)
+        }
         guard rejection == nil, let map, !path.isEmpty,
               goal.x.isFinite, goal.y.isFinite,
               path.allSatisfy({ $0.x.isFinite && $0.y.isFinite }) else { return nil }
@@ -65,6 +71,7 @@ final class FollowPursuitDriver {
         var admissionDuration: @MainActor () -> Double? = { nil }
         var depthNotificationsEnabled = false
         var acknowledgementSnapshot: (@MainActor () -> Date?)? = nil
+        var targetSample: @MainActor () -> FollowTargetSpeedSample? = { nil }
     }
 
     private final class Job {
@@ -109,6 +116,44 @@ final class FollowPursuitDriver {
     private let guardLayer = ObstacleGuard()
     private var job: Job?
     private var active = true
+    private(set) var perceptionPaused = false
+    private var perceptionPauseBoundary: Double?
+    private var requiresCurrentRouteAfterPause = false
+    private var resumedAfterPerceptionPause = false
+    private var perceptionPauseWaiters: [CheckedContinuation<Bool, Never>] = []
+    private(set) var stationaryStopConfirmed = false
+
+    func pauseForPerception() async -> Bool {
+        guard owned else { return false }
+        if !perceptionPaused { perceptionPauseBoundary = nil }
+        perceptionPaused = true
+        wakeDepthWaiter()
+        if perceptionPauseBoundary != nil { return true }
+        return await withCheckedContinuation { perceptionPauseWaiters.append($0) }
+    }
+
+    func canResumePerception(timestamp: Double) -> Bool {
+        guard owned, perceptionPaused, let boundary = perceptionPauseBoundary,
+              timestamp.isFinite, timestamp > boundary, timestamp <= environment.uptime(),
+              environment.uptime() - timestamp <= 0.5 else { return false }
+        return true
+    }
+
+    func resumePerception(timestamp: Double) -> Bool {
+        guard canResumePerception(timestamp: timestamp) else { return false }
+        perceptionPaused = false
+        perceptionPauseBoundary = nil
+        requiresCurrentRouteAfterPause = true
+        resumedAfterPerceptionPause = true
+        wakeDepthWaiter()
+        return true
+    }
+
+    private func completePerceptionPause(_ confirmed: Bool) {
+        let waiters = perceptionPauseWaiters
+        perceptionPauseWaiters.removeAll()
+        for waiter in waiters { waiter.resume(returning: confirmed) }
+    }
     private var depthRevision: UInt64 = 0
     private var depthPublishedAt: Double?
     private var depthWaiter: (id: UUID, continuation: CheckedContinuation<Void, Never>)?
@@ -171,6 +216,7 @@ final class FollowPursuitDriver {
 
     func inhibit() {
         active = false; acceptingGoals = false
+        completePerceptionPause(false)
         wakeDepthWaiter()
         job?.task?.cancel(); job = nil
     }
@@ -215,6 +261,16 @@ final class FollowPursuitDriver {
         var expiryRecoveries = 0
         var refreshAfter: (frame: ARFrameID?, time: Double)?
         var progress = DriveProgressWatchdog(timeout: 2.5, minimumProgress: 0.05)
+        var progressStoppedAt: Date?
+        var progressStoppedDuration = 0.0
+        func markProgressStopped() { progressStoppedAt = progressStoppedAt ?? environment.date() }
+        func progressTime(_ date: Date) -> Date {
+            date.addingTimeInterval(-progressStoppedDuration - (progressStoppedAt.map { max(0, date.timeIntervalSince($0)) } ?? 0))
+        }
+        func resumeProgress(at date: Date) {
+            if let stopped = progressStoppedAt { progressStoppedDuration += max(0, date.timeIntervalSince(stopped)) }
+            progressStoppedAt = nil
+        }
         var previousPosition: Vec2?
         var previousGoal: Vec2?
         var approach = 0.0
@@ -265,7 +321,11 @@ final class FollowPursuitDriver {
                 "command_valid_until_s": expiry.isFinite ? .number(expiry) : .null,
                 "evaluated_at_s": .number(environment.uptime()), "reason": .string(rawDepth ? "raw_depth_freshness" : "command_authorization_expired"),
                 "transport_attempts": .number(0)])
-            do { try await environment.stop() } catch { return .commandFailed }
+            if !stationaryStopConfirmed {
+                do { try await environment.stop() } catch { return .commandFailed }
+                stationaryStopConfirmed = true
+            }
+            markProgressStopped()
             movementActive = false
             acceleration.reset()
             stoppedAcknowledgement = nil
@@ -297,6 +357,37 @@ final class FollowPursuitDriver {
                 return .failed(.noPath)
             }
             if let refreshDeadline, tick >= refreshDeadline { return .failed(.depthUnavailable(refreshReason)) }
+            if perceptionPaused {
+                if !stationaryStopConfirmed {
+                    do { try await environment.stop() } catch { return .failed(.commandFailed) }
+                    stationaryStopConfirmed = true
+                    movementActive = false
+                    acceleration.reset()
+                    stoppedAcknowledgement = nil
+                }
+                if perceptionPauseBoundary == nil {
+                    markProgressStopped()
+                    perceptionPauseBoundary = environment.uptime()
+                    completePerceptionPause(true)
+                    environment.emit("perception_pause_confirmed", [:])
+                }
+                await waitForDepth(after: depthRevision, seconds: 0.02)
+                continue
+            }
+            if resumedAfterPerceptionPause {
+                resumedAfterPerceptionPause = false
+                if sent, let old = job, tick >= old.started + Self.planningTimeout {
+                    // A completed candidate can age out while deliberately
+                    // stationary. Discard it once on resume, rather than accept
+                    // stale geometry or restart the entire pursuit owner.
+                    recordAcceptance("expired_plan_after_perception_pause", job: old, source: source, at: tick,
+                        event: "planning_superseded", includeGeometry: false)
+                    old.task?.cancel()
+                    job = nil
+                    route = nil
+                    routeRevision = nil
+                }
+            }
             if let boundary = refreshAfter {
                 guard let timestamp = source.sourceTimestamp, timestamp > boundary.time,
                       let frame = source.frameID, let previous = boundary.frame,
@@ -363,7 +454,8 @@ final class FollowPursuitDriver {
                             recordAcceptance("path_join_blocked", job: job, source: source, at: tick)
                             return .failed(.noPath)
                         }
-                        if result.map == nil, let origin = job.source.pose, origin.position.distance(to: pose.position) > Self.maximumUnmappedPoseShift {
+                        if result.map == nil, !result.isDirectDepthRoute, let origin = job.source.pose,
+                           origin.position.distance(to: pose.position) > Self.maximumUnmappedPoseShift {
                             recordAcceptance("unmapped_pose_shift", job: job, source: source, at: tick)
                             return .failed(.trackingLost)
                         }
@@ -431,7 +523,7 @@ final class FollowPursuitDriver {
             case .stopCommsLost: return .failed(.commsLost)
             case .stopTipping: return .failed(.tipping)
             }
-            guard let route, sent || routeRevision == revision else {
+            guard let route, (sent && !requiresCurrentRouteAfterPause) || routeRevision == revision else {
                 await environment.sleep(.milliseconds(20)); continue
             }
             if let refreshDeadline, time >= refreshDeadline { return .failed(.depthUnavailable(refreshReason)) }
@@ -439,12 +531,25 @@ final class FollowPursuitDriver {
                 recordAcceptance("active_route_join_blocked", job: nil, source: current, at: time)
                 return .failed(.noPath)
             }
-            let output = pursuit.step(pose: currentPose, path: joined.path)
+            let targetSample = environment.targetSample()
+            let targetSpeed = FollowTargetSpeed.evaluate(targetSample, pose: current,
+                now: time, maximum: pursuit.params.maxLinear)
+            let targetExpiry = targetSpeed == nil ? Double.infinity : (targetSample!.timestamp + 0.5)
+            var parameters = pursuit.params
+            if let targetSpeed {
+                parameters.maxLinear = targetSpeed.maximumWheelSpeed
+                parameters.goalTolerance = 0.05
+                parameters.slowdownRadius = parameters.goalTolerance
+            }
+            let output = PursuitController(params: parameters).step(pose: currentPose, path: joined.path)
+            if targetSpeed.map({ $0.range <= $0.stopDistance }) == true { return .arrived }
             if output.reachedGoal {
                 // A pending new goal must not be discarded by old-goal arrival.
                 if routeRevision == revision { return .arrived }
                 if movementActive {
                     do { try await environment.stop() } catch { return .failed(.commandFailed) }
+                    stationaryStopConfirmed = true
+                    markProgressStopped()
                     movementActive = false
                     acceleration.reset()
                 }
@@ -452,9 +557,13 @@ final class FollowPursuitDriver {
             }
 
             let distanceToGoal = currentPose.position.distance(to: joined.path.last ?? routeGoal)
-            let approaching = FollowPursuitAcceleration.approaching(output.command,
-                distance: distanceToGoal, params: pursuit.params)
-            var safeCommand = acceleration.limited(approaching, at: environment.uptime())
+            let approaching = targetSpeed == nil ? FollowPursuitAcceleration.approaching(output.command,
+                distance: distanceToGoal, params: pursuit.params) : output.command
+            let bypassStartupRamp = targetSpeed?.bypassesStartupRamp == true
+            // Catch-up already has a fresh target-derived speed ceiling. Do not
+            // repeatedly ramp it from crawl after a confirmed recovery stop.
+            // Depth and exact-command transport checks still run below.
+            var safeCommand = bypassStartupRamp ? approaching : acceleration.limited(approaching, at: environment.uptime())
             var unavailable: DepthSafetyUnavailableReason?
             var depthExpiry = -Double.infinity
             let assessmentStarted = environment.uptime()
@@ -549,7 +658,7 @@ final class FollowPursuitDriver {
                 return .failed(.trackingLost)
             }
             if finalSource.pose != current.pose { await environment.sleep(.milliseconds(20)); continue }
-            if !sent, routeRevision != revision { continue }
+            if !sent || requiresCurrentRouteAfterPause, routeRevision != revision { continue }
             if let refreshDeadline, sendTime >= refreshDeadline { return .failed(.depthUnavailable(refreshReason)) }
             if !sent, sendTime >= began + Self.initialAdmissionTimeout {
                 recordAcceptance("startup_timeout", job: job, source: finalSource, at: sendTime)
@@ -559,17 +668,19 @@ final class FollowPursuitDriver {
                 approach += previousPosition.distance(to: previousGoal) - currentPose.position.distance(to: previousGoal)
             }
             previousPosition = currentPose.position; previousGoal = routeGoal
-            if progress.observe(distanceToGoal: -approach, now: environment.date(), commanded: true) { return .failed(.stalled) }
+            if progress.observe(distanceToGoal: -approach, now: progressTime(environment.date()), commanded: true) { return .failed(.stalled) }
             let ackExpiry = ack.map { sendTime + RoverConfig.commsWatchdogTimeout - environment.date().timeIntervalSince($0) } ?? sendTime
             let expiry = min(depthExpiry, finalSource.sourceTimestamp.map { $0 + 0.5 } ?? .infinity,
-                ackExpiry, sent ? .infinity : began + Self.initialAdmissionTimeout, refreshDeadline ?? .infinity)
+                ackExpiry, targetExpiry, sent ? .infinity : began + Self.initialAdmissionTimeout, refreshDeadline ?? .infinity)
             guard sendTime < expiry else {
+                if sendTime >= targetExpiry { continue }
                 if let failure = await recoverExpiredCommand(expiry: expiry) { return .failed(failure) }
                 continue
             }
             if sendTime - lastDiagnostic >= 0.5 {
                 lastDiagnostic = sendTime
                 environment.emit("drive_tick", ["goal_x": .number(routeGoal.x), "goal_z": .number(routeGoal.y),
+                    "planning_mode": .string(route.planningMode.rawValue),
                     "acknowledgement_snapshot": .bool(environment.acknowledgementSnapshot != nil),
                     "depth_notification_to_evaluation_s": notificationLag,
                     "acknowledgement_read_s": .number(ackReadDuration), "acknowledgement_reused": .bool(reuseAck),
@@ -578,6 +689,11 @@ final class FollowPursuitDriver {
                     "planning_pending": .bool(job != nil), "depth_valid_until_s": .number(depthExpiry),
                     "desired_command_left": .number(output.command.left), "desired_command_right": .number(output.command.right),
                     "forward_acceleration_mps2": .number(FollowPursuitAcceleration.acceleration),
+                    "target_range_m": targetSpeed.map { .number($0.range) } ?? .null,
+                    "target_radial_velocity_mps": targetSpeed.map { .number($0.radialVelocity) } ?? .null,
+                    "target_speed_ceiling": targetSpeed.map { .number($0.maximumWheelSpeed) } ?? .null,
+                    "target_speed_valid_until_s": targetSpeed.map { _ in .number(targetExpiry) } ?? .null,
+                    "catchup_ramp_bypassed": .bool(bypassStartupRamp),
                     "distance_to_goal_m": .number(distanceToGoal),
                     "approach_command_left": .number(approaching.left), "approach_command_right": .number(approaching.right),
                     "required_send_margin_s": .number(requiredMargin),
@@ -585,17 +701,22 @@ final class FollowPursuitDriver {
                     "command_left": .number(safeCommand.left), "command_right": .number(safeCommand.right)])
             }
             environment.moving()
-            guard owned, revision == sendRevision else { continue }
+            guard owned, !perceptionPaused, revision == sendRevision else { continue }
             guard environment.uptime() < expiry else {
+                if environment.uptime() >= targetExpiry { continue }
                 if let failure = await recoverExpiredCommand(expiry: expiry) { return .failed(failure) }
                 continue
             }
             let sendStarted = environment.uptime()
+            let sendDate = environment.date()
+            stationaryStopConfirmed = false
             do { try await environment.send(safeCommand, expiry) }
             catch {
                 guard owned else { return .cancelled }
                 if let rejected = error as? FollowPursuitSendFailure {
+                    if rejected.definitelyUnsent, perceptionPaused { continue }
                     if rejected.definitelyUnsent, rejected.authorizationExpired {
+                        if environment.uptime() >= targetExpiry { continue }
                         if let failure = await recoverExpiredCommand(expiry: expiry) { return .failed(failure) }
                         continue
                     }
@@ -608,6 +729,8 @@ final class FollowPursuitDriver {
             maximumAdmissionDuration = max(maximumAdmissionDuration,
                 environment.admissionDuration() ?? (environment.uptime() - sendStarted))
             sent = true
+            resumeProgress(at: sendDate)
+            requiresCurrentRouteAfterPause = false
             acceleration.sent(safeCommand, at: sendStarted)
             movementActive = true
             if refreshDeadline != nil { environment.emit("depth_wait_recovered", [:]) }

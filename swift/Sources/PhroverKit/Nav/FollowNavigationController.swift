@@ -70,7 +70,9 @@ final class FollowNavigationController {
         wheelBase: RoverConfig.wheelBase,
         goalTolerance: 0.2,
         minimumRotateWheelSpeed: RoverConfig.minimumRotateWheelSpeed))
-    private let guardLayer = ObstacleGuard()
+    private var guardLayer: ObstacleGuard {
+        .init(stopDistance: FollowPlanningScope.minimumObstacleClearance ?? 0.45)
+    }
     private static let obstacleArrivalDistance = 0.65
 
     private var loop: Task<NavigationResult, Never>?
@@ -492,7 +494,12 @@ final class FollowNavigationController {
     func pauseFollowForPerception() async -> Bool? {
         guard preservesFollowGoalOwner, let driver = pursuitDriver else { return nil }
         pursuitCommandFence?.inhibit()
-        return await driver.pauseForPerception()
+        let confirmed = await driver.pauseForPerception()
+        if confirmed { return true }
+        // A finished/inhibited driver also releases pause waiters with false.
+        // Only a latched stop failure means that confirmation actually failed;
+        // otherwise the caller must join the independent terminal stop owner.
+        return stopUnconfirmed ? false : nil
     }
 
     func resumeFollowAfterPerception(timestamp: Double) -> Bool {
@@ -509,13 +516,15 @@ final class FollowNavigationController {
                                    planner: @escaping @MainActor (Vec2, Vec2) async -> FollowPursuitPlan?) async -> NavigationResult {
         let evidence = FollowMotionTaskScope.evidence
         let targetFeed = FollowTargetSpeedScope.feed
+        let detourContext = FollowObstacleDetourScope.context
+        var detouring = false
         var admissionDuration: Double?
         var lastAdmissionDiagnostic = -Double.infinity
         func owned() -> Bool {
             operationGeneration == owner && evidence?.fenced != true && !stopUnconfirmed &&
                 activeFollowEvidence === evidence && recoveryAuthorized
         }
-        let driver = FollowPursuitDriver(goal: goal, environment: .init(plan: planner, pose: readFollowPose,
+        let environment = FollowPursuitDriver.Environment(plan: planner, pose: readFollowPose,
             owned: owned, uptime: { self.sourceNow() }, date: { self.now() }, acknowledgement: { await self.currentLastAck() },
             clearance: { self.currentForwardClearance() }, depth: { command in
                 let result = self.searchDepthObservation(command)
@@ -614,23 +623,48 @@ final class FollowNavigationController {
             }, emit: { stage, fields in
                 self.diagnosticEmitter?.emit(.init(event: "follow_pursuit." + stage, context: .init(
                     sessionGeneration: evidence?.context.request?.sessionGeneration,
-                    operationID: evidence?.context.controllerOperationID, purpose: "followGoal", phase: "following"), payload: fields))
+                     operationID: evidence?.context.controllerOperationID, purpose: "followGoal", phase: detouring ? "avoidingObstacle" : "following"), payload: fields))
             }, admissionDuration: { admissionDuration }, depthNotificationsEnabled: observeDepthSafety != nil,
              acknowledgementSnapshot: currentAcknowledgementSnapshot,
-             targetSample: { targetFeed?.sample }))
+             targetSample: { targetFeed?.sample })
+        let driver = FollowPursuitDriver(goal: goal, environment: environment)
         pursuitDriver = driver
         let removePursuitDepthObserver = observeDepthSafety? { [weak driver] _ in driver?.depthPublished() }
         state = .planning
         let task = Task(priority: .userInitiated) { await driver.run() }
         loop = task
         defer { removePursuitDepthObserver?(); if pursuitDriver === driver { pursuitDriver = nil } }
-        let result = await task.value
+        var result = await task.value
         // Loss of episode authorization ends driving, but does not remove this
         // owner's cleanup obligation. Only an actual replacement owns its stop.
         guard operationGeneration == owner, activeFollowEvidence === evidence, evidence?.fenced != true else { return .cancelled }
         if stopUnconfirmed { finish(.failed(.commandFailed)); return .failed(.commandFailed) }
-        if case .failed(let failure) = result { evidence?.recordFailure(failure, cause: driver.failureCause) }
-        if driver.stationaryStopConfirmed, evidence?.stopOutcome == .confirmed {
+        if result == .failed(.obstacle), let detourContext,
+           let request = detourContext.begin(at: readFollowPose()) {
+            detouring = true
+            let detour = FollowObstacleDetour(request: request, control: environment,
+                turn: { heading in
+                    await self.startFollowTurn(by: 0, purpose: .followAlignment, retainedOwner: owner, absoluteTarget: heading)
+                }, stopFence: { evidence?.turnStopFence }, target: detourContext.target)
+            let authorization = FollowRecoveryAuthorization(episodeID: request.id, expectedGeneration: request.generation,
+                deadline: request.deadline, now: { self.sourceNow() }, canContinue: {
+                    self.operationGeneration == owner && self.activeFollowEvidence === evidence &&
+                        evidence?.fenced != true && !self.stopUnconfirmed && detour.withinBounds()
+                })
+            let maneuver = Task { @MainActor in
+                await FollowRecoveryScope.$authorization.withValue(authorization) {
+                    await FollowObstacleDetourScope.$active.withValue(true) {
+                        await FollowTurnSourceScope.$required.withValue(true) { await detour.run() }
+                    }
+                }
+            }
+            loop = maneuver
+            result = await maneuver.value
+            guard operationGeneration == owner, activeFollowEvidence === evidence, evidence?.fenced != true else { return .cancelled }
+            if stopUnconfirmed { finish(.failed(.commandFailed)); return .failed(.commandFailed) }
+        }
+        if case .failed(let failure) = result { evidence?.recordFailure(failure, cause: detouring ? nil : driver.failureCause) }
+        if (driver.stationaryStopConfirmed || detouring), evidence?.stopOutcome == .confirmed {
             loop = nil
             path = []
             diagnosticEmitter?.emit(.init(event: "follow_pursuit.stop_reused", context: .init(
@@ -1216,9 +1250,12 @@ final class FollowNavigationController {
         return await startFollowTurn(by: angle, purpose: .followAlignment)
     }
 
-    private func startFollowTurn(by angle: Double, purpose: FollowMotionPurpose) async -> NavigationResult {
+    private func startFollowTurn(by angle: Double, purpose: FollowMotionPurpose,
+                                 retainedOwner: UInt? = nil, absoluteTarget: Double? = nil) async -> NavigationResult {
         guard !stopUnconfirmed else { return .failed(.commandFailed) }
-        operationGeneration &+= 1
+        if let retainedOwner {
+            guard retainedOwner == operationGeneration, FollowObstacleDetourScope.active else { return .cancelled }
+        } else { operationGeneration &+= 1 }
         let owner = operationGeneration
         let evidence = FollowMotionTaskScope.evidence
         evidence?.ownedGeneration = owner
@@ -1231,7 +1268,13 @@ final class FollowNavigationController {
                 followTurnSourceSubscriptionID = nil
             }
         }
-        do { try await confirmStop() } catch { return .failed(.commandFailed) }
+        do {
+            if retainedOwner != nil {
+                if evidence?.stopOutcome != .confirmed || followTurnStopFence?.operationGeneration != owner {
+                    try await rotationStop(origin: "obstacle_detour_turn")
+                }
+            } else { try await confirmStop() }
+        } catch { return .failed(.commandFailed) }
         // Preserve the actual stopped capture even when source admission rejects
         // it. This is evidence only; resolution remains absent until admission.
         if let recovery = FollowRecoveryScope.heading {
@@ -1255,7 +1298,9 @@ final class FollowNavigationController {
             return .failed(.trackingLost)
         }
         let target: Double
-        if purpose == .followScan, let recovery = FollowRecoveryScope.heading {
+        if let absoluteTarget, retainedOwner != nil, absoluteTarget.isFinite {
+            target = FollowReacquisitionPlanner.wrap(absoluteTarget)
+        } else if purpose == .followScan, let recovery = FollowRecoveryScope.heading {
             let delta: Double
             switch FollowReacquisitionPlanner.resolveAbsoluteStage(stageHeading: recovery.stageHeading, actualYaw: yaw,
                 maximumSegment: recovery.maximumSegment) {
@@ -1455,10 +1500,14 @@ final class FollowNavigationController {
                          stoppedEvaluation: self.turnPoseEvidence == nil ? nil : captured.stoppedEvaluation)
                 })
         }
-        loop = task
-        let result = await task.value
+        if retainedOwner == nil { loop = task }
+        let result = await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
         guard operationGeneration == owner else { return .cancelled }
-        loop = nil
+        if retainedOwner == nil { loop = nil }
         if stopUnconfirmed { return .failed(.commandFailed) }
         guard !Task.isCancelled, evidence?.fenced != true, recoveryAuthorized else { return .cancelled }
         if let previous = evidence?.recovery, let arrival = followTurnSourceGate.latest {
@@ -1480,7 +1529,7 @@ final class FollowNavigationController {
                 arrivalReadUptime: readUptime)
             if result == .arrived, !valid { return .failed(.trackingLost) }
         }
-        finish(result)
+        if retainedOwner == nil { finish(result) }
         return result
     }
 
@@ -3212,7 +3261,7 @@ final class FollowNavigationController {
         switch decision {
         case .allow(let safe, _): return (safe, false)
         case .stopDepth(let rejected):
-            guard evidence?.context.request?.isSearchSweep != true,
+            guard !FollowObstacleDetourScope.active, evidence?.context.request?.isSearchSweep != true,
                   evidence?.context.request?.searchClearance == nil,
                   rejected.state == .unavailable(.blindSweptVolume), DepthSafetyMotionClass.classify(command) == .rotating else {
                 runtime.fail(recordDepthRejection(rejected)); throw DepthSafetyStop(failure: runtime.failure!)

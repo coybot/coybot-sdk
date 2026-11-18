@@ -546,7 +546,8 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
             operatorClearedRotation: FollowSearchRotationScope.authorized,
             boundedReadyMotion: ReadyMotionDepthScope.active,
             visibilityPolicy: FollowDepthPolicyScope.current,
-            includeDiagnosticCoverage: FollowDepthPolicyScope.current != .astralCompatible
+            includeDiagnosticCoverage: FollowDepthPolicyScope.current != .astralCompatible,
+            minimumObstacleClearance: FollowPlanningScope.minimumObstacleClearance ?? 0.30
         )
     }
 
@@ -1190,8 +1191,31 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
             }
         }
         guard !depths.isEmpty else { return .infinity }
-        depths.sort()
         let index = min(depths.count - 1, max(0, Int(Double(depths.count - 1) * 0.10)))
+        // Only the tenth percentile is needed. Sorting all ~8,000 samples on
+        // every camera callback occupies the same actor that delivers depth and
+        // motor decisions. Three-way selection preserves every input sample and
+        // the exact rank, including repeated depths, without fully sorting.
+        var lower = 0, upper = depths.count - 1
+        while lower < upper {
+            let a = depths[lower], b = depths[(lower + upper) / 2], c = depths[upper]
+            let pivot = max(min(a, b), min(max(a, b), c))
+            var less = lower, cursor = lower, greater = upper
+            while cursor <= greater {
+                if depths[cursor] < pivot {
+                    depths.swapAt(less, cursor)
+                    less += 1; cursor += 1
+                } else if depths[cursor] > pivot {
+                    depths.swapAt(cursor, greater)
+                    greater -= 1
+                } else {
+                    cursor += 1
+                }
+            }
+            if index < less { upper = less - 1 }
+            else if index > greater { lower = greater + 1 }
+            else { break }
+        }
         return Double(depths[index])
     }
 

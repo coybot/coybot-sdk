@@ -552,7 +552,20 @@ final class DepthSafetyEvaluatorTests: XCTestCase {
         XCTAssertEqual(observation.state, .stop)
     }
 
-    private func stoppingMarginObservation(speed: Double, age: TimeInterval, obstacleDepth: Float) -> DepthSafetyObservation {
+    func testFifteenCentimeterMinimumRetainsBrakingAndNearObstacleStop() {
+        let clearOfMinimum = stoppingMarginObservation(speed: 0.12, age: 0.10, obstacleDepth: 0.43, minimum: 0.15)
+        XCTAssertEqual(clearOfMinimum.requiredStoppingDistance, 0.15, accuracy: 1e-6)
+        XCTAssertEqual(clearOfMinimum.state, .caution)
+        let near = stoppingMarginObservation(speed: 0.12, age: 0.10, obstacleDepth: 0.27, minimum: 0.15)
+        XCTAssertEqual(near.state, .stop)
+        XCTAssertLessThanOrEqual(near.clearance, 0.15)
+        let fast = stoppingMarginObservation(speed: 0.50, age: 0.20, obstacleDepth: 0.50, minimum: 0.15)
+        XCTAssertEqual(fast.requiredStoppingDistance, 0.38125, accuracy: 1e-6)
+        XCTAssertEqual(fast.state, .stop)
+    }
+
+    private func stoppingMarginObservation(speed: Double, age: TimeInterval, obstacleDepth: Float,
+                                          minimum: Double = 0.30) -> DepthSafetyObservation {
         let map = makeDepthBuffer(width: 80, height: 60, constantDepth: 3.0)
         fill(depth: obstacleDepth, x: 35...44, y: 33...37, in: map)
         let snapshot = DepthSafetyEvaluator.ingest(
@@ -566,7 +579,7 @@ final class DepthSafetyEvaluatorTests: XCTestCase {
         return DepthSafetyEvaluator.evaluate(
             snapshot,
             command: WheelCommand(left: speed, right: speed),
-            now: 10 + age
+            now: 10 + age, minimumObstacleClearance: minimum
         )
     }
 

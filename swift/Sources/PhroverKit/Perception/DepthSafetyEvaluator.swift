@@ -234,12 +234,14 @@ enum DepthSafetyEvaluator {
                           operatorClearedRotation: Bool = false,
                           boundedReadyMotion: Bool = false,
                           visibilityPolicy: FollowDepthPolicy = .fullVolume,
-                          includeDiagnosticCoverage: Bool = true) -> DepthSafetyObservation {
+                           includeDiagnosticCoverage: Bool = true,
+                           minimumObstacleClearance: Double = 0.30) -> DepthSafetyObservation {
         let evaluationStarted = ProcessInfo.processInfo.systemUptime
         var observation = evaluateMotion(snapshot, command: command, now: now,
             operatorClearedRotation: operatorClearedRotation, boundedReadyMotion: boundedReadyMotion,
             astralCompatible: visibilityPolicy == .astralCompatible,
-            includeDiagnosticCoverage: includeDiagnosticCoverage)
+            includeDiagnosticCoverage: includeDiagnosticCoverage,
+            minimumObstacleClearance: minimumObstacleClearance)
         observation.visibilityPolicy = visibilityPolicy
         observation.evaluationDuration = ProcessInfo.processInfo.systemUptime - evaluationStarted
         return observation
@@ -251,7 +253,8 @@ enum DepthSafetyEvaluator {
                                        operatorClearedRotation: Bool,
                                        boundedReadyMotion: Bool,
                                        astralCompatible: Bool,
-                                       includeDiagnosticCoverage: Bool) -> DepthSafetyObservation {
+                                        includeDiagnosticCoverage: Bool,
+                                        minimumObstacleClearance: Double) -> DepthSafetyObservation {
         let motion = DepthSafetyMotionClass.classify(command)
         let age = max(0, now - snapshot.timestamp)
         guard now.isFinite, snapshot.timestamp.isFinite, now >= snapshot.timestamp,
@@ -279,9 +282,10 @@ enum DepthSafetyEvaluator {
         let speed = max(abs(command.left), abs(command.right))
         let latencyAndBrakingDistance = speed * (age + assumedLatency)
             + speed * speed / (2 * assumedDeceleration)
-        // Thirty centimeters is the total minimum, not an additive buffer.
+        // The selected clearance is a total minimum, not an additive buffer.
         // Faster motion still requires the full latency and braking distance.
-        let stoppingDistance = max(confirmedRotation ? FollowSearchClearancePolicy.retainedClearance : minimumStoppingDistance, latencyAndBrakingDistance)
+        let minimum = minimumObstacleClearance.isFinite ? max(0.15, minimumObstacleClearance) : minimumStoppingDistance
+        let stoppingDistance = max(confirmedRotation ? FollowSearchClearancePolicy.retainedClearance : minimum, latencyAndBrakingDistance)
         let cautionDistance = stoppingDistance + cautionLeadDistance
         let boundedForward = boundedReadyMotion && motion == .forward && command.left == command.right &&
             command.left > 0 && command.left <= RoverConfig.readySignalWheelMagnitude

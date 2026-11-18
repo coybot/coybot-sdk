@@ -11,8 +11,8 @@ public struct FollowReacquisitionEpisode: Sendable {
     public let segmentIndex: Int
     public let unavailableReason: String?
 
-    public init(id: UUID = UUID(), firstLoss: TimeInterval, anchor: FollowReliableMemory?) {
-        self.id = id; self.firstLoss = firstLoss; self.deadline = firstLoss + 10
+    public init(id: UUID = UUID(), firstLoss: TimeInterval, anchor: FollowReliableMemory?, deadlineLimit: TimeInterval = .infinity) {
+        self.id = id; self.firstLoss = firstLoss; self.deadline = min(firstLoss + 10, deadlineLimit)
         self.anchor = anchor; self.center = nil; self.stageIndex = 0; self.segmentIndex = 0
         self.unavailableReason = anchor == nil ? "missing_reliable_memory" : nil
     }

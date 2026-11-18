@@ -13,6 +13,340 @@ Automated simulator tests do not establish LiDAR projection accuracy or prove th
 
 Record the tested phone, rover, build revision, pass/fail per step, and redacted runtime-log evidence here after the supervised run. Do not attach camera images or raw transcripts.
 
+## Live holding yaw and early caution arcs (November 17, 17:26 installation)
+
+The `follow-on-the-fly-nov17.log` capture showed nine hold/alignment cycles
+between 00:03:22Z and 00:04:17Z, with matched ranges 1.19–1.66 m (median 1.38 m).
+Forward steering was active elsewhere. No obstacle arcs appeared in the sampled
+drive diagnostics. Near the final stop, successive candidate checks consumed
+most of the raw-depth freshness window; one alternative had only 3.4 cm clearance.
+
+Regressions failed before implementation: holding entered burst alignment,
+the driver immediately completed instead of turning at hold range, and caution
+kept a straight command despite a depth-approved clearer side arc.
+
+- Talk enables continuous holding facing. Fresh measured samples explicitly
+  carry translation inhibition. The same pursuit owner issues equal-and-opposite
+  wheel commands while holding, and can become a forward drive when fresh target
+  range leaves the hold band. Holding begins a turn above 10 degrees and completes
+  below 5 degrees to avoid restarting on measurement jitter. Completion still
+  confirms a stop; there is no mandatory stop/settle between yaw updates.
+- Holding progress uses measured directed yaw rather than distance travelled.
+  A 2.5-second lack of yaw progress remains terminal. The existing rotation
+  magnitude, live swept-depth evaluation, exact-command transport check,
+  observation expiry, cancellation and failed-stop handling remain authoritative.
+- Arc selection now runs during caution. A candidate must have a clear corridor
+  or improve measured clearance by more than 5 cm; otherwise the existing
+  caution-limited command remains. Blocked-path handling still requires an
+  approved alternative or a stop.
+- Each candidate is evaluated locally once and accepted only if the approved
+  command exactly equals the proposed bounded command. The duplicate evaluation
+  of an unchanged arc is removed. Native transport still rechecks the exact
+  command before HTTP. Candidate work is bounded by measured evaluation cost,
+  admission margin and remaining depth freshness.
+
+Verification: 1,680 SDK tests passed in 1,680 runs without retries. New checks
+cover mirrored holding yaw with zero translation and no intermediate stops,
+yaw progress beyond the translation-stall interval, no-yaw stall detection,
+holding-to-forward ownership continuity, transport-time obstacle rejection for
+holding turns, and early caution arcs with a device-like evaluation-time budget.
+Conversation ViewModel tests and the signed Debug build passed.
+Installed on HungIphone at 17:26, database sequence 6512.
+
+A small hold/drive/wait/cancel state model was proposed; it was not model-checked.
+Checks above exercise the actual implementation and do not prove physical
+behaviour. Rotation overshoot, wheel response, depth latency and smoother
+obstacle avoidance still need a device capture.
+
+## Continuous forward arcs (November 17, 15:59 installation)
+
+Pulled `follow-continuous-curves-nov17.log`. The run acquired at 23:41:37Z,
+held distance at 23:41:41Z, drove at 23:41:44Z and entered the stopped obstacle
+detour at 23:41:47Z. It resumed at 23:41:56Z. Later reacquisitions retained
+bearings around -27 degrees, below the existing 45-degree moving-facing gate:
+those interruptions followed lost target matches, rather than the large-turn
+gate. The session ultimately ended in person loss.
+
+- Talk now permits forward curves toward a visible target through 90 degrees
+  either side. Reactive pursuit uses the same forward-hemisphere boundary;
+  targets behind the rover still require stopped facing. Startup alignment and
+  stationary holding keep their existing gates.
+- When the desired forward command is depth-blocked, measured-target reactive
+  pursuit inspects two bounded forward arcs, preferring the previous successful
+  side or the target side. Peak wheel request is capped at 0.12 and the inner
+  wheel at one quarter of that; target-speed limits still apply. The exact
+  caution-scaled candidate must pass a fresh depth evaluation, and native
+  transport independently checks it again before sending.
+- If neither arc has fresh depth approval, the existing stop/bounded-detour
+  path remains. No unseen side space is treated as clear. Ordinary forward
+  guard checks, target expiry, source ownership, progress watchdog and detour
+  budget remain active.
+- While already moving, a brief side-target miss can retain the measured arc
+  within the configured moving-bearing limit. Coasting cannot extend measured
+  position freshness beyond 0.5 s, and cannot launch translation from holding.
+
+Verification: regressions reproduced stopped obstacle handling and in-place
+far-side turns. Mirrored forward arcs through 85 degrees, clear-left/clear-right,
+both-blocked/stale-depth rejection, brief lateral-target loss, and native
+transport-time obstacle appearance are covered. All 1,674 SDK tests passed in
+1,674 runs, without retries. Conversation ViewModel tests passed after one
+simulator launch attempt failed with “Busy / Application failed preflight
+checks”; no assertion failure was reported in that attempt.
+Signed Debug build passed and installed on HungIphone at 15:59, sequence 6504.
+
+Physical smoothness, actual swept wheel paths and detection continuity remain
+unverified. Candidate-arc tests establish software admission behavior, not
+calibrated physical clearance or guaranteed continuous movement.
+
+## Acquisition hold and heading-priority pursuit (November 17, 13:44 installation)
+
+Reviewed `follow-initial-center-nov17.log`. Initial capture was 26.84 degrees
+off-centre (box centre x=0.889), followed by repeated verification holds and
+reacquisition without forward pursuit. The second attempt acquired at 10.68
+degrees, then began driving at approximately 1.46 degrees. During driving,
+bearing error grew to about 16 degrees while measured rover yaw changed by
+only about one degree. The capture contained 36 `no_matching_body` rejections
+and one drive tick without fresh-target centring. Final clearance was
+0.214442 m against 0.215347 m required braking distance.
+
+Three regressions failed before the changes: expired target evidence silently
+falling back to waypoint driving, insufficient differential steering under
+depth caution, and a requested one-second acquisition hold expiring at 0.5 s.
+
+- Talk now permits a one-second stationary acquisition-verification hold. It
+  retains the same original deadline across repeated misses, remains capped by
+  the recovery episode, and still requires fresh verified observations to resume.
+  Default SDK configuration remains 0.5 s. This does not make unverified bodies
+  eligible targets or guarantee recognition at the image edge.
+- Reactive measured-target pursuit stops on expired/missing target evidence
+  instead of substituting a waypoint. Recovery requires a confirmed stop and
+  a new same-generation sample captured after that stop. The wait is bounded
+  to 0.5 s from its start, with at most two target-refresh attempts per driver.
+  Target-owned startup also cannot drive before its first measurement.
+- Reactive steering uses a 0.15 m virtual lookahead, prioritising heading over
+  translation. This is a steering parameter, separate from obstacle clearance.
+  Angular and wheel caps remain; the angular cap scales with target speed to
+  preserve the requested arc across ranges and under proportional depth caution.
+
+Verification: 1,670 SDK tests passed in 1,670 runs, without retries. Checks cover
+changing/mirrored bearings, range-independent arcs, caution-limited wheel
+commands, target expiry and fresh recovery, absent/wrong-generation/pre-stop
+evidence, failed-stop/cancelled-owner rejection, and a non-renewing stationary
+acquisition deadline. Conversation ViewModel tests and signed Debug build
+passed. Installed on HungIphone (iPhone 15 Pro Max) at 13:44, sequence 6496.
+
+The measured weak physical yaw response motivated the sharper arc, but software
+tests cannot establish that it overcomes wheel friction on the actual floor.
+Physical centring, turning response and recognition continuity need a new run.
+No model-check result is claimed; a small recovery-state model could represent
+driving → stop-pending → waiting → fresh-ready, plus failed/cancelled terminals,
+and check send exclusion until confirmed stop and post-stop evidence.
+
+## Continuous bearing correction (November 17, 12:43 installation)
+
+Pulled `follow-continuous-center-nov17.log`. The first attempt searched for about
+19 seconds, repeatedly aligned/reacquired and ended in person loss. The second
+attempt followed intermittently from 19:45:35Z to 19:45:48Z, with four
+reacquisitions, then stopped during its obstacle detour. The final rotating
+depth observation reported zero clearance and a 15 cm required stopping
+distance.
+
+During pursuit the target stayed roughly 16–17 degrees off-centre while
+depth-limited wheel requests were almost equal (approximately 0.117/0.120).
+The two-point measured-target path selected the distant endpoint as the
+lookahead, weakening curvature as target range increased. A regression through
+the actual pursuit driver failed before the fix: a 20-degree target offset
+produced only a 0.0222 differential/sum ratio at two metres, falling further
+at longer ranges.
+
+The user clarified that forward motion should continue while centring, rather
+than stopping until perfectly aligned. Reactive pursuit now places its steering
+aim 0.5 m along the fresh target bearing. It continuously corrects small offsets
+without an angular deadband; the five-degree stopped-turn completion tolerance
+is not a moving-steering deadband and remains separate. Moving pursuit permits
+corrections through 45 degrees, matching Talk's stop-and-face boundary.
+Target range still controls stand-off braking. Depth limits, target expiry and
+exact-command admission still apply to the resulting command.
+
+Verification: mirrored bearings from 1 to 44 degrees at 2/3/4 m produce forward
+corrections with range-independent differential ratios. A changing-bearing
+sequence crosses centre and reverses correction within one pursuit operation,
+with no intermediate stops and both wheels capped by 0.12 depth caution.
+All 1,664 SDK tests passed in 1,664 runs, without retries. Signed Debug build
+passed; installed on HungIphone at 12:43, database sequence 6488.
+Added bearing/lookahead drive diagnostics for the next capture.
+
+Physical heading response and image centring remain unverified. Repeated target
+loss remains a separate observed limitation; these tests do not establish that
+stronger steering resolves it.
+
+## Measured-target centring, 15 cm clearance and spoken readiness (November 16, 17:49 installation)
+
+The latest device capture (`follow-center-15cm-latest.log`) showed repeated
+alignment/reacquisition before person loss, then about 14 seconds of following,
+a completed obstacle detour and reacquisition. The final stop had 9.848 cm
+clearance, 144.7 ms depth age and a 30 cm required stopping distance. That
+obstacle remains inside the new 15 cm minimum.
+
+- Reactive Follow Me now uses a 15 cm minimum clearance in live depth evaluation
+  and its forward obstacle guards. Latency/braking can require a larger stopping
+  distance. Mesh/default navigation and confirmed search-rotation clearance
+  retain their existing settings.
+- Reactive steering aims at the fresh measured target rather than the led goal.
+  Target stand-off braking and transport expiry remain authoritative. Talk
+  permits moving corrections through 45 degrees; holding retains the 15-degree
+  stop-and-face threshold.
+- Immediate startup says “I'm ready to follow you.” once per session after
+  accepted alignment, whether beginning pursuit or holding distance. The cue
+  uses the existing independent speech audio session without another motion wait.
+
+Verification: 1,662 SDK tests passed, including mirrored steering, moderate
+bearing/owner continuity, large-turn stopping, holding/following speech,
+15 cm and speed-dependent braking, and live AR/native scope propagation.
+One existing background-depth reset/publication test exceeded its two-second
+publication expectation and passed on automatic retry (1,663 test runs).
+Conversation ViewModel tests and the signed Debug build passed.
+Installed on HungIphone at 17:49, installation database sequence 6392.
+
+Physical centring, audible speech, mounted-camera clearance and braking remain
+unverified. The source of repeated target-match loss is not established by these
+changes; a new device capture is needed to assess improvement.
+
+## Direct target speed and reduced alignment churn (November 16, 16:32 installation)
+
+The 16:05–16:06 capture took 18 seconds searching and another 12 seconds aligning
+on its first attempt. Both attempts then exhausted depth recovery. Fresh targets
+closer than the old catch-up threshold repeatedly restarted the 0.10 acceleration
+ramp. A late perception pause while terminal cleanup was pending also produced
+“Rover stop could not be confirmed” before successful stop ACKs arrived.
+
+Three regressions failed before the changes: nearby-target speed after recovery,
+perception pause during pending terminal cleanup, and an already-aligned target
+launching a redundant motor operation. They now pass.
+
+- Fresh validated target speed bypasses the additional startup/recovery ramp at
+  every range. Target-distance braking, holding, obstacle caution, target expiry,
+  and exact-command transport admission still apply. Unverified legacy goals
+  retain their conservative acceleration behavior.
+- Immediate startup recognizes an already-aligned settled post-stop observation,
+  then waits for a newer matched frame rather than requesting a zero-angle turn.
+  Completed native alignment can reuse its correlated confirmed stop fence.
+  The final handoff rechecks heading, source identity, stop ownership and frame
+  freshness; it does not issue another stop merely to begin pursuit.
+- A finished driver declining a perception pause is not a failed stop. The
+  controller reports no active pause capability unless a real failed-stop latch
+  is present, allowing independent terminal stop confirmation to complete.
+- The per-camera-frame forward-clearance calculation now selects the exact tenth
+  percentile without fully sorting every corridor sample. Twelve generated
+  full-resolution maps match the sorted reference exactly, including constant,
+  increasing, decreasing and invalid samples. On the Debug simulator, 240
+  evaluations decreased from 2.706 s to 0.495 s (about 5.5× faster). No depth
+  samples, obstacles, or freshness checks were removed.
+
+All 1,657 SDK tests passed, with one retry of
+`testBackgroundDepthResultsCannotSurviveResetOrInterruption` after its two-second
+publication expectation timed out. That test then passed ten consecutive
+focused iterations. Conversation ViewModel tests and the signed Debug build
+passed. Installed on HungIphone at 16:32, installation database sequence 6384.
+The clearance benchmark measures simulator CPU cost, not physical smoothness.
+Acquisition coverage, real target visibility, depth delivery under device load,
+and physical stopping remain subject to the next supervised capture.
+
+## Immediate aligned startup and independent depth scheduling (November 16, 15:43 installation)
+
+The latest 15:26 runs exhausted ordinary pursuit depth recovery with clear depth
+observations around 232 ms old. New timing fields showed negligible memory
+attachment/publication work, but worker-to-actor delays up to about 58 ms in the
+sampled final drive. Initial startup also spent five seconds paused, followed by
+alignment, readiness announcement and a separate departure gesture.
+
+Talk now starts searching immediately and follows on a fresh post-stop aligned
+target match. It skips the readiness announcement and departure gesture. Initial
+alignment remains required even if the person disappears and is reacquired during
+startup. Detection continues during driving and search turns; lost-target
+reacquisition retains bounded depth-checked turns, not blind forward translation.
+The subsequent stationary return wait and spoken guidance now use 15 seconds.
+
+Depth projection no longer waits for main-actor publication before starting the
+newest pending input. Separate locked input/result mailboxes coalesce stale work,
+retain original capture timestamps, and fence invalidated generations. Main-actor
+publication still owns visibility memory and observers. This removes a reproduced
+scheduling dependency; it does not prove all physical depth-freshness stops are
+eliminated or change the 250 ms validity/600 ms recovery limits.
+
+Validation: the blocked-main-actor regression failed before the worker change and
+passed afterward. Twelve deterministic generated submit/reset sequences check
+generation fencing and publication order. Startup, loss-during-alignment, and the
+15-second timeout boundary are covered. All 1,653 SDK tests passed without retries;
+Conversation ViewModel tests and signed Debug build passed. Installed on
+HungIphone at 15:43, installation database sequence 6376. Physical smooth-follow
+acceptance and the separately reported AR tracking failure remain unverified.
+
+## Detour depth-freshness recovery (November 16, 12:39 installation)
+
+The 12:11:54–12:11:57 capture reached a 30° detour heading and sent two forward
+commands before a 243 ms raw-depth sample left less than the required 20 ms
+transport margin. The maneuver stopped with confirmed stop evidence before
+turning back toward the target. This was depth freshness, not a floor-map rejection.
+
+A deterministic replay of that sample age failed before the fix. The detour now
+permits one confirmed stationary depth refresh during advance: at most 600 ms,
+capped by the existing maneuver deadline, with three increasing post-stop depth
+captures spanning at least 60 ms before resuming. The 250 ms depth expiry and
+exact-command transport validation remain unchanged. A second interruption,
+new obstacle, or failed stop terminates the maneuver. This does not extend the
+ordinary pursuit driver's recovery budget.
+
+Four regressions cover the recorded transient, persistent near-expiry delivery,
+second interruption, failed recovery stop, and an obstacle during recovery.
+All 1,649 SDK tests passed without retries. Signed Debug build succeeded and was
+installed on HungIphone at 12:39, installation database sequence 6368.
+
+Ordinary-following depth-recovery exhaustion and the earlier AR tracking failure
+are not yet resolved. Additional depth timing fields separate worker-to-actor
+delay, memory attachment, and publication cost for the next physical capture.
+Physical improvement remains unverified.
+
+## One bounded obstacle detour (November 13, 22:31 validation)
+
+The 21:33:55 device stop was a live obstacle, not a mesh/floor rejection:
+0.256 m clearance against 0.30 m required stopping distance, 170 ms depth age,
+and 171 supporting samples. Talk now opts into one detour attempt per explicit
+follow session when reactive pursuit stops for an obstacle with a healthy,
+body-verified matched target. SDK clients remain opt-in.
+
+The maneuver confirms stop, inspects the side opposite the last target-facing
+turn in 15°, 30°, and 45° increments, then inspects the other side if blocked.
+Every turn uses the existing depth-checked pure-turn controller; blind arc
+fallback is disabled. A candidate direction needs three distinct post-stop
+clear-depth captures spanning at least 60 ms, each younger than 250 ms, with
+at least 0.60 m swept and forward clearance. These checks use the existing
+live-depth policy; they do not establish complete observed-volume coverage.
+
+Advance is limited to approximately 0.25 m, wheel requests no greater than
+0.12, and 0.35 m maximum displacement from the stopped origin. Lateral drift,
+heading drift, source generation, progress, ACK freshness, and exact-command
+transport admission remain checked. The rover stops, turns toward the latest
+reliable remembered target, and requires fresh post-stop reacquisition before
+following resumes. The entire maneuver and reacquisition share the original
+12-second deadline; new targets and goals cannot renew it. Cancellation reaches
+nested turns, and a failed stop remains terminal.
+
+Validation: 18 new deterministic engine, native-controller, and coordinator tests
+cover both inspected sides, blocked/unsafe/stale observations, travel bounds,
+source reset, ownership replacement, final-transport obstacle rejection, failed
+stop, cancellation, fixed deadlines, and post-stop target reacquisition. All
+1,645 SDK tests passed without retries; Conversation ViewModel tests and the
+signed Debug device build passed. Standards review found no documented-rule
+violations and noted two maintainability concerns around shared pursuit transport
+and nested-turn ownership. Spec review's cancellation and deadline findings were
+fixed and re-reviewed successfully.
+
+Installed on `HungIphone` (iPhone 15 Pro Max) at 22:34 local time, installation
+database sequence 6280. Physical corner-detour acceptance is pending. Requested
+wheel values remain uncalibrated PWM; the simulator does not prove real braking,
+clearance geometry, or reacquisition performance.
+
 ## Basic direct following with live depth (November 13, 21:21 validation)
 
 The 21:09 failure had a free raw start cell but an inflated blocked cell from

@@ -106,7 +106,10 @@ final class FollowReturnCoordinatorTests: XCTestCase {
 
     func testReturnWaitExpiresWithoutFurtherPerception() async {
         let (coordinator, _, motion, clock) = await waiting()
-        clock.advance(to: 70)
+        clock.advance(to: 24.99)
+        await drain()
+        guard case .waitingForReturn = coordinator.state else { return XCTFail("Wait ended before 15 seconds") }
+        clock.advance(to: 25)
         await drain()
         XCTAssertEqual(coordinator.state, .failed("Return wait expired. Come into view and say follow me to restart."))
         XCTAssertEqual(motion.goals.count, 1)

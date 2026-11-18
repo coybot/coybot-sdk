@@ -102,9 +102,18 @@ public struct FollowMeConfiguration {
     /// After a confirmed stop for target loss or transient depth failure, wait
     /// for a fresh human return before starting a new readiness sequence.
     public var waitForUserReturn = false
+    /// Begin pursuit after fresh, stopped alignment rather than a readiness
+    /// announcement and a separate human-departure gesture.
+    public var followImmediatelyAfterAlignment = false
+    /// Above this measured bearing, stop forward pursuit and turn in place.
+    public var movingTargetFacingAngle: Double = .pi / 12
+    /// Keep a live yaw controller while holding range instead of burst alignment.
+    public var continuousHoldingFacing = false
     /// Pursuit mode: direct live-depth-gated following on flat floors, or mesh
     /// routing. Legacy moving readiness retains its separate mesh preflight.
     public var planningMode: FollowPlanningMode = .mesh
+    /// One depth-checked local obstacle detour per explicit follow session.
+    public var allowsObstacleDetour = false
 
     // MARK: Continuous following (all off by default; `.continuous` turns them on)
 

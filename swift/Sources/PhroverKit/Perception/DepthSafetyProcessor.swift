@@ -17,12 +17,8 @@ final class DepthSafetyProcessor {
 
     private let evaluate: @Sendable (Input) -> DepthSafetySnapshot
     private let didProcess: @MainActor (DepthSafetySnapshot) -> Void
-    // Depth must not queue behind the serial Vision/Core ML worker. Its safety
-    // projection has a dedicated high-QoS lane; publication remains actor-owned.
-    private let projectionQueue = DispatchQueue(label: "us.coybot.depth-safety", qos: .userInteractive)
-    private var pending: (input: Input, generation: UInt64, submitted: Double)?
+    private let worker = ProjectionWorker()
     private var lastTimingLog = -Double.infinity
-    private var task: Task<Void, Never>?
     private var generation: UInt64 = 0
     private var memory = DepthVisibilityMemory()
 
@@ -44,39 +40,34 @@ final class DepthSafetyProcessor {
         // Revoke at ingress so a newer normal waiter cannot erase the loss,
         // and an in-flight pre-loss projection cannot repopulate memory.
         guard input.trackingNormal else { invalidate(); return }
-        // Bound retained camera buffers to the running capture and the newest waiter.
-        pending = (input, generation, ProcessInfo.processInfo.systemUptime)
-        guard task == nil else { return }
-        task = Task(priority: .userInitiated) { [self] in
-            defer { task = nil }
-            while let job = pending {
-                pending = nil
-                let evaluate = evaluate
-                let (snapshot, started, finished) = await withCheckedContinuation { continuation in
-                    projectionQueue.async {
-                        let started = ProcessInfo.processInfo.systemUptime
-                        let result = evaluate(job.input)
-                        continuation.resume(returning: (result, started, ProcessInfo.processInfo.systemUptime))
-                    }
-                }
+        worker.submit(input, generation: generation, evaluate: evaluate) { [weak self] in
+            Task(priority: .userInitiated) { @MainActor [weak self] in
+                guard let self, let result = self.worker.takeResult() else { return }
+                let snapshot = result.snapshot
+                let started = result.started, finished = result.finished
                 // Resets, interruptions and missing raw depth revoke old results, even
                 // if their native computation could not be cancelled mid-frame.
-                guard job.generation == generation else { continue }
+                let resumed = ProcessInfo.processInfo.systemUptime
+                guard result.generation == self.generation else { return }
                 var delivered = snapshot
-                memory.attach(to: &delivered)
-                didProcess(delivered)
+                self.memory.attach(to: &delivered)
+                let publicationStarted = ProcessInfo.processInfo.systemUptime
+                self.didProcess(delivered)
                 let published = ProcessInfo.processInfo.systemUptime
-                if published - lastTimingLog >= 1 {
-                    lastTimingLog = published
+                if published - self.lastTimingLog >= 1 {
+                    self.lastTimingLog = published
                     RuntimeFileLog.append("depth_pipeline_timing", fields: [
                         "thermal_state": String(ProcessInfo.processInfo.thermalState.rawValue),
                         "low_power_mode": String(ProcessInfo.processInfo.isLowPowerModeEnabled),
-                        "source_timestamp_s": String(job.input.timestamp),
-                        "capture_to_submit_s": String(job.submitted - job.input.timestamp),
-                        "submit_to_worker_s": String(started - job.submitted),
+                        "source_timestamp_s": String(snapshot.timestamp),
+                        "capture_to_submit_s": String(result.submitted - snapshot.timestamp),
+                        "submit_to_worker_s": String(started - result.submitted),
                         "projection_s": String(finished - started),
+                        "worker_to_actor_s": String(resumed - finished),
+                        "memory_attach_s": String(publicationStarted - resumed),
+                        "publication_s": String(published - publicationStarted),
                         "worker_to_publish_s": String(published - finished),
-                        "capture_to_publish_s": String(published - job.input.timestamp)])
+                        "capture_to_publish_s": String(published - snapshot.timestamp)])
                 }
             }
         }
@@ -84,7 +75,85 @@ final class DepthSafetyProcessor {
 
     func invalidate() {
         generation &+= 1
-        pending = nil
+        worker.invalidate(generation: generation)
         memory.clear()
+    }
+
+    /// All mailbox state is protected by `lock`; only the serial queue evaluates.
+    /// Publication is coalesced independently so a busy main actor cannot stall
+    /// projection or accumulate an unbounded queue of completed snapshots.
+    private final class ProjectionWorker: @unchecked Sendable {
+        struct Job {
+            let input: Input
+            let generation: UInt64
+            let submitted: Double
+        }
+        struct Result {
+            let snapshot: DepthSafetySnapshot
+            let generation: UInt64
+            let submitted: Double
+            let started: Double
+            let finished: Double
+        }
+        private let lock = NSLock()
+        private let queue = DispatchQueue(label: "us.coybot.depth-safety", qos: .userInteractive)
+        private var generation: UInt64 = 0
+        private var pending: Job?
+        private var latest: Result?
+        private var running = false
+        private var publicationScheduled = false
+
+        func submit(_ input: Input, generation: UInt64,
+                    evaluate: @escaping @Sendable (Input) -> DepthSafetySnapshot,
+                    notify: @escaping @Sendable () -> Void) {
+            let start = lock.withLock {
+                pending = Job(input: input, generation: generation, submitted: ProcessInfo.processInfo.systemUptime)
+                if running { return false }
+                running = true
+                return true
+            }
+            guard start else { return }
+            queue.async { [self] in
+                while let job = next() {
+                    let started = ProcessInfo.processInfo.systemUptime
+                    let snapshot = evaluate(job.input)
+                    let result = Result(snapshot: snapshot, generation: job.generation, submitted: job.submitted,
+                        started: started, finished: ProcessInfo.processInfo.systemUptime)
+                    let shouldNotify = lock.withLock {
+                        guard job.generation == self.generation else { return false }
+                        latest = result
+                        guard !publicationScheduled else { return false }
+                        publicationScheduled = true
+                        return true
+                    }
+                    if shouldNotify { notify() }
+                }
+            }
+        }
+
+        private func next() -> Job? {
+            lock.withLock {
+                guard let job = pending else { running = false; return nil }
+                pending = nil
+                return job
+            }
+        }
+
+        func takeResult() -> Result? {
+            lock.withLock {
+                defer { latest = nil; publicationScheduled = false }
+                return latest
+            }
+        }
+
+        func invalidate(generation: UInt64) {
+            lock.withLock {
+                self.generation = generation
+                pending = nil
+                latest = nil
+                // Keep the scheduled notification: it will drain either nothing
+                // or the newest valid generation, without an extra queued task.
+            }
+        }
     }
 }

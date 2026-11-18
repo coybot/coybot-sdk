@@ -150,6 +150,7 @@ final class ConversationViewModel {
         case .following: return "Following — 1.5 m"
         case .holdingDistance: return "Holding distance"
         case .reacquiring: return "Person lost — searching…"
+        case .avoidingObstacle: return "Obstacle ahead — checking for a clear detour…"
         case .waitingForReturn(let message): return message
         case .stopped: return "Stopped"
         case .failed(let message): return message

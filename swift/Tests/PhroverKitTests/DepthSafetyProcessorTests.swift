@@ -6,6 +6,66 @@ import XCTest
 
 @MainActor
 final class DepthSafetyProcessorTests: XCTestCase {
+    func testGeneratedSubmitResetSequencesPublishOnlyCurrentGeneration() async throws {
+        for seed in 1...12 {
+            let entered = expectation(description: "seed \(seed) running")
+            let completed = expectation(description: "seed \(seed) newest delivered")
+            let release = DispatchSemaphore(value: 0)
+            var delivered: [Double] = []
+            let processor = DepthSafetyProcessor(evaluate: { input in
+                if input.timestamp == 1 {
+                    entered.fulfill()
+                    _ = release.wait(timeout: .now() + 3)
+                }
+                return Self.result(for: input)
+            }, didProcess: { snapshot in
+                delivered.append(snapshot.timestamp)
+                if snapshot.timestamp == 32 { completed.fulfill() }
+            })
+            processor.submit(try input(at: 1))
+            await fulfillment(of: [entered], timeout: 1)
+            var random = UInt64(seed)
+            var lastReset = 0.0
+            for step in 2...31 {
+                random = random &* 6364136223846793005 &+ 1
+                if random >> 62 == 0 {
+                    processor.invalidate()
+                    lastReset = Double(step)
+                } else {
+                    processor.submit(try input(at: Double(step)))
+                }
+            }
+            processor.submit(try input(at: 32))
+            release.signal()
+            await fulfillment(of: [completed], timeout: 2)
+            XCTAssertEqual(delivered.last, 32, "seed \(seed)")
+            XCTAssertTrue(delivered.allSatisfy { $0 > lastReset }, "pre-reset publication, seed \(seed)")
+            XCTAssertEqual(delivered, delivered.sorted(), "nonmonotonic publication, seed \(seed)")
+            processor.invalidate()
+        }
+    }
+
+    func testNextProjectionDoesNotWaitForMainActorPublication() async throws {
+        let entered = expectation(description: "first projection running")
+        let release = DispatchSemaphore(value: 0)
+        let nextProjected = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        let processor = DepthSafetyProcessor(evaluate: { input in
+            if input.timestamp == 1 {
+                entered.fulfill()
+                _ = release.wait(timeout: .now() + 2)
+            } else { nextProjected.signal() }
+            return Self.result(for: input)
+        }, didProcess: { _ in })
+        processor.submit(try input(at: 1))
+        await fulfillment(of: [entered], timeout: 1)
+        processor.submit(try input(at: 2))
+        release.signal()
+        // Deliberately occupy the actor: projection must progress independently.
+        XCTAssertEqual(nextProjected.wait(timeout: .now() + 1), .success)
+        processor.invalidate()
+    }
+
     func testDepthDeliveryContinuesWhileDetectorWorkerIsBlocked() async throws {
         let inferenceStarted = expectation(description: "inference is busy")
         let depthDelivered = expectation(description: "depth bypasses inference worker")
@@ -98,7 +158,9 @@ final class DepthSafetyProcessorTests: XCTestCase {
         processor.submit(try input(at: 3))
         gate.signal()
         await fulfillment(of: [completed], timeout: 2)
-        XCTAssertEqual(delivered, [1, 3])
+        XCTAssertEqual(delivered.last, 3)
+        XCTAssertFalse(delivered.contains(2))
+        XCTAssertEqual(delivered, delivered.sorted(), "Coalescing must never publish captures backwards")
     }
 
     func testInvalidationDiscardsRunningAndWaitingCaptures() async throws {

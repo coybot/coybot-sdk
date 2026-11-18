@@ -11,6 +11,9 @@ public enum FollowPlanningMode: String, Sendable {
 
 enum FollowPlanningScope {
     @TaskLocal static var mode: FollowPlanningMode = .mesh
+    /// Reactive pursuit's minimum bumper clearance. Depth still accounts for
+    /// latency and braking; other navigation retains its existing thresholds.
+    static var minimumObstacleClearance: Double? { mode == .reactiveDepth ? 0.15 : nil }
 }
 
 enum FollowPlanningPolicy {

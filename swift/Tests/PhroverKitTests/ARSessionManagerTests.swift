@@ -8,6 +8,48 @@ import Observation
 
 @MainActor
 final class ARSessionManagerTests: XCTestCase {
+    func testForwardClearanceMatchesExactPercentileAcrossGeneratedDepthMaps() throws {
+        var elapsed = 0.0
+        for seed in 0..<12 {
+            var buffer: CVPixelBuffer?
+            CVPixelBufferCreate(kCFAllocatorDefault, 256, 192, kCVPixelFormatType_DepthFloat32, nil, &buffer)
+            let map = try XCTUnwrap(buffer)
+            CVPixelBufferLockBaseAddress(map, [])
+            let stride = CVPixelBufferGetBytesPerRow(map) / MemoryLayout<Float>.stride
+            let base = CVPixelBufferGetBaseAddress(map)!.assumingMemoryBound(to: Float.self)
+            var expected: [Float] = []
+            var random = UInt64(seed + 1)
+            for y in 0..<192 {
+                for x in 0..<256 {
+                    random = random &* 6364136223846793005 &+ 1
+                    let index = y * 256 + x
+                    let value: Float
+                    switch seed {
+                    case 0: value = .nan
+                    case 1: value = 2
+                    case 2: value = Float(index) / 1000
+                    case 3: value = Float(49152 - index) / 1000
+                    default:
+                        value = random % 17 == 0 ? .infinity : Float(random % 4000) / 1000
+                    }
+                    base[y * stride + x] = value
+                    if (64..<128).contains(y), (64..<192).contains(x), value > 0.05, value.isFinite {
+                        expected.append(value)
+                    }
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(map, [])
+            expected.sort()
+            let percentile = expected.isEmpty ? Double.infinity : Double(expected[Int(Double(expected.count - 1) * 0.1)])
+            let started = ProcessInfo.processInfo.systemUptime
+            for _ in 0..<20 {
+                XCTAssertEqual(ARSessionManager.forwardClearance(fromDepthMap: map), percentile, "seed \(seed)")
+            }
+            elapsed += ProcessInfo.processInfo.systemUptime - started
+        }
+        print("Clearance benchmark: 240 full-resolution evaluations took \(elapsed) seconds")
+    }
+
     func testClearanceRevocationSurvivesOverwrittenIngressBeforeConsumptionAndDuringPause() throws {
         for consumedBeforeIngress in [false, true] {
             for invalidTracking in [false, true] {
@@ -271,6 +313,11 @@ final class ARSessionManagerTests: XCTestCase {
         XCTAssertEqual(control.clearance, diagnostic.clearance)
         XCTAssertEqual(control.supportCount, diagnostic.supportCount)
         XCTAssertEqual(control.requiredStoppingDistance, diagnostic.requiredStoppingDistance)
+        let reactive = FollowPlanningScope.$mode.withValue(.reactiveDepth) {
+            ar.depthSafetyObservation(for: command, at: 10.18)
+        }
+        XCTAssertEqual(reactive.requiredStoppingDistance, 0.15, accuracy: 1e-6)
+        XCTAssertEqual(ar.depthSafetyObservation(for: command, at: 10.18).requiredStoppingDistance, 0.30)
         XCTAssertNil(control.coverage, "Shadow full-volume analysis must not delay an Astral-compatible control decision")
         XCTAssertNil(control.fullVolumeWouldBlock, "Skipped diagnostics must not claim the full-volume policy passed")
         let stale = FollowDepthPolicyScope.$current.withValue(.astralCompatible) {

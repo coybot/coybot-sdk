@@ -145,10 +145,12 @@ final class ContextualFollowMotionFake: FollowMeContextualMotion, FollowMeReturn
     private(set) var contextualSubscriptions = 0
     private var failureContinuation: AsyncStream<FollowMotionFailureDelivery>.Continuation?
     var resultOverride: FollowMotionResult?
+    var performHandler: ((FollowMotionRequest, FollowMotionRequestContext) async -> FollowMotionResult)?
 
     func perform(_ request: FollowMotionRequest, context: FollowMotionRequestContext) async -> FollowMotionResult {
         requests.append(request)
         contexts.append(context)
+        if let performHandler { return await performHandler(request, context) }
         let result = await legacy.performContextual(request, context: context)
         return resultOverride ?? result
     }
@@ -179,11 +181,13 @@ final class LiveGoalFollowMotionFake: FollowMeContextualMotion {
     private(set) var liveGoals: [Vec2] = []
     /// When false the fake refuses live updates, like a controller that is not driving.
     var acceptsLiveGoals = true
+    private(set) var targetFeed: FollowTargetSpeedFeed?
 
     init() { legacy.suspendNavigation = true }
 
     func perform(_ request: FollowMotionRequest, context: FollowMotionRequestContext) async -> FollowMotionResult {
-        await legacy.performContextual(request, context: context)
+        targetFeed = FollowTargetSpeedScope.feed
+        return await legacy.performContextual(request, context: context)
     }
     func updateFollowGoal(_ goal: Vec2) -> Bool {
         guard acceptsLiveGoals, !legacy.goals.isEmpty else { return false }

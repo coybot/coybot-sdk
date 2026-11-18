@@ -7,9 +7,9 @@ enum FollowReturnWaitReason {
     var message: String {
         switch self {
         case .targetLost:
-            return "I can't see you. Come back into view, about two metres in front of the camera, and stand still. I'll wait for one minute and try following again when you're detected."
+            return "I can't see you. Come back into view, about two metres in front of the camera, and stand still. I'll wait for 15 seconds and try following again when you're detected."
         case .depthUnstable:
-            return "Depth isn't stable, so I've paused. Step out of view, then return about two metres in front of the camera and stand still. I'll wait for one minute and try again when tracking and depth are stable."
+            return "Depth isn't stable, so I've paused. Step out of view, then return about two metres in front of the camera and stand still. I'll wait for 15 seconds and try again when tracking and depth are stable."
         }
     }
 }

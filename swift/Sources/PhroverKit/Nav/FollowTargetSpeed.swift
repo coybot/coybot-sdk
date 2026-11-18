@@ -8,6 +8,7 @@ struct FollowTargetSpeedSample: Sendable {
     let velocity: Vec2
     let standOff: Double
     let minimumDistance: Double
+    var holdsTranslation: Bool = false
 }
 
 /// One session's newest measured target, never a re-timestamped coast estimate.
@@ -18,6 +19,12 @@ final class FollowTargetSpeedFeed {
 
 enum FollowTargetSpeedScope {
     @TaskLocal static var feed: FollowTargetSpeedFeed?
+}
+
+/// Hysteresis keeps small measurement jitter from repeatedly restarting a hold turn.
+enum FollowHoldingTurn {
+    static let entryAngle = Double.pi / 18
+    static let completionAngle = Double.pi / 36
 }
 
 struct FollowTargetSpeed {

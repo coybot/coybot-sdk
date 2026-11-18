@@ -232,8 +232,14 @@ struct ConversationView: View {
             ) { brain }
             let followClock = SystemFollowClock()
             var followConfiguration = FollowMeConfiguration.continuous
+            followConfiguration.stationaryPauseSeconds = 0
+            followConfiguration.followImmediatelyAfterAlignment = true
+            followConfiguration.movingTargetFacingAngle = .pi / 2
+            followConfiguration.acquisitionVerificationGraceSeconds = 1
+            followConfiguration.continuousHoldingFacing = true
             followConfiguration.waitForUserReturn = true
             followConfiguration.planningMode = .reactiveDepth
+            followConfiguration.allowsObstacleDetour = true
             let follow = FollowMeCoordinator(
                 perception: ARFollowMePerceptionSource(ar: ar, detector: detector),
                 motion: NavigationFollowMeMotion(navigation: nav),

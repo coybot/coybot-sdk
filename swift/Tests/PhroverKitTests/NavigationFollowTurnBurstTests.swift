@@ -93,6 +93,13 @@ final class NavigationFollowTurnBurstTests: XCTestCase {
 
     @MainActor
     func testSearchSettlesEarlyOnlyAfterAdvancingStablePostStopPoses() async {
+        for recovery in [false, true] {
+            await assertScanSettlesEarly(recovery: recovery)
+        }
+    }
+
+    @MainActor
+    private func assertScanSettlesEarly(recovery: Bool) async {
         var uptime = 10.0
         var snapshot = sample(1, 9.99)
         var stops = 0
@@ -107,8 +114,9 @@ final class NavigationFollowTurnBurstTests: XCTestCase {
             sleep: { try? await Task.sleep(for: $0) }, poseSample: { snapshot }, sourceNow: { uptime }, sourceStopSnapshot: { snapshot })
         let task = Task {
             let result = await NavigationFollowMeMotion(navigation: controller).perform(.scan(.pi / 18), context:
-                .init(sessionGeneration: 1, requestToken: 1, purpose: .followScan, phase: "searching", isSearchSweep: true,
-                    allowsAcquisitionRotationWithoutDepth: true))
+                .init(sessionGeneration: 1, requestToken: 1, purpose: .followScan,
+                    phase: recovery ? "reacquiring" : "searching", isSearchSweep: !recovery,
+                    allowsAcquisitionRotationWithoutDepth: true, allowsEarlyScanSettle: recovery))
             completed = true
             return result
         }

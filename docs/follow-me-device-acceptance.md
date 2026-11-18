@@ -13,6 +13,55 @@ Automated simulator tests do not establish LiDAR projection accuracy or prove th
 
 Record the tested phone, rover, build revision, pass/fail per step, and redacted runtime-log evidence here after the supervised run. Do not attach camera images or raw transcripts.
 
+## Recovery timing and edge detections (November 17, 19:52 installation)
+
+The `follow-post-6512-review.log` capture contained two 600 ms depth-recovery
+timeouts, two person-loss endings, and one stalled reacquisition rotation.
+Depth was still arriving during the timeouts: send-margin rejection repeatedly
+reset the three-capture stability history. During the final acquisition,
+several person boxes overran the right image edge by 0.26–0.50%, exceeding
+the verifier's 0.2% clipping allowance. Reacquisition used short requested
+bursts with a mandatory 300 ms settle between them.
+
+- Fresh, depth-approved post-stop captures now accumulate stability evidence
+  independently of the send-margin gate. A margin miss still prevents sending.
+  Stale/missing depth and pre-stop captures still reset stability; three distinct
+  captures spanning 60 ms, the fixed 600 ms deadline, and transport approval
+  remain required.
+- Freshness budgeting reserves the larger of one depth evaluation or observed
+  native admission cost, plus 10 ms, with the existing 30 ms minimum. It no longer
+  reserves a second execution of the entire multi-candidate local assessment.
+  Arc probes must fit both their own evaluation and the remaining send reserve.
+- Person boxes may be clipped by at most 1% per image edge. Clipping never grows
+  a box or fabricates joints. A unique, same-frame, independently verified torso
+  with valid visible joints is still required. Missing and ambiguous bodies
+  remain rejected.
+- The coordinator explicitly opts scan requests into the existing 100 ms
+  stable post-stop pose window. Reacquisition retains exact-heading completion,
+  bounded burst requests, fixed recovery deadlines and yaw-stall detection.
+  Drift, gaps, and duplicate evidence retain the 300 ms settle fallback.
+  Low-level callers retain their existing default settling policy.
+
+Regressions failed before implementation for intermittent margin misses,
+recorded edge boxes, and early reacquisition settling. An expanded arc-cost
+regression also failed before correcting the probe reserve. Deterministic
+variants cover alternate evaluation-cost sequences, mirrored recorded boxes,
+missing/ambiguous torso evidence, and both initial and recovery scans.
+The first broader run exposed legacy fixture assumptions about 300 ms sleeps
+and timed out; early settling was then made an explicit coordinator request.
+Final verification: **1,682 SDK tests passed without retries**, including
+coordinator opt-in, stop/source fences, cancellation, deadline, hard-depth-fault,
+and native exact-command rejection regressions. Signed Debug build passed.
+Installed on HungIphone at 19:52, database sequence **6520**.
+
+Artifacts are in the OpenCode temporary directory: `follow-recovery-6512-red.log`,
+`follow-recovery-6512-arc-red.log`, `follow-recovery-6512-boundaries.log`,
+`follow-recovery-6512-full-final.log`, and `follow-recovery-6512-build.log`.
+Final test bundle: `Test-PhroverSDKTests-2026.11.17_19-50-22--0800.xcresult`.
+A small TLA+ recovery-state model was proposed but not model-checked.
+These checks do not establish physical turn gain, wheel stopping, or improved
+real-world tracking; another device capture is required.
+
 ## Live holding yaw and early caution arcs (November 17, 17:26 installation)
 
 The `follow-on-the-fly-nov17.log` capture showed nine hold/alignment cycles

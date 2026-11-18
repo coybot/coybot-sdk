@@ -46,9 +46,10 @@ public enum PersonBodyVerifier {
             return .init(rawPersonID: rawPersonID, accepted: false, reason: "invalid_person_box", matchingBodies: 0,
                 inputBox: box, boxIssue: "nonfinite_or_nonpositive_area")
         }
-        // Detector rounding can put an otherwise visible torso fractionally
-        // outside the unit image. Bound the repair to 0.2% per edge; never grow it.
-        guard box.minX >= -0.002, box.minY >= -0.002, box.maxX <= 1.002, box.maxY <= 1.002 else {
+        // Edge detections can overrun the image slightly (recorded: 0.26–0.50%).
+        // Clip at most 1% per edge; never grow the box or infer missing joints.
+        // Acceptance still requires one independently verified visible torso.
+        guard box.minX >= -0.01, box.minY >= -0.01, box.maxX <= 1.01, box.maxY <= 1.01 else {
             return .init(rawPersonID: rawPersonID, accepted: false, reason: "invalid_person_box", matchingBodies: 0,
                 inputBox: box, boxIssue: "outside_edge_slack")
         }

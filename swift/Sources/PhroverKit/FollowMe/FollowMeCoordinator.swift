@@ -1982,7 +1982,8 @@ public final class FollowMeCoordinator {
             scanResponseSeed: purpose == .followScan && scanResponseSeed?.sourceGeneration == latestFrame?.generation ? scanResponseSeed : nil,
             isSearchSweep: purpose == .followScan && state == .searching,
             searchClearance: purpose == .followScan && state == .searching ? searchClearance : nil,
-            allowsAcquisitionRotationWithoutDepth: (purpose == .followScan || purpose == .followAlignment) && acquisitionRotationIgnoresDepth)
+            allowsAcquisitionRotationWithoutDepth: (purpose == .followScan || purpose == .followAlignment) && acquisitionRotationIgnoresDepth,
+            allowsEarlyScanSettle: purpose == .followScan)
         activeRequest = context
         movementTask = Task { [weak self] in
             let result = await action(context)
@@ -2380,7 +2381,7 @@ public final class FollowMeCoordinator {
         let context = FollowMotionRequestContext(sessionGeneration: token, requestToken: id,
             purpose: .followScan, phase: String(describing: state),
             scanResponseSeed: scanResponseSeed?.sourceGeneration == latestFrame?.generation ? scanResponseSeed : nil,
-            allowsAcquisitionRotationWithoutDepth: acquisitionRotationIgnoresDepth)
+            allowsAcquisitionRotationWithoutDepth: acquisitionRotationIgnoresDepth, allowsEarlyScanSettle: true)
         activeRequest = context
         scanning = true
         emitRecovery("request_started", reason: "absolute_stage_requested", episode: episode,

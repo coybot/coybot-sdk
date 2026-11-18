@@ -466,6 +466,7 @@ final class FollowMeCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.state, .reacquiring)
         XCTAssertNil(coordinator.perceptionIssue)
         XCTAssertEqual(motion.recoveryContexts.last?.allowsAcquisitionRotationWithoutDepth, true)
+        XCTAssertEqual(motion.recoveryContexts.last?.allowsEarlyScanSettle, true)
         XCTAssertEqual(motion.recoveryAuthorized.last, true, "Depthless acquisition still retains a usable recovery anchor")
 
         perception.send(frame(4, at: clock.now, pose: .init(position: .zero, yaw: .pi / 2),
@@ -482,6 +483,8 @@ final class FollowMeCoordinatorTests: XCTestCase {
         perception.send(frame(8, at: clock.now)); await drain()
         XCTAssertEqual(coordinator.state, .reacquiring)
         XCTAssertEqual(motion.recoveryContexts.last?.allowsAcquisitionRotationWithoutDepth, false)
+        XCTAssertEqual(motion.recoveryContexts.last?.allowsEarlyScanSettle, true,
+            "Early stable-pose settling is independent of the acquisition depth exception")
         perception.send(frame(9, at: clock.now, depth: false)); await drain()
         XCTAssertEqual(coordinator.perceptionIssue, .depthUnavailable)
         _ = await coordinator.stop()

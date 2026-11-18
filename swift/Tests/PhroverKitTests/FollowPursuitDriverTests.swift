@@ -52,6 +52,12 @@ final class FollowPursuitDriverTests: XCTestCase {
     }
 
     func testCautionSelectsEarlyArcWithoutDuplicateDepthEvaluation() async {
+        for evaluationCost in [0.020, 0.025, 0.028] {
+            await assertCautionArc(evaluationCost: evaluationCost)
+        }
+    }
+
+    private func assertCautionArc(evaluationCost: Double) async {
         let f = Fixture()
         var reads = 0
         var capture: Double?
@@ -64,7 +70,7 @@ final class FollowPursuitDriverTests: XCTestCase {
             reads += 1
             if capture == nil { capture = f.time - 0.15 }
             let age = f.time - capture!
-            f.time += 0.02 // Device-like cost: preserve the remaining freshness budget.
+            f.time += evaluationCost
             let arc = command.right > command.left
             return .init(state: arc ? .clear : .caution, clearance: arc ? 1 : 0.5,
                 supportCount: 5, sampleAge: age, requiredStoppingDistance: 0.15,
@@ -74,6 +80,8 @@ final class FollowPursuitDriverTests: XCTestCase {
             XCTAssertGreaterThan(command.right, command.left, "Steer before the desired path reaches hard stop")
             XCTAssertEqual(reads, 2, "Evaluate the intended command and one exact arc; transport owns its final recheck")
             XCTAssertEqual(f.stops, 0)
+            XCTAssertGreaterThanOrEqual(capture! + 0.25 - f.time, evaluationCost + 0.01,
+                "Reserve a full exact-command admission and scheduling margin")
             f.position = Vec2(3, 0)
         }
         let result = await f.driver.run()
@@ -1781,6 +1789,39 @@ final class FollowPursuitDriverTests: XCTestCase {
         XCTAssertTrue(f.events.contains("raw_depth_refresh_started"))
         XCTAssertTrue(f.events.contains("depth_wait_recovered"))
         XCTAssertNil(f.driver.failureCause)
+    }
+
+    func testPostStopDepthStabilitySurvivesIntermittentSendMarginMisses() async {
+        for expensiveEvery in [2, 3] {
+            let f = Fixture()
+            var reads = 0
+            var stoppedAt = 0.0
+            f.onStop = { stoppedAt = f.time }
+            f.depthProvider = { _ in
+                if f.commands.isEmpty { return f.observation(age: 0.01) }
+                if f.stops == 0 { return f.observation(age: 0.26) }
+                reads += 1
+                // Same 150 ms delivery age as the capture. Some local
+                // evaluations leave too little time to safely admit a send.
+                let observation = f.observation(age: 0.15)
+                f.time += reads % expensiveEvery == 0 ? 0.075 : 0.005
+                return observation
+            }
+            f.onSend = { _ in
+                if f.commands.count == 2 {
+                    XCTAssertGreaterThanOrEqual(f.time - stoppedAt, 0.21)
+                    XCTAssertLessThan(f.time - stoppedAt, 0.6)
+                    XCTAssertNotEqual(reads % expensiveEvery, 0, "Never send on a margin-rejected tick")
+                    f.position = Vec2(5, 0)
+                }
+            }
+            let result = await f.driver.run()
+            XCTAssertEqual(result, .arrived)
+            XCTAssertEqual(f.commands.count, 2)
+            XCTAssertEqual(f.stops, 1)
+            XCTAssertTrue(f.events.contains("freshness_margin_wait"))
+            XCTAssertTrue(f.events.contains("depth_wait_recovered"))
+        }
     }
 
     func testMeasuredAdmissionCostRaisesReserveBeforeAnotherSend() async {

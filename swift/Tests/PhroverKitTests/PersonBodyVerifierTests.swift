@@ -2,6 +2,32 @@ import XCTest
 @testable import PhroverKit
 
 final class PersonBodyVerifierTests: XCTestCase {
+    func testRecordedEdgeOverrunsRequireIndependentVisibleTorso() {
+        let recorded = [
+            CGRect(x: 0.6303116232, y: 0.056201756, width: 0.3743521869, height: 0.7421096563),
+            CGRect(x: 0.6282535791, y: 0.054117918, width: 0.3767776489, height: 0.7481240034),
+            CGRect(x: 0.5820810050, y: 0.060308784, width: 0.4204775393, height: 0.7309002280)
+        ]
+        for box in recorded {
+            for mirrored in [false, true] {
+                let input = mirrored ? CGRect(x: 1 - box.maxX, y: box.minY, width: box.width, height: box.height) : box
+                func x(_ value: Double) -> Double { mirrored ? 1 - value : value }
+                let torso = PersonBodyVerifier.Body(
+                    leftShoulder: joint(x(0.75), 0.70), rightShoulder: joint(x(0.95), 0.70),
+                    leftHip: joint(x(0.78), 0.40), rightHip: joint(x(0.92), 0.40))
+                let result = PersonBodyVerifier.verify(box: input, rawPersonID: 0, bodies: [torso])
+                XCTAssertTrue(result.accepted)
+                XCTAssertEqual(result.normalizedBox, input.intersection(CGRect(x: 0, y: 0, width: 1, height: 1)))
+                XCTAssertNotNil(result.depthAnchor)
+                XCTAssertFalse(PersonBodyVerifier.verify(box: input, rawPersonID: 0, bodies: []).accepted)
+                XCTAssertFalse(PersonBodyVerifier.verify(box: input, rawPersonID: 0, bodies: [torso, torso]).accepted)
+            }
+        }
+        for overrun in [0.0101, 0.02, 0.5] {
+            XCTAssertFalse(PersonBodyVerifier.verify(box: CGRect(x: -overrun, y: 0, width: 1 + overrun, height: 1),
+                rawPersonID: 0, bodies: [body()]).accepted)
+        }
+    }
     private func joint(_ x: Double, _ y: Double, confidence: Float = 0.9) -> PersonBodyVerifier.Joint {
         .init(location: CGPoint(x: x, y: y), confidence: confidence)
     }

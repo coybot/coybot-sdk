@@ -105,11 +105,15 @@ struct FollowMotionRequestContext: Sendable, Equatable {
     /// Explicit pre-ready acquisition policy. Only bounded in-place turns may
     /// use it; forward readiness/pursuit requests never inherit this exception.
     let allowsAcquisitionRotationWithoutDepth: Bool
+    /// Coordinator scans may finish settling on 100 ms of stable post-stop
+    /// source evidence. This never bypasses the stop or source fence.
+    let allowsEarlyScanSettle: Bool
     let searchClearance: FollowSearchClearanceGrant?
     init(sessionGeneration: UInt64, requestToken: UInt64, purpose: FollowMotionPurpose, phase: String,
           scanUsed: Double? = nil, scanRemaining: Double? = nil, scanResponseSeed: FollowScanResponseSeed? = nil,
           isSearchSweep: Bool = false, searchClearance: FollowSearchClearanceGrant? = nil,
-          allowsAcquisitionRotationWithoutDepth: Bool = false) {
+          allowsAcquisitionRotationWithoutDepth: Bool = false, allowsEarlyScanSettle: Bool = false) {
+        self.allowsEarlyScanSettle = allowsEarlyScanSettle
         self.allowsAcquisitionRotationWithoutDepth = allowsAcquisitionRotationWithoutDepth
         self.searchClearance = searchClearance
         self.isSearchSweep = isSearchSweep

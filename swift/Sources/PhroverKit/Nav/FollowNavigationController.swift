@@ -1319,8 +1319,12 @@ final class FollowNavigationController {
         let searchSweep = purpose == .followScan && evidence?.context.request?.isSearchSweep == true &&
             FollowRecoveryScope.heading == nil && FollowRecoveryScope.authorization == nil &&
             angle.isFinite && angle != 0 && abs(angle) <= .pi ? angle : nil
+        // Reacquisition scans use the same observed-stability shortcut as
+        // initial search. The source gate retains its 300 ms fallback for
+        // drift/gaps; exact-heading completion and burst budgets stay intact.
         let profile = FollowTurnBurstPlanner.Profile(purpose: purpose == .followAlignment ? .alignment : .scan,
-            fastSearch: searchSweep != nil)
+            fastSearch: searchSweep != nil ||
+                (purpose == .followScan && evidence?.context.request?.allowsEarlyScanSettle == true))
         state = .driving
         publishSafetyState(.moving)
         let task = Task { @MainActor in

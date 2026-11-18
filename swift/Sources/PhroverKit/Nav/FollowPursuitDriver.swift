@@ -666,7 +666,7 @@ final class FollowPursuitDriver {
                     let probeCost = max(0.001, depthEvaluationCost)
                     let projectedMargin = max(Self.minimumFreshnessMargin,
                         maximumAdmissionDuration + 0.01,
-                        environment.uptime() - assessmentStarted + probeCost + 0.01)
+                        probeCost + 0.01)
                     guard depthExpiry - environment.uptime() > probeCost + projectedMargin else { return false }
                     let candidate = direction > 0
                         ? WheelCommand(left: peak * 0.25, right: peak)
@@ -745,12 +745,27 @@ final class FollowPursuitDriver {
             }
             // Leave enough time for transport admission. While refreshing, require
             // raw depth captured after the confirmed stop, not just a new pose.
+            // The remaining work is one exact-command check, not a replay of
+            // the entire assessment (ack read plus every candidate arc).
             let remaining = depthExpiry - environment.uptime()
             let requiredMargin = max(Self.minimumFreshnessMargin,
-                max(maximumAdmissionDuration, environment.uptime() - assessmentStarted) + 0.01)
+                max(maximumAdmissionDuration, depthEvaluationCost) + 0.01)
             let captureTime = depthExpiry - DepthSafetyEvaluator.maximumRawDepthAge
-            if remaining < requiredMargin || refreshAfter.map({ captureTime <= $0.time }) == true {
-                refreshCaptureCount = 0; refreshFirstCapture = nil; refreshLastCapture = nil
+            let capturedBeforeStop = refreshAfter.map({ captureTime <= $0.time }) == true
+            if refreshAfter != nil {
+                if capturedBeforeStop {
+                    refreshCaptureCount = 0; refreshFirstCapture = nil; refreshLastCapture = nil
+                } else if refreshLastCapture.map({ captureTime > $0 + 1e-6 }) ?? true {
+                    // Depth stability describes fresh, approved post-stop
+                    // captures, independently of this tick's send budget.
+                    // A slow assessment must still inhibit sending, but must
+                    // not erase valid evidence from earlier captures.
+                    refreshFirstCapture = refreshFirstCapture ?? captureTime
+                    refreshLastCapture = captureTime
+                    refreshCaptureCount += 1
+                }
+            }
+            if remaining < requiredMargin || capturedBeforeStop {
                 if refreshAfter == nil {
                     if let failure = await recoverExpiredCommand(expiry: depthExpiry, rawDepth: true) { return .failed(failure) }
                 }
@@ -767,11 +782,6 @@ final class FollowPursuitDriver {
                 continue
             }
             if refreshAfter != nil {
-                if refreshLastCapture.map({ captureTime > $0 + 1e-6 }) ?? true {
-                    refreshFirstCapture = refreshFirstCapture ?? captureTime
-                    refreshLastCapture = captureTime
-                    refreshCaptureCount += 1
-                }
                 guard refreshCaptureCount >= 3, captureTime - refreshFirstCapture! >= 0.06 else {
                     environment.emit("depth_stability_wait", ["capture_count": .number(Double(refreshCaptureCount)),
                         "capture_span_s": .number(captureTime - refreshFirstCapture!),

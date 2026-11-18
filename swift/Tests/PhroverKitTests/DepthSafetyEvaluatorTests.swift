@@ -5,6 +5,28 @@ import RoverNav
 @testable import PhroverKit
 
 final class DepthSafetyEvaluatorTests: XCTestCase {
+    func testObstacleSideUsesOccupiedSpaceNotCommandCurvature() {
+        func cells(_ lateral: Int) -> Set<DepthSafetyCell> {
+            Set((2...4).map { .init(lateralIndex: lateral, heightIndex: $0, forwardIndex: 10) })
+        }
+        for (occupied, expected) in [
+            (cells(-6), DepthObstacleSide.left),
+            (cells(5), .right), (cells(0), .front),
+            (cells(-6).union(cells(5)), .both),
+            (cells(-6).union(cells(0)), .front)
+        ] {
+            let snapshot = DepthSafetySnapshot(timestamp: 10, cells: occupied, cellResolution: 0.04,
+                validSampleRatio: 1, geometry: geometry, projection: nil, failureReason: nil)
+            for command in [WheelCommand(left: 0.12, right: 0.12),
+                            .init(left: 0.078, right: 0.12), .init(left: 0.12, right: 0.078)] {
+                let result = DepthSafetyEvaluator.evaluate(snapshot, command: command, now: 10.05,
+                    visibilityPolicy: .astralCompatible, includeDiagnosticCoverage: false, minimumObstacleClearance: 0.15)
+                XCTAssertEqual(result.obstacleSide, expected)
+                XCTAssertNil(DepthSafetyEvaluator.evaluate(snapshot, command: command, now: 10.251).obstacleSide,
+                    "Stale captures cannot provide side authority")
+            }
+        }
+    }
     @MainActor
     func testControlDepthCoverageTiming() throws {
         var scene = liveNearBlindSnapshot()

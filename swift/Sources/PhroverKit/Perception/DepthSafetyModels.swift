@@ -180,8 +180,13 @@ enum DepthSafetyMotionClass: String, Equatable, Sendable {
     }
 }
 
+/// Rover-relative occupied space, independent of the desired target bearing.
+enum DepthObstacleSide: String, Equatable, Sendable {
+    case front, left, right, both
+}
+
 struct DepthSafetyObservation: Equatable, Sendable {
-    let state: DepthSafetyState
+    var state: DepthSafetyState
     let clearance: Double
     let supportCount: Int
     let sampleAge: TimeInterval
@@ -199,6 +204,7 @@ struct DepthSafetyObservation: Equatable, Sendable {
     var collisionCandidateCount: Int?
     var rememberedProjectionCount: Int?
     var evaluationDuration: TimeInterval?
+    var obstacleSide: DepthObstacleSide?
 
     static func unavailable(_ reason: DepthSafetyUnavailableReason,
                              sampleAge: TimeInterval,

@@ -13,6 +13,60 @@ Automated simulator tests do not establish LiDAR projection accuracy or prove th
 
 Record the tested phone, rover, build revision, pass/fail per step, and redacted runtime-log evidence here after the supervised run. Do not attach camera images or raw transcripts.
 
+## Stop ahead, steer away from flank obstacles (November 17, 20:26 installation)
+
+The latest log was pulled to `follow-obstacle-direction-review-retry.log` after
+the first transfer lost its device connection. Three attempts after sequence
+6520 entered the automatic obstacle detour. Two ended with obstacle failures
+and zero reported clearance; the other exhausted its detour deadline. The two
+sampled avoidance arcs both requested left turns. The prior policy preferred
+target bearing or the previous arc, not measured obstacle side.
+
+Requested behaviour: stop for an obstacle ahead; for a left obstacle, check the
+right path and make only a small rightward correction if clear. Mirror this for
+a right obstacle. Talk now disables the stopped automatic obstacle detour.
+
+- Depth observations carry rover-relative `front`, `left`, `right`, or `both`
+  obstacle evidence. Connected occupied clusters must have at least three cells.
+  The front band covers the assembly's body width with voxel padding. Flanks
+  extend through the section safety margin plus 15 cm; the forward horizon uses
+  the existing dynamic stopping distance plus caution lead. Height bands and
+  section offsets remain respected. Live and retained hazards contribute.
+- Classification is independent of target bearing and intended curvature.
+  A clear curved sweep cannot hide an occupied frontal corridor. This side
+  evidence describes occupancy, not a guarantee that the other side is free.
+- Reactive forward pursuit stops for front/both-side occupancy. With a single
+  occupied flank it evaluates only the opposite arc, requiring a fresh `.clear`
+  exact-command result and compatible side evidence. Unclassified blockage,
+  caution on the escape path, stale data, or failed evaluation budget stops.
+- Avoidance caps peak wheel request at 0.12 and uses 65% on the inner wheel,
+  replacing the previous 25% ratio. Both wheels remain forward; it does not
+  launch a search rotation to evade the obstacle.
+- Native transport independently rejects new frontal/both-side occupancy,
+  caution, or steering toward a newly observed flank. Stop ownership, source
+  generation, cancellation, freshness and braking checks remain in force.
+  Depth candidate diagnostics now include `depth_obstacle_side`.
+
+Regressions failed before the changes, including a new frontal hazard arriving
+at transport after local arc approval. Generated mirrored scenes exercise real
+depth cells through the pursuit driver; other cases cover clear/caution/stop
+states, opposite-arc rejection, unknown direction, stale evidence, and confirmed
+native stopping. The old test permitting unclassified caution driving was
+updated to the requested stop policy; clear-path target-centering remains tested.
+Final verification: **1,687 SDK tests passed without retries**; Conversation
+ViewModel tests, signed Debug build, and diff whitespace checks passed.
+Installed on HungIphone at 20:26, database sequence **6528**.
+
+Artifacts: `follow-directional-obstacles-red.log`,
+`follow-directional-obstacles-native-red.log`,
+`follow-directional-obstacles-focused-final.log`,
+`follow-directional-obstacles-full.log`,
+`follow-directional-obstacles-viewmodel.log`, and
+`follow-directional-obstacles-build.log` in the OpenCode temporary directory.
+Final SDK bundle: `Test-PhroverSDKTests-2026.11.17_20-24-13--0800.xcresult`.
+Physical yaw magnitude, PWM response, and real-world clearance remain unverified
+by these software tests. No model-checking result is claimed.
+
 ## Recovery timing and edge detections (November 17, 19:52 installation)
 
 The `follow-post-6512-review.log` capture contained two 600 ms depth-recovery

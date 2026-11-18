@@ -3373,7 +3373,19 @@ final class FollowNavigationController {
     /// Caution changes curvature visibility and stopping distance; authorize the
     /// exact scaled wheels too. A second scaling is rejected instead of iterated.
     private func exactDepthDecision(_ command: WheelCommand, disposition: String) -> ObstacleGuard.DepthDecision {
-        let observation = searchDepthObservation(command)
+        var observation = searchDepthObservation(command)
+        if FollowPlanningScope.mode == .reactiveDepth, command.left > 0, command.right > 0,
+           observation.state == .clear || observation.state == .caution {
+            // Recheck the requested policy at the actual send boundary. A
+            // curved sweep being clear cannot authorize passing a frontal
+            // obstacle, or turning toward newly observed flank occupancy.
+            if observation.state == .caution ||
+                observation.obstacleSide == .front || observation.obstacleSide == .both ||
+                (observation.obstacleSide == .left && command.left <= command.right) ||
+                (observation.obstacleSide == .right && command.right <= command.left) {
+                observation.state = .stop
+            }
+        }
         recordDepthObservation(observation, disposition: disposition)
         switch guardLayer.evaluate(command: command, depthSafety: observation) {
         case .stopDepth: return .stopDepth(observation)
@@ -3392,6 +3404,7 @@ final class FollowNavigationController {
         func finite(_ value: Double) -> FollowDiagnosticValue { value.isFinite ? .number(value) : .null }
         var fields: [String: FollowDiagnosticValue] = [
             "depth_state": .string(observation.state.telemetryReason), "depth_age_s": finite(observation.sampleAge),
+            "depth_obstacle_side": observation.obstacleSide.map { .string($0.rawValue) } ?? .null,
             "depth_coverage_provenance": .string(observation.coverageProvenance),
             "depth_clearance_m": finite(observation.clearance), "depth_support_count": .number(Double(observation.supportCount)),
             "depth_motion_class": .string(observation.motionClass.rawValue), "depth_candidate_disposition": .string(disposition),

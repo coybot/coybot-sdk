@@ -239,7 +239,7 @@ struct ConversationView: View {
             followConfiguration.continuousHoldingFacing = true
             followConfiguration.waitForUserReturn = true
             followConfiguration.planningMode = .reactiveDepth
-            followConfiguration.allowsObstacleDetour = true
+            followConfiguration.allowsObstacleDetour = false
             let follow = FollowMeCoordinator(
                 perception: ARFollowMePerceptionSource(ar: ar, detector: detector),
                 motion: NavigationFollowMeMotion(navigation: nav),

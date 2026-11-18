@@ -299,12 +299,15 @@ enum DepthSafetyEvaluator {
         // Obstacles seen moments ago stay hazards wherever the live camera is now blind.
         var rememberedProjectionCount = 0
         var collisionCandidateCount = 0
+        var nearbyCells = Set<DepthSafetyCell>()
+        var obstacleSide: DepthObstacleSide?
         let rememberedHazards = rememberedHazardCells(snapshot: snapshot, reach: reach, projectionCount: &rememberedProjectionCount)
         func finalized(_ observation: DepthSafetyObservation) -> DepthSafetyObservation {
             var result = observation
             result.rememberedHazardCellCount = rememberedHazards.count
             result.collisionCandidateCount = collisionCandidateCount
             result.rememberedProjectionCount = rememberedProjectionCount
+            result.obstacleSide = obstacleSide
             return result
         }
         func checkingCoverage(_ observation: DepthSafetyObservation, horizon: Double) -> DepthSafetyObservation {
@@ -352,6 +355,22 @@ enum DepthSafetyEvaluator {
                 continue
             }
             let point = center(of: occupiedCell)
+            if motion == .forward || motion == .curved {
+                // Inspect a rover-relative front/flank corridor, not just the
+                // desired curved sweep. Turning away must not hide a wall
+                // directly in front. This is occupied-space evidence only;
+                // the opposite arc still needs its own full depth evaluation.
+                let padding = snapshot.cellResolution / 2
+                if collisionSections.contains(where: { section in
+                    point.y + padding >= section.minimumHeight && point.y - padding <= section.maximumHeight &&
+                    point.z + padding >= section.forwardOffset - section.length / 2 &&
+                    point.z - padding <= section.forwardOffset + section.length / 2 + cautionDistance &&
+                    abs(point.x - section.lateralOffset) - padding <=
+                        section.width / 2 + snapshot.geometry.lateralSafetyMargin + 0.15
+                }) {
+                    nearbyCells.insert(occupiedCell)
+                }
+            }
             // The rover origin moves at most the travelled arc length; every
             // footprint corner stays within its radius plus voxel padding.
             // Cells outside this enclosing disc cannot intersect any sweep pose.
@@ -370,6 +389,21 @@ enum DepthSafetyEvaluator {
             }
         }
 
+        let nearbyClusters = connectedClusters(in: nearbyCells).filter { $0.count >= minimumConnectedCells }
+        var left = false, right = false, front = false
+        for cluster in nearbyClusters {
+            for cell in cluster {
+                let lateral = center(of: cell).x
+                if abs(lateral) <= snapshot.geometry.width / 2 + snapshot.cellResolution / 2 {
+                    front = true
+                } else if lateral < 0 {
+                    left = true
+                } else {
+                    right = true
+                }
+            }
+        }
+        obstacleSide = front ? .front : (left && right ? .both : (left ? .left : (right ? .right : nil)))
         let clusters = connectedClusters(in: Set(contactTravel.keys))
             .filter { $0.count >= minimumConnectedCells }
         let nearestCluster = clusters.min {

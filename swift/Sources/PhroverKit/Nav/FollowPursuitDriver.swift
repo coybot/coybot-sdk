@@ -260,7 +260,6 @@ final class FollowPursuitDriver {
         var requiresMeasuredTarget = FollowTargetSpeedScope.feed != nil
         var targetRefresh: (after: Double, deadline: Double)?
         var targetRefreshes = 0
-        var obstacleArcDirection: Double?
         var acceleration = FollowPursuitAcceleration()
         var refreshDeadline: Double?
         var refreshReason = DepthSafetyUnavailableReason.staleRawDepth
@@ -653,72 +652,71 @@ final class FollowPursuitDriver {
                 let elapsed = assessmentStarted - $0
                 return elapsed.isFinite && elapsed >= 0 ? .number(elapsed) : .null
             } ?? .null
-            func selectForwardArc(improving original: DepthSafetyObservation? = nil) -> Bool {
+            func selectForwardArc(awayFrom original: DepthSafetyObservation) -> Bool {
                 guard route.planningMode == .reactiveDepth,
                       let targetSpeed, let bearing = centeringBearing,
                       abs(bearing) <= .pi / 2,
                       safeCommand.left > 0, safeCommand.right > 0 else { return false }
-                let originalLimit = original?.speedLimit.flatMap { $0.isFinite && $0 > 0 ? $0 : nil } ?? 0.12
+                guard original.obstacleSide == .left || original.obstacleSide == .right else { return false }
+                let originalLimit = original.speedLimit.flatMap { $0.isFinite && $0 > 0 ? $0 : nil } ?? 0.12
                 let peak = min(0.12, targetSpeed.maximumWheelSpeed, originalLimit)
                 guard peak > 0 else { return false }
-                let preferred = obstacleArcDirection ?? (bearing < 0 ? -1.0 : 1.0)
-                for direction in [preferred, -preferred] {
-                    let probeCost = max(0.001, depthEvaluationCost)
-                    let projectedMargin = max(Self.minimumFreshnessMargin,
-                        maximumAdmissionDuration + 0.01,
-                        probeCost + 0.01)
-                    guard depthExpiry - environment.uptime() > probeCost + projectedMargin else { return false }
-                    let candidate = direction > 0
-                        ? WheelCommand(left: peak * 0.25, right: peak)
-                        : WheelCommand(left: peak, right: peak * 0.25)
-                    let capturedAt = environment.uptime()
-                    let probe = environment.depth(candidate)
-                    depthEvaluationCost = max(depthEvaluationCost, environment.uptime() - capturedAt)
-                    let expiry = capturedAt + DepthSafetyEvaluator.maximumRawDepthAge - probe.sampleAge
-                    guard probe.sampleAge.isFinite, probe.sampleAge >= 0,
-                          expiry - environment.uptime() > Self.minimumFreshnessMargin,
-                          case .allow(let accepted, _) = guardLayer.evaluate(command: candidate, depthSafety: probe),
-                          accepted == candidate else { continue }
-                    // While still in caution, change course only for a clear
-                    // corridor or a measured clearance improvement.
-                    if let original, probe.state != .clear,
-                       !(probe.clearance > original.clearance + 0.05) { continue }
-                    // Candidate is already the exact bounded command evaluated.
-                    // Avoid a duplicate local projection/sweep; native transport
-                    // still independently checks this command immediately before HTTP.
-                    safeCommand = candidate
-                    depthExpiry = expiry
-                    obstacleArcDirection = direction
-                    usingObstacleArc = true
-                    return true
-                }
-                return false
+                // Positive lateral is rover-right. A left obstacle requires
+                // left wheel faster than right, regardless of target bearing.
+                let direction = original.obstacleSide == .left ? -1.0 : 1.0
+                let probeCost = max(0.001, depthEvaluationCost)
+                let projectedMargin = max(Self.minimumFreshnessMargin,
+                    maximumAdmissionDuration + 0.01, probeCost + 0.01)
+                guard depthExpiry - environment.uptime() > probeCost + projectedMargin else { return false }
+                let candidate = direction > 0
+                    ? WheelCommand(left: peak * 0.65, right: peak)
+                    : WheelCommand(left: peak, right: peak * 0.65)
+                let capturedAt = environment.uptime()
+                let probe = environment.depth(candidate)
+                depthEvaluationCost = max(depthEvaluationCost, environment.uptime() - capturedAt)
+                let expiry = capturedAt + DepthSafetyEvaluator.maximumRawDepthAge - probe.sampleAge
+                guard probe.sampleAge.isFinite, probe.sampleAge >= 0,
+                      expiry - environment.uptime() > Self.minimumFreshnessMargin,
+                      case .allow(let accepted, _) = guardLayer.evaluate(command: candidate, depthSafety: probe),
+                      accepted == candidate, probe.state == .clear,
+                      probe.obstacleSide != .front, probe.obstacleSide != .both,
+                      probe.obstacleSide == nil || probe.obstacleSide == original.obstacleSide else { return false }
+                // Native transport independently checks this exact command
+                // and obstacle-side evidence again immediately before HTTP.
+                safeCommand = candidate
+                depthExpiry = expiry
+                usingObstacleArc = true
+                return true
             }
             do {
                 let readStarted = environment.uptime()
                 let observation = environment.depth(safeCommand)
                 depthEvaluationCost = environment.uptime() - readStarted
                 depthExpiry = readStarted + DepthSafetyEvaluator.maximumRawDepthAge - observation.sampleAge
-                switch guardLayer.evaluate(command: safeCommand, depthSafety: observation) {
-                case .allow(let limited, _):
-                    // ObstacleGuard scales both wheels proportionally. Do not
-                    // spend a second full evaluation here: transport must still
-                    // validate this exact command against current depth before HTTP.
-                    safeCommand = limited
-                    if observation.state == .caution {
-                        _ = selectForwardArc(improving: observation)
-                    } else {
-                        obstacleArcDirection = nil
+                if route.planningMode == .reactiveDepth, safeCommand.left > 0, safeCommand.right > 0,
+                   observation.state == .clear || observation.state == .caution || observation.state == .stop {
+                    if observation.obstacleSide == .front || observation.obstacleSide == .both {
+                        environment.emit("obstacle_stop", ["obstacle_side": .string(observation.obstacleSide!.rawValue)])
+                        return .failed(.obstacle)
                     }
-                case .stopDepth(let rejected):
-                    switch rejected.state {
-                    case .unavailable(let reason): unavailable = reason
-                    case .stop, .caution:
-                        // A blocked intended arc does not prove every forward
-                        // arc is blocked. Inspect both swept corridors using live
-                        // depth, without stopping or inventing side clearance.
-                        if !selectForwardArc() { return .failed(.obstacle) }
-                    case .clear: unavailable = .malformedDepth
+                    if observation.obstacleSide != nil {
+                        guard selectForwardArc(awayFrom: observation) else { return .failed(.obstacle) }
+                    } else if observation.state != .clear {
+                        // Unknown obstacle direction is not permission to guess.
+                        return .failed(.obstacle)
+                    }
+                }
+                if !usingObstacleArc {
+                    switch guardLayer.evaluate(command: safeCommand, depthSafety: observation) {
+                    case .allow(let limited, _):
+                        // Transport still validates these exact wheels before HTTP.
+                        safeCommand = limited
+                    case .stopDepth(let rejected):
+                        switch rejected.state {
+                        case .unavailable(let reason): unavailable = reason
+                        case .stop, .caution: return .failed(.obstacle)
+                        case .clear: unavailable = .malformedDepth
+                        }
                     }
                 }
             }

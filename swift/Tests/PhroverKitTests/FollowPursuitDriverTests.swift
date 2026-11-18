@@ -5,6 +5,102 @@ import simd
 
 @MainActor
 final class FollowPursuitDriverTests: XCTestCase {
+    func testRealDepthCellsDriveMirroredSideAvoidanceAndFrontalStop() async {
+        for lateral in [-6, 5, 0] {
+            let f = Fixture()
+            f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+            f.targetSample = {
+                .init(frameID: .init(generation: 1, sequence: f.sequence), timestamp: f.time,
+                    position: Vec2(3, 0), velocity: .zero, standOff: 1.5, minimumDistance: 1.25)
+            }
+            let cells = Set((2...4).map { DepthSafetyCell(lateralIndex: lateral, heightIndex: $0, forwardIndex: 10) })
+            f.depthProvider = { command in
+                let snapshot = DepthSafetySnapshot(timestamp: f.time - 0.01, cells: cells, cellResolution: 0.04,
+                    validSampleRatio: 1, geometry: .init(length: 0.30, width: 0.25,
+                        minimumCollisionHeight: 0.04, maximumCollisionHeight: 0.50),
+                    projection: nil, failureReason: nil)
+                return DepthSafetyEvaluator.evaluate(snapshot, command: command, now: f.time,
+                    visibilityPolicy: .astralCompatible, includeDiagnosticCoverage: false, minimumObstacleClearance: 0.15)
+            }
+            f.onSend = { command in
+                XCTAssertEqual(command.left > command.right, lateral < 0)
+                f.position = Vec2(3, 0)
+            }
+            let result = await f.driver.run()
+            XCTAssertEqual(result, lateral == 0 ? .failed(.obstacle) : .arrived)
+            XCTAssertEqual(f.commands.count, lateral == 0 ? 0 : 1)
+        }
+    }
+
+    func testUnclassifiedReactiveObstacleStopsInsteadOfGuessingASide() async {
+        for state in [DepthSafetyState.caution, .stop] {
+            let f = Fixture()
+            f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+            f.depthProvider = { command in
+                .init(state: state, clearance: 0.35, supportCount: 5, sampleAge: 0.01,
+                    requiredStoppingDistance: 0.15, motionClass: .classify(command), speedLimit: 0.12)
+            }
+            let result = await f.driver.run()
+            XCTAssertEqual(result, .failed(.obstacle))
+            XCTAssertTrue(f.commands.isEmpty)
+        }
+    }
+
+    func testReactiveSideAvoidanceChecksOnlyOppositeGentleArc() async {
+        for side in [DepthObstacleSide.left, .right] {
+            for escapeClear in [false, true] {
+                let f = Fixture()
+                f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+                f.targetSample = {
+                    .init(frameID: .init(generation: 1, sequence: f.sequence), timestamp: f.time,
+                        position: Vec2(3, 0), velocity: .zero, standOff: 1.5, minimumDistance: 1.25)
+                }
+                var probes: [WheelCommand] = []
+                f.depthProvider = { command in
+                    probes.append(command)
+                    let escape = probes.count > 1
+                    if escape {
+                        XCTAssertEqual(command.left > command.right, side == .left)
+                        XCTAssertEqual(min(command.left, command.right) / max(command.left, command.right), 0.65, accuracy: 1e-9)
+                    }
+                    return .init(state: escape && escapeClear ? .clear : .caution,
+                        clearance: escape && escapeClear ? 1 : 0.35, supportCount: 5, sampleAge: 0.01,
+                        requiredStoppingDistance: 0.15, motionClass: .classify(command), speedLimit: 0.12,
+                        obstacleSide: side)
+                }
+                f.onSend = { _ in f.position = Vec2(3, 0) }
+                let result = await f.driver.run()
+                XCTAssertEqual(result, escapeClear ? .arrived : .failed(.obstacle))
+                XCTAssertEqual(f.commands.count, escapeClear ? 1 : 0)
+                XCTAssertEqual(probes.count, 2, "Do not try steering toward the obstacle")
+            }
+        }
+    }
+
+    func testReactiveFrontAndBothSidesStopWithoutTryingAnyArc() async {
+        for side in [DepthObstacleSide.front, .both] {
+            for state in [DepthSafetyState.clear, .caution, .stop] {
+                let f = Fixture()
+                f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+                f.targetSample = {
+                    .init(frameID: .init(generation: 1, sequence: f.sequence), timestamp: f.time,
+                        position: Vec2(3, 0), velocity: .zero, standOff: 1.5, minimumDistance: 1.25)
+                }
+                var probes = 0
+                f.depthProvider = { command in
+                    probes += 1
+                    return .init(state: state, clearance: 0.35, supportCount: 5, sampleAge: 0.01,
+                        requiredStoppingDistance: 0.15, motionClass: .classify(command), speedLimit: 0.12,
+                        obstacleSide: side)
+                }
+                let result = await f.driver.run()
+                XCTAssertEqual(result, .failed(.obstacle))
+                XCTAssertTrue(f.commands.isEmpty)
+                XCTAssertEqual(probes, 1)
+            }
+        }
+    }
+
     func testHoldingTurnRequiresNativeTransportDepthApproval() async {
         for blockAtEntry in [false, true] {
             let f = ControllerFixture()
@@ -74,7 +170,7 @@ final class FollowPursuitDriverTests: XCTestCase {
             let arc = command.right > command.left
             return .init(state: arc ? .clear : .caution, clearance: arc ? 1 : 0.5,
                 supportCount: 5, sampleAge: age, requiredStoppingDistance: 0.15,
-                motionClass: .classify(command), speedLimit: arc ? nil : 0.12)
+                motionClass: .classify(command), speedLimit: arc ? nil : 0.12, obstacleSide: .right)
         }
         f.onSend = { command in
             XCTAssertGreaterThan(command.right, command.left, "Steer before the desired path reaches hard stop")
@@ -142,10 +238,10 @@ final class FollowPursuitDriverTests: XCTestCase {
             f.arrival = Vec2(3, 0)
             var obstructed = false
             f.depthOverride = { command in
-                let allowed = !obstructed && command.right > command.left && command.left > 0
+                let allowed = command.right > command.left && command.left > 0
                 return .init(state: allowed ? .clear : .stop, clearance: allowed ? 1 : 0.1,
                     supportCount: 5, sampleAge: 0.01, requiredStoppingDistance: 0.15,
-                    motionClass: .classify(command), speedLimit: nil)
+                    motionClass: .classify(command), speedLimit: nil, obstacleSide: obstructed ? .front : .right)
             }
             f.beforeAttempt = { if obstructAtEntry { obstructed = true } }
             let feed = FollowTargetSpeedFeed()
@@ -177,7 +273,8 @@ final class FollowPursuitDriverTests: XCTestCase {
                     return f.observation(age: scenario == 3 ? 0.3 : 0.01)
                 }
                 return .init(state: .stop, clearance: 0.2, supportCount: 5, sampleAge: 0.01,
-                    requiredStoppingDistance: 0.25, motionClass: .classify(command), speedLimit: nil)
+                    requiredStoppingDistance: 0.25, motionClass: .classify(command), speedLimit: nil,
+                    obstacleSide: direction > 0 ? .right : .left)
             }
             f.onSend = { command in
                 if f.commands.count == 2 {
@@ -280,7 +377,7 @@ final class FollowPursuitDriverTests: XCTestCase {
         XCTAssertEqual(f.stops, 1)
     }
 
-    func testReactiveCenteringTracksChangingBearingWithoutStoppingUnderDepthCaution() async {
+    func testReactiveCenteringTracksChangingBearingWithoutStoppingOnClearDepth() async {
         let f = Fixture()
         let bearings = [20.0, 5, 1, 0, -1, -5, -20, 10]
         var index = 0
@@ -294,20 +391,19 @@ final class FollowPursuitDriverTests: XCTestCase {
                 position: target(), velocity: .zero, standOff: 1.5, minimumDistance: 1.25)
         }
         f.depthProvider = { command in
-            .init(state: .caution, clearance: 0.4, supportCount: 5, sampleAge: 0.01,
-                requiredStoppingDistance: 0.15, motionClass: .classify(command), speedLimit: 0.12)
+            .init(state: .clear, clearance: 1, supportCount: 5, sampleAge: 0.01,
+                requiredStoppingDistance: 0.15, motionClass: .classify(command), speedLimit: nil)
         }
         f.onSend = { command in
             XCTAssertEqual(f.stops, 0)
             XCTAssertGreaterThan(command.left, 0)
             XCTAssertGreaterThan(command.right, 0)
-            XCTAssertLessThanOrEqual(max(command.left, command.right), 0.12)
             let difference = command.right - command.left
             if bearings[index] == 0 { XCTAssertEqual(difference, 0, accuracy: 1e-9) }
             else { XCTAssertGreaterThan(difference * bearings[index], 0) }
             if abs(bearings[index]) == 20 {
                 XCTAssertGreaterThan(abs(difference) / (command.left + command.right), 0.20,
-                    "Heading correction must retain priority over translation under depth caution")
+                    "Heading correction must retain priority over translation")
             }
             if index == bearings.count - 1 { f.position = target() }
             else { index += 1 }

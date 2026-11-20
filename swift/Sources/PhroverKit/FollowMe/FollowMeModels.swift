@@ -98,6 +98,7 @@ public struct FollowMeConfiguration {
     /// Hand fresh verified targets directly to depth-approved continuous
     /// centering instead of requiring a discrete initial alignment turn.
     public var continuousTargetCentering: Bool = false
+    public var recoversBlockedMotion: Bool = false
     /// Bridge a lost target with a bounded, live-depth-approved approach to its
     /// last confirmed position, then stop and search that area.
     public var approachLastSeenTarget: Bool = false

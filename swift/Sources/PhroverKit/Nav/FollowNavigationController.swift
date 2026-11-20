@@ -556,6 +556,8 @@ final class FollowNavigationController {
                 }
                 let uptime = self.transportUptime
                 var depthFailure: NavigationFailure?
+                var retryableDepthCaution = false
+                var rejectedObstacleSide: DepthObstacleSide?
                 var targetAuthorityChanged = false
                 // A queued measured command may outlive the transition to a
                 // low-speed last-seen approach (or vice versa). Recheck that
@@ -589,14 +591,19 @@ final class FollowNavigationController {
                          switch self.exactDepthDecision(command, disposition: "pursuit_transport") {
                         case .allow(let accepted, _) where accepted == command: break
                         case .allow: depthFailure = .obstacle
-                        case .stopDepth(let observation): depthFailure = self.recordDepthRejection(observation)
+                         case .stopDepth(let observation):
+                             retryableDepthCaution = observation.retryableTransportCaution
+                             rejectedObstacleSide = observation.obstacleSide
+                             let canObserveBlocked = FollowTargetSpeedScope.feed?.sample?.recoversBlockedMotion == true &&
+                                 (observation.state == .stop || observation.state == .caution)
+                             depthFailure = retryableDepthCaution || canObserveBlocked ? .obstacle : self.recordDepthRejection(observation)
                         }
                         switch self.guardLayer.evaluate(forwardClearance: self.currentForwardClearance(), lastAckAt: nil,
                             now: self.now(), feedback: nil, requireFreshAck: false, checkForwardObstacle: true) {
                         case .go: break
-                        case .stopObstacle: depthFailure = .obstacle
-                        case .stopCommsLost: depthFailure = .commsLost
-                        case .stopTipping: depthFailure = .tipping
+                         case .stopObstacle: depthFailure = .obstacle; retryableDepthCaution = false
+                         case .stopCommsLost: depthFailure = .commsLost; retryableDepthCaution = false
+                         case .stopTipping: depthFailure = .tipping; retryableDepthCaution = false
                         }
                              guard depthFailure == nil, owned(), !driver.perceptionPaused, driver.revision == revision,
                               self.readFollowPose().rejection(at: self.sourceNow(), expectedGeneration: source.frameID?.generation) == nil else {
@@ -641,7 +648,8 @@ final class FollowNavigationController {
                     throw FollowPursuitSendFailure(reason: depthFailure ??
                          (denial == .expired ? .depthUnavailable(.staleRawDepth) : .commandFailed), definitelyUnsent: unsent,
                           authorizationExpired: depthFailure == nil && denial == .expired,
-                          targetAuthorityChanged: targetAuthorityChanged)
+                           targetAuthorityChanged: targetAuthorityChanged,
+                           retryableDepthCaution: retryableDepthCaution, obstacleSide: rejectedObstacleSide)
                 }
             }, stop: { try await self.rotationStop(origin: "cleanup") }, sleep: { await self.sleep($0) }, publishPath: { self.path = $0 }, moving: {
                 if self.state != .driving { self.state = .driving; self.publishSafetyState(.moving) }
@@ -3399,6 +3407,8 @@ final class FollowNavigationController {
     /// exact scaled wheels too. A second scaling is rejected instead of iterated.
     private func exactDepthDecision(_ command: WheelCommand, disposition: String) -> ObstacleGuard.DepthDecision {
         var observation = searchDepthObservation(command)
+        observation.retryableTransportCaution = FollowPlanningScope.mode == .reactiveDepth &&
+            command.left > 0 && command.right > 0 && observation.state == .caution
         if FollowPlanningScope.mode == .reactiveDepth, command.left > 0, command.right > 0,
            observation.state == .clear || observation.state == .caution {
             // Early front/bilateral warnings permit only a bounded slow arc
@@ -3441,6 +3451,7 @@ final class FollowNavigationController {
             "depth_passage_required_width_m": observation.passageRequiredWidth.map { finite($0) } ?? .null,
             "depth_hazard_contacts_x_y_z_travel_source": observation.hazardContactProfile.map { .string($0) } ?? .null,
             "depth_hazard_sweep": observation.hazardSweepProfile.map { .string($0) } ?? .null,
+            "depth_retryable_transport_caution": .bool(observation.retryableTransportCaution),
             "depth_passage_left_columns": observation.passageLeftColumns.map { .number(Double($0)) } ?? .null,
             "depth_passage_right_columns": observation.passageRightColumns.map { .number(Double($0)) } ?? .null,
             "depth_passage_center_lateral_m": observation.passage.map { finite($0.centerLateral) } ?? .null,

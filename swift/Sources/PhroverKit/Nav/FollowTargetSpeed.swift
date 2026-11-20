@@ -23,6 +23,7 @@ struct FollowTargetSpeedSample: Sendable {
     let minimumDistance: Double
     var holdsTranslation: Bool = false
     var centersContinuously: Bool = false
+    var recoversBlockedMotion: Bool = false
     var lastSeenApproach: FollowLastSeenApproach?
 
     var validUntil: Double {

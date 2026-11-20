@@ -5,6 +5,212 @@ import simd
 
 @MainActor
 final class FollowPursuitDriverTests: XCTestCase {
+    func testBlockedFollowStopsYawsAwayAndResumesOnlyClearTranslation() async {
+        for side in [DepthObstacleSide.left, .right, .front] {
+            let f = Fixture()
+            let person = Vec2(3, 0.8)
+            var turned = false
+            f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+            f.targetSample = { .init(frameID: .init(generation: 1, sequence: f.sequence), timestamp: f.time,
+                position: person, velocity: .zero, standOff: 1.5, minimumDistance: 1.25,
+                centersContinuously: true, recoversBlockedMotion: true) }
+            f.depthProvider = { command in
+                let rotation = command.left * command.right < 0
+                return .init(state: rotation || turned ? .clear : .stop, clearance: turned ? 5 : 0,
+                    supportCount: 3, sampleAge: 0.01, requiredStoppingDistance: 0.15,
+                    motionClass: .classify(command), speedLimit: nil, obstacleSide: rotation || turned ? nil : side)
+            }
+            f.onSend = { command in
+                XCTAssertGreaterThan(f.stops, 0)
+                if command.left * command.right < 0 {
+                    XCTAssertEqual(command.left > command.right, side == .left)
+                    f.yaw += side == .left ? -0.31 : 0.31
+                    turned = true
+                } else {
+                    XCTAssertTrue(turned)
+                    XCTAssertGreaterThanOrEqual(f.stops, 2)
+                    f.position = person
+                }
+            }
+            let result = await f.driver.run()
+            XCTAssertEqual(result, .arrived)
+            XCTAssertTrue(turned)
+        }
+    }
+
+    func testBlockedYawWaitsForMovingTargetAndNeverForcesBlockedRotation() async {
+        for scenario in ["clears", "blocked", "cancel", "stop_failure", "source_reset"] {
+            let f = Fixture()
+            let person = Vec2(3, -0.8)
+            var blockedAt: Double?
+            f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+            f.targetSample = { .init(frameID: .init(generation: f.generation, sequence: f.sequence), timestamp: f.time,
+                position: person, velocity: .zero, standOff: 1.5, minimumDistance: 1.25,
+                centersContinuously: true, recoversBlockedMotion: true) }
+            f.depthProvider = { command in
+                if f.commands.isEmpty || (scenario == "clears" && f.time >= (blockedAt ?? .infinity) + 0.5) {
+                    return f.observation(age: 0.01)
+                }
+                return .init(state: .stop, clearance: 0, supportCount: 3, sampleAge: 0.01,
+                    requiredStoppingDistance: 0.15, motionClass: .classify(command), speedLimit: nil,
+                    obstacleSide: .left)
+            }
+            f.onStop = {
+                blockedAt = blockedAt ?? f.time
+                if scenario == "cancel" { f.allowed = false }
+                if scenario == "source_reset" { f.generation += 1 }
+            }
+            f.stopError = scenario == "stop_failure"
+            f.onSend = { command in
+                XCTAssertGreaterThan(command.left, 0, "Blocked yaw must never be sent")
+                XCTAssertGreaterThan(command.right, 0)
+                if f.commands.count == 2 { f.position = person }
+            }
+            let result = await f.driver.run()
+            XCTAssertEqual(result, scenario == "clears" ? .arrived : scenario == "cancel" ? .cancelled :
+                scenario == "stop_failure" ? .failed(.commandFailed) :
+                scenario == "source_reset" ? .failed(.trackingLost) : .failed(.obstacle), scenario)
+            XCTAssertEqual(f.commands.count, scenario == "clears" ? 2 : 1)
+            XCTAssertLessThanOrEqual(f.events.filter { $0 == "obstacle_recovery_yaw_requested" }.count, 2)
+            if scenario == "blocked" {
+                XCTAssertGreaterThanOrEqual(f.time - (blockedAt ?? f.time), 15)
+                XCTAssertLessThan(f.time - (blockedAt ?? f.time), 15.2)
+            }
+        }
+    }
+
+    func testNativeBlockedFollowRechecksYawAndResumesWithoutTerminalEvidence() async {
+        for blockYaw in [false, true] {
+            let f = ControllerFixture()
+            f.usePlanningPolicy = true
+            var atEntry = false
+            var turned = false
+            f.beforeAttempt = { atEntry = true }
+            f.depthOverride = { command in
+                let rotation = command.left * command.right < 0
+                return .init(state: atEntry && !turned && (!rotation || blockYaw) ? .stop : .clear,
+                    clearance: 0, supportCount: 3, sampleAge: 0.01, requiredStoppingDistance: 0.15,
+                    motionClass: .classify(command), speedLimit: nil, obstacleSide: rotation ? nil : .left)
+            }
+            let feed = FollowTargetSpeedFeed()
+            func target() {
+                feed.sample = .init(frameID: f.sample.frameID!, timestamp: f.clock.value,
+                    position: f.arrival, velocity: .zero, standOff: 1.5, minimumDistance: 1.25,
+                    centersContinuously: true, recoversBlockedMotion: true)
+            }
+            target()
+            f.sleepHandler = { duration in
+                f.clock.value += Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
+                f.sequence += 1
+                target()
+                await Task.yield()
+            }
+            f.afterSend = {
+                if let command = f.commands.last, command.left * command.right < 0 {
+                    XCTAssertGreaterThan(command.left, command.right)
+                    XCTAssertGreaterThan(f.stops, 0)
+                    f.position = .zero
+                    turned = true
+                }
+            }
+            let result = await FollowTargetSpeedScope.$feed.withValue(feed) {
+                await FollowPlanningScope.$mode.withValue(.reactiveDepth) { await f.run() }
+            }
+            XCTAssertEqual(result.result, blockYaw ? .failed(.obstacle) : .arrived)
+            XCTAssertEqual(result.stopOutcome, .confirmed)
+            if blockYaw { XCTAssertTrue(f.commands.isEmpty) }
+            else { XCTAssertNil(result.failure); XCTAssertTrue(turned) }
+        }
+    }
+
+    func testNativeLateCautionStopsRefreshesAndRetriesSlowStraight() async {
+        let f = ControllerFixture()
+        f.usePlanningPolicy = true
+        var atEntry = false
+        var recovering = false
+        var stoppedAt: Double?
+        var attempts: [WheelCommand] = []
+        f.beforeAttempt = { atEntry = true }
+        f.onStop = {
+            if atEntry, !recovering {
+                recovering = true
+                stoppedAt = f.clock.value
+            }
+        }
+        f.depthOverride = { command in
+            if atEntry { attempts.append(command) }
+            return .init(state: atEntry && !recovering ? .caution : .clear,
+                clearance: atEntry && !recovering ? 0.582 : 5,
+                supportCount: atEntry && !recovering ? 6 : 0, sampleAge: 0.01,
+                requiredStoppingDistance: 0.232, motionClass: .classify(command), speedLimit: nil)
+        }
+        let feed = FollowTargetSpeedFeed()
+        feed.sample = .init(frameID: f.sample.frameID!, timestamp: f.clock.value,
+            position: f.arrival, velocity: .zero, standOff: 1.5, minimumDistance: 1.25,
+            centersContinuously: true)
+        let result = await FollowTargetSpeedScope.$feed.withValue(feed) {
+            await FollowPlanningScope.$mode.withValue(.reactiveDepth) { await f.run() }
+        }
+        XCTAssertEqual(result.result, .arrived)
+        XCTAssertNil(result.failure, "A recovered native caution is not a terminal failure")
+        XCTAssertEqual(result.stopOutcome, .confirmed)
+        XCTAssertEqual(f.commands.count, 1)
+        if let command = f.commands.first {
+            XCTAssertEqual(command.left, command.right)
+            XCTAssertLessThanOrEqual(command.left, 0.12)
+        }
+        XCTAssertGreaterThanOrEqual((f.firstSendTime ?? 0) - (stoppedAt ?? 0), 0.06)
+        XCTAssertGreaterThan(attempts.count, 3, "Recovery requires new captures and native revalidation")
+    }
+
+    func testLateCautionRecoveryCannotBypassNewHazardsOrRetryForever() async {
+        for scenario in ["native_stop", "new_stop", "stale", "stop_failure", "repeated_caution"] {
+            let f = ControllerFixture()
+            f.usePlanningPolicy = true
+            var atEntry = false
+            var recovering = false
+            var nativeChecks = 0
+            f.beforeAttempt = { atEntry = true; nativeChecks += 1 }
+            f.onStop = {
+                if atEntry {
+                    recovering = true
+                    atEntry = false
+                    if scenario == "stop_failure" { f.failStopNumber = f.stops }
+                }
+            }
+            f.depthOverride = { command in
+                if recovering, scenario == "stale" {
+                    return .unavailable(.staleRawDepth, sampleAge: 0.3, motionClass: .classify(command))
+                }
+                let stop = (atEntry && scenario == "native_stop") || (recovering && scenario == "new_stop")
+                return .init(state: stop ? .stop : atEntry ? .caution : .clear,
+                    clearance: stop ? 0.1 : 0.582, supportCount: 6, sampleAge: 0.01,
+                    requiredStoppingDistance: 0.232, motionClass: .classify(command), speedLimit: nil)
+            }
+            let feed = FollowTargetSpeedFeed()
+            func refreshTarget() {
+                feed.sample = .init(frameID: f.sample.frameID!, timestamp: f.clock.value,
+                    position: f.arrival, velocity: .zero, standOff: 1.5, minimumDistance: 1.25,
+                    centersContinuously: true)
+            }
+            refreshTarget()
+            f.sleepHandler = { duration in
+                f.clock.value += Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
+                f.sequence += 1
+                refreshTarget()
+                await Task.yield()
+            }
+            let result = await FollowTargetSpeedScope.$feed.withValue(feed) {
+                await FollowPlanningScope.$mode.withValue(.reactiveDepth) { await f.run() }
+            }
+            if case .failed = result.result {} else { XCTFail("Must fail closed: \(scenario)") }
+            XCTAssertTrue(f.commands.isEmpty, scenario)
+            XCTAssertLessThanOrEqual(nativeChecks, 3, "At most two stopped retries: \(scenario)")
+            if scenario == "repeated_caution" { XCTAssertEqual(nativeChecks, 3) }
+            if scenario == "native_stop" { XCTAssertEqual(nativeChecks, 1) }
+        }
+    }
+
     func testClearPassageAlternativeRemainsValidWhenOpeningBecomesAdvisory() async {
         let f = Fixture()
         let person = Vec2(3, 0.8)

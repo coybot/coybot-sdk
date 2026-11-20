@@ -237,6 +237,7 @@ struct ConversationView: View {
             followConfiguration.movingTargetFacingAngle = .pi / 2
             followConfiguration.continuousHoldingFacing = true
             followConfiguration.continuousTargetCentering = true
+            followConfiguration.recoversBlockedMotion = true
             followConfiguration.approachLastSeenTarget = true
             followConfiguration.waitForUserReturn = true
             followConfiguration.planningMode = .reactiveDepth

@@ -1247,7 +1247,8 @@ public final class FollowMeCoordinator {
             pursuitTargetFeed.sample = .init(frameID: selected.frameID, timestamp: selected.timestamp,
                 position: selected.position, velocity: lead ?? trackVelocity(at: selected.timestamp) ?? .zero,
                 standOff: config.standOffDistance, minimumDistance: config.minimumHoldDistance,
-                holdsTranslation: continuousHold && holding, centersContinuously: usesContinuousCentering)
+                holdsTranslation: continuousHold && holding, centersContinuously: usesContinuousCentering,
+                recoversBlockedMotion: config.recoversBlockedMotion)
         }
         if pursuitPerceptionPaused {
             guard measured, let control = motion as? any FollowMePursuitControl,

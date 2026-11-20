@@ -218,6 +218,9 @@ struct DepthSafetyObservation: Equatable, Sendable {
     /// Bounded rejection evidence: x:y:z:contact-travel:live/remembered.
     var hazardContactProfile: String?
     var hazardSweepProfile: String?
+    /// Native policy rejected a caution, not a stop-level collision.
+    /// Only permits a stopped replan after a definitely-unsent command.
+    var retryableTransportCaution = false
 
     static func unavailable(_ reason: DepthSafetyUnavailableReason,
                              sampleAge: TimeInterval,

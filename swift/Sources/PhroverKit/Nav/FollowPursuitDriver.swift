@@ -45,6 +45,8 @@ struct FollowPursuitSendFailure: Error {
     var definitelyUnsent = false
     var authorizationExpired = false
     var targetAuthorityChanged = false
+    var retryableDepthCaution = false
+    var obstacleSide: DepthObstacleSide?
 }
 
 /// One follow owner, one worker, and a newest-only goal mailbox. Planning never
@@ -315,6 +317,13 @@ final class FollowPursuitDriver {
         var alignmentAttempts = 0
         var creepResponse = FollowCreepResponse()
         var creepHoldRequested = false
+        var lateCautionRecoveries = 0
+        var retrySlowStraight = false
+        var lateCautionSlowUntil = -Double.infinity
+        var blockedDeadline: Double?
+        var blockedOrigin: Vec2?
+        var blockedTurns = 0
+        var blockedTurn: (direction: Double, yaw: Double, deadline: Double)?
 
         func recordAcceptance(_ reason: String, job: Job?, source: NavigationPoseSample, at time: Double,
                               event: String = "plan_acceptance_rejected", includeGeometry: Bool = true) {
@@ -336,21 +345,22 @@ final class FollowPursuitDriver {
             healthySince = nil; lastHealthySend = nil; lastHealthyCapture = nil; healthySends = 0
         }
 
-        func recoverExpiredCommand(expiry: Double, rawDepth: Bool = false) async -> NavigationFailure? {
+        func recoverExpiredCommand(expiry: Double, rawDepth: Bool = false, lateCaution: Bool = false) async -> NavigationFailure? {
             resetHealthyDelivery()
             refreshCaptureCount = 0; refreshFirstCapture = nil; refreshLastCapture = nil
-            guard expiryRecoveries < 2 else {
+            guard !lateCaution || lateCautionRecoveries < 2 else { return .obstacle }
+            guard lateCaution || expiryRecoveries < 2 else {
                 failureCause = .pursuitRecoveryExhausted
                 return .depthUnavailable(.staleRawDepth)
             }
             failureCause = rawDepth ? .pursuitDepthRefreshTimeout : .pursuitAuthorizationExpired
             let stopRequestedAt = environment.uptime()
             let existingRecoveryDeadline = refreshAfter == nil ? nil : refreshDeadline
-            expiryRecoveries += 1
-            environment.emit(rawDepth ? "raw_depth_refresh_started" : "authorization_expired", ["recovery_attempt": .number(Double(expiryRecoveries)),
+            if lateCaution { lateCautionRecoveries += 1 } else { expiryRecoveries += 1 }
+            environment.emit(lateCaution ? "late_caution_refresh_started" : rawDepth ? "raw_depth_refresh_started" : "authorization_expired", ["recovery_attempt": .number(Double(lateCaution ? lateCautionRecoveries : expiryRecoveries)),
                 "refresh_deadline_s": existingRecoveryDeadline.map { .number($0) } ?? .null,
                 "command_valid_until_s": expiry.isFinite ? .number(expiry) : .null,
-                "evaluated_at_s": .number(environment.uptime()), "reason": .string(rawDepth ? "raw_depth_freshness" : "command_authorization_expired"),
+                 "evaluated_at_s": .number(environment.uptime()), "reason": .string(lateCaution ? "native_caution" : rawDepth ? "raw_depth_freshness" : "command_authorization_expired"),
                 "transport_attempts": .number(0)])
             if !stationaryStopConfirmed {
                 do { try await environment.stop() } catch { return .commandFailed }
@@ -383,7 +393,7 @@ final class FollowPursuitDriver {
                 recordAcceptance("source_" + (sourceRejection ?? "missing_pose"), job: job, source: source, at: tick)
                 return .failed(.trackingLost)
             }
-            if !sent, tick >= began + Self.initialAdmissionTimeout {
+            if !sent, blockedDeadline == nil, tick >= began + Self.initialAdmissionTimeout {
                 recordAcceptance("startup_timeout", job: job, source: source, at: tick)
                 return .failed(.noPath)
             }
@@ -529,7 +539,7 @@ final class FollowPursuitDriver {
             let current = environment.pose()
             let time = environment.uptime()
             guard time.isFinite, time >= tick else { return .failed(.trackingLost) }
-            if !sent, time >= began + Self.initialAdmissionTimeout {
+            if !sent, blockedDeadline == nil, time >= began + Self.initialAdmissionTimeout {
                 recordAcceptance("startup_timeout", job: job, source: current, at: time)
                 return .failed(.noPath)
             }
@@ -656,7 +666,77 @@ final class FollowPursuitDriver {
             } else {
                 steeringPath = joined.path
             }
-            let correctionEligible = route.planningMode == .reactiveDepth &&
+            func recoverBlocked(_ side: DepthObstacleSide?) async -> NavigationResult? {
+                guard route.planningMode == .reactiveDepth, targetSample?.recoversBlockedMotion == true,
+                      targetSample?.lastSeenApproach == nil, targetSample?.holdsTranslation != true,
+                      targetSpeed != nil else { return .failed(.obstacle) }
+                if !stationaryStopConfirmed {
+                    do { try await environment.stop() } catch { return .failed(.commandFailed) }
+                    stationaryStopConfirmed = true
+                }
+                guard owned else { return .cancelled }
+                movementActive = false
+                markProgressStopped()
+                acceleration.reset()
+                steeringResponse.reset()
+                alignmentRequested = nil
+                alignmentApproach = nil
+                correctiveTurn = nil
+                passagePreference = nil
+                avoidanceSide = nil
+                avoidanceUntil = -Double.infinity
+                if blockedDeadline == nil {
+                    blockedDeadline = environment.uptime() + 15
+                    blockedOrigin = currentPose.position
+                    blockedTurns = 0
+                    environment.emit("obstacle_recovery_started", [
+                        "deadline_s": .number(blockedDeadline!),
+                        "side": side.map { .string($0.rawValue) } ?? .null])
+                }
+                guard environment.uptime() < blockedDeadline! else { return .failed(.obstacle) }
+                let rejectedTurn = blockedTurn != nil
+                blockedTurn = nil
+                let direction: Double? = side == .left ? -1 : side == .right ? 1 :
+                    centeringBearing.flatMap { abs($0) > .pi / 36 ? ($0 > 0 ? 1.0 : -1.0) : nil }
+                if !rejectedTurn, blockedTurns < 2, let direction {
+                    blockedTurns += 1
+                    blockedTurn = (direction, currentPose.yaw, min(blockedDeadline!, environment.uptime() + 0.6))
+                    environment.emit("obstacle_recovery_yaw_requested", [
+                        "direction": .number(direction), "attempt": .number(Double(blockedTurns))])
+                } else {
+                    // Continue consuming fresh target/depth updates while stopped.
+                    // No cached hazard or failed turn is permission to move.
+                    await environment.sleep(.milliseconds(100))
+                }
+                return nil
+            }
+            if let deadline = blockedDeadline {
+                if blockedTurn == nil, let origin = blockedOrigin,
+                   currentPose.position.distance(to: origin) >= 0.15 {
+                    blockedDeadline = nil; blockedOrigin = nil; blockedTurns = 0
+                    environment.emit("obstacle_recovery_progress", [:])
+                } else if environment.uptime() >= deadline {
+                    if !stationaryStopConfirmed {
+                        do { try await environment.stop() } catch { return .failed(.commandFailed) }
+                        stationaryStopConfirmed = true
+                    }
+                    return .failed(.obstacle)
+                }
+            }
+            if let turn = blockedTurn {
+                let travel = abs(atan2(sin(currentPose.yaw - turn.yaw), cos(currentPose.yaw - turn.yaw)))
+                if environment.uptime() >= turn.deadline || travel >= 0.25 {
+                    do { try await environment.stop() } catch { return .failed(.commandFailed) }
+                    stationaryStopConfirmed = true
+                    movementActive = false
+                    markProgressStopped()
+                    blockedTurn = nil
+                    guard owned else { return .cancelled }
+                    environment.emit("obstacle_recovery_yaw_completed", ["yaw_travel_rad": .number(travel)])
+                    continue
+                }
+            }
+            let correctionEligible = blockedDeadline == nil && route.planningMode == .reactiveDepth &&
                 targetSample?.centersContinuously == true && targetSample?.lastSeenApproach == nil &&
                 targetSample?.holdsTranslation != true && (targetSpeed?.maximumWheelSpeed ?? 0) > 0
             let creepEligible = correctionEligible &&
@@ -755,12 +835,15 @@ final class FollowPursuitDriver {
                     continue
                 }
             }
-            let holdingTurn = correctiveTurn != nil ||
+            let holdingTurn = blockedTurn != nil || correctiveTurn != nil ||
                 (route.planningMode == .reactiveDepth && targetSpeed != nil && targetSample?.holdsTranslation == true)
             let output = PursuitController(params: parameters).step(pose: currentPose, path: steeringPath)
             var desiredCommand = output.command
             if alignmentApproach != nil, targetSpeed.map({ $0.range <= $0.stopDistance }) == true { return .arrived }
-            if let approach = alignmentApproach {
+            if let turn = blockedTurn {
+                let wheel = turn.direction * RoverConfig.minimumRotateWheelSpeed
+                desiredCommand = .init(left: -wheel, right: wheel)
+            } else if let approach = alignmentApproach {
                 desiredCommand = approach.command
             } else if let turn = correctiveTurn {
                 let wheel = turn.direction * RoverConfig.minimumRotateWheelSpeed
@@ -940,6 +1023,15 @@ final class FollowPursuitDriver {
                 return .approved
             }
             let retainingAvoidance = environment.uptime() < avoidanceUntil && avoidanceSide != nil
+            if (retrySlowStraight || blockedDeadline != nil), safeCommand.left > 0, safeCommand.right > 0 {
+                let peak = min(0.12, max(safeCommand.left, safeCommand.right))
+                safeCommand = .init(left: peak, right: peak)
+            } else if environment.uptime() < lateCautionSlowUntil,
+                      safeCommand.left > 0, safeCommand.right > 0 {
+                let peak = max(safeCommand.left, safeCommand.right)
+                let scale = min(1, 0.12 / peak)
+                safeCommand = .init(left: safeCommand.left * scale, right: safeCommand.right * scale)
+            }
             if environment.uptime() >= passageSlowUntil { passagePreference = nil }
             // Retain the speed ceiling through detection gaps, never depth
             // approval. Every steering preference is checked on current depth.
@@ -974,11 +1066,15 @@ final class FollowPursuitDriver {
                     let frontal = observation.obstacleSide == .front || observation.obstacleSide == .both
                     if frontal, observation.state == .stop {
                         environment.emit("obstacle_stop", ["obstacle_side": .string(observation.obstacleSide!.rawValue)])
-                        return .failed(.obstacle)
+                        if let result = await recoverBlocked(observation.obstacleSide) { return result }
+                        continue
                     }
                     if observation.obstacleSide == nil, observation.state != .clear, observation.passage == nil {
                         guard observation.state == .caution, let targetSpeed,
-                              targetSample?.centersContinuously == true else { return .failed(.obstacle) }
+                              targetSample?.centersContinuously == true else {
+                            if let result = await recoverBlocked(observation.obstacleSide) { return result }
+                            continue
+                        }
                         let peak = min(0.12, targetSpeed.maximumWheelSpeed, observation.speedLimit ?? 0.12)
                         guard peak.isFinite, peak > 0 else { return .failed(.obstacle) }
                         let scale = peak / max(safeCommand.left, safeCommand.right)
@@ -1006,7 +1102,9 @@ final class FollowPursuitDriver {
                         }
                         switch selection {
                         case .approved: break
-                        case .blocked: return .failed(.obstacle)
+                        case .blocked:
+                            if let result = await recoverBlocked(observation.obstacleSide) { return result }
+                            continue
                         case .depthUnavailable(let reason): unavailable = reason
                         }
                     }
@@ -1017,7 +1115,9 @@ final class FollowPursuitDriver {
                               observation.passage?.conflicts(with: observation.obstacleSide) != true {
                         switch selectPassage(observation, retained: preferringPassage) {
                         case .approved: break
-                        case .blocked: return .failed(.obstacle)
+                        case .blocked:
+                            if let result = await recoverBlocked(observation.obstacleSide) { return result }
+                            continue
                         case .depthUnavailable(let reason): unavailable = reason
                         }
                     } else if observation.obstacleSide != nil || retainingAvoidance {
@@ -1038,12 +1138,14 @@ final class FollowPursuitDriver {
                         case .approved: break
                         case .blocked:
                             environment.emit("obstacle_arc_rejected", ["reason": .string("escape_not_approved")])
-                            return .failed(.obstacle)
+                            if let result = await recoverBlocked(observation.obstacleSide) { return result }
+                            continue
                         case .depthUnavailable(let reason): unavailable = reason
                         }
                     } else if observation.state != .clear {
                         // Unknown obstacle direction is not permission to guess.
-                        return .failed(.obstacle)
+                        if let result = await recoverBlocked(observation.obstacleSide) { return result }
+                        continue
                     }
                 }
                 if !usingObstacleArc, !usingPassage, unavailable == nil {
@@ -1054,7 +1156,9 @@ final class FollowPursuitDriver {
                     case .stopDepth(let rejected):
                         switch rejected.state {
                         case .unavailable(let reason): unavailable = reason
-                        case .stop, .caution: return .failed(.obstacle)
+                        case .stop, .caution:
+                            if let result = await recoverBlocked(rejected.obstacleSide) { return result }
+                            continue
                         case .clear: unavailable = .malformedDepth
                         }
                     }
@@ -1148,7 +1252,7 @@ final class FollowPursuitDriver {
             if finalSource.pose != current.pose { await environment.sleep(.milliseconds(20)); continue }
             if !sent || requiresCurrentRouteAfterPause, routeRevision != revision { continue }
             if let refreshDeadline, sendTime >= refreshDeadline { return .failed(.depthUnavailable(refreshReason)) }
-            if !sent, sendTime >= began + Self.initialAdmissionTimeout {
+            if !sent, blockedDeadline == nil, sendTime >= began + Self.initialAdmissionTimeout {
                 recordAcceptance("startup_timeout", job: job, source: finalSource, at: sendTime)
                 return .failed(.noPath)
             }
@@ -1179,8 +1283,8 @@ final class FollowPursuitDriver {
                    progress.observe(distanceToGoal: -approach, now: progressTime(environment.date()), commanded: true) { return .failed(.stalled) }
             }
             let ackExpiry = ack.map { sendTime + RoverConfig.commsWatchdogTimeout - environment.date().timeIntervalSince($0) } ?? sendTime
-            let expiry = min(alignmentApproach?.deadline ?? .infinity, correctiveTurn?.deadline ?? .infinity, depthExpiry, finalSource.sourceTimestamp.map { $0 + 0.5 } ?? .infinity,
-                ackExpiry, targetExpiry, sent ? .infinity : began + Self.initialAdmissionTimeout, refreshDeadline ?? .infinity)
+            let expiry = min(blockedTurn?.deadline ?? blockedDeadline ?? .infinity, alignmentApproach?.deadline ?? .infinity, correctiveTurn?.deadline ?? .infinity, depthExpiry, finalSource.sourceTimestamp.map { $0 + 0.5 } ?? .infinity,
+                ackExpiry, targetExpiry, sent || blockedDeadline != nil ? .infinity : began + Self.initialAdmissionTimeout, refreshDeadline ?? .infinity)
             guard sendTime < expiry else {
                 if sendTime >= targetExpiry { continue }
                 if let failure = await recoverExpiredCommand(expiry: expiry) { return .failed(failure) }
@@ -1243,6 +1347,26 @@ final class FollowPursuitDriver {
                         continue
                     }
                     if rejected.definitelyUnsent, revision != sendRevision { continue }
+                    if rejected.definitelyUnsent, rejected.retryableDepthCaution,
+                       route.planningMode == .reactiveDepth, !holdingTurn,
+                       safeCommand.left > 0, safeCommand.right > 0 {
+                        if let failure = await recoverExpiredCommand(expiry: expiry, rawDepth: true, lateCaution: true) {
+                            return .failed(failure)
+                        }
+                        guard owned else { return .cancelled }
+                        retrySlowStraight = true
+                        lateCautionSlowUntil = environment.uptime() + 2
+                        passagePreference = nil
+                        avoidanceSide = nil
+                        avoidanceUntil = -Double.infinity
+                        steeringResponse.reset()
+                        alignmentRequested = nil
+                        continue
+                    }
+                    if rejected.definitelyUnsent, rejected.reason == .obstacle {
+                        if let result = await recoverBlocked(rejected.obstacleSide) { return result }
+                        continue
+                    }
                     return .failed(rejected.reason)
                 }
                 if error as? FollowTurnBurstTransportDenial == .expired { return .failed(.depthUnavailable(.staleRawDepth)) }
@@ -1250,6 +1374,7 @@ final class FollowPursuitDriver {
             }
             maximumAdmissionDuration = max(maximumAdmissionDuration,
                 environment.admissionDuration() ?? (environment.uptime() - sendStarted))
+            retrySlowStraight = false
             creepHoldRequested = creepResponse.observe(command: safeCommand, position: currentPose.position,
                 now: environment.uptime(), eligible: creepEligible && !holdingTurn && refreshAfter == nil)
             if let direction = steeringResponse.observe(command: safeCommand, yaw: currentPose.yaw,

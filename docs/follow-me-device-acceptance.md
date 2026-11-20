@@ -15,6 +15,77 @@ Record the tested phone, rover, build revision, pass/fail per step, and redacted
 
 ## Advisory passage rejection (November 20)
 
+### Blocked follow yaw-and-observe recovery
+
+The 12:40–12:41 kitchen run (`iphone15pro-kitchen-img2031.log`) completed
+an 0.119 m bounded approach and a right alignment correction. It then
+steered right with 0.12/0.078 wheels to avoid the left flank. Three remembered
+cells at x=-0.22 m, z=0.14 m, heights 0.38–0.46 m entered the padded
+footprint, producing zero predicted contact travel and a confirmed stop.
+This was an actual stop-level sweep rejection, not the prior late caution.
+
+Talk now opts into blocked-motion recovery. Following confirms a stop,
+requests yaw away from a known occupied side (or toward the fresh target
+for a frontal warning), and checks that exact rotation independently.
+Each yaw request is bounded by 0.6 seconds/0.25 rad measured travel, with
+at most two requests per blocked episode. Rejected yaw leaves the rover
+stopped while fresh target and depth observations continue.
+
+The episode has a non-renewable 15-second deadline. Translation resumes
+only through ordinary fresh-depth and native admission; 0.15 m measured
+translation ends the episode. Neither remembered hazards nor stop-level
+observations are downgraded. The same person feed/owner remains active;
+existing target-loss handling owns reacquisition if perception is lost.
+SDK callers retain the default terminal behaviour unless they opt in.
+
+Concurrency model proposal: states Stopped, YawPending, Yawing,
+TranslationPending, Following, Cancelled; invariants require a confirmed
+stop before yaw, fresh exact-command approval for every send, no sends
+after cancellation, and non-renewable recovery deadline/turn count.
+No model-checking result or physical traversal proof is claimed.
+
+Validation: **1,736/1,736 SDK tests passed**, zero failures/skips
+(`Test-PhroverSDKTests-2026.11.20_13-06-17--0800.xcresult`).
+Generated left/right/front scenarios cover stop–yaw–clear-translation,
+blocked yaw with later clearance, fixed timeout, cancellation, stop failure,
+source reset, and independent native rejection/recovery. `git diff --check`
+passed. Signed Debug build passed and was installed on **iPhone 15 Pro at
+13:09 November 20**, database sequence **1652**. Artifacts use `blocked-yaw-*`
+in the OpenCode temporary directory. Physical kitchen traversal remains unverified.
+
+### Late native caution at the entryway
+
+The 12:07:12 stop (`iphone15pro-entry-img2029.log`) rejected a left-curving
+0.303/0.35 command at native admission. The driver sweep was clear, but
+the later sweep found six remembered cells at x=-0.46 m, z=0.54 m,
+heights 0.30–0.50 m. Predicted contact travel was 0.582 m versus a
+0.232 m required stopping distance. Native reactive policy promoted
+this caution to stop; no straight alternative was evaluated.
+
+Native admission now preserves whether rejection originated as caution.
+Only a definitely-unsent positive-wheel reactive command can recover.
+Recovery confirms stop, requires post-stop fresh depth captures under the
+existing fixed recovery deadline, and starts with a slow straight candidate.
+Existing passage/obstacle checks may select another independently clear
+candidate. A two-second slow ceiling prevents immediate return to cruise,
+and at most two late-caution recoveries are allowed per pursuit.
+Actual stop-level hazards, uncertain sends, failed stops, and cancellation
+do not gain retry authority. Remembered hazards are retained.
+
+`depth_retryable_transport_caution` and `late_caution_refresh_started`
+distinguish this path in device logs. A successfully recovered caution is
+not recorded as terminal motion failure. Physical entryway traversal
+remains pending.
+
+Validation: **1,733/1,733 SDK tests passed**, zero failures/skips
+(`Test-PhroverSDKTests-2026.11.20_12-24-33--0800.xcresult`).
+Native integration tests verify stopped fresh-capture recovery, a slow
+straight retry, terminal native/new stop-level hazards, persistent stale
+depth, failed stop confirmation, and exhaustion after two retries.
+`git diff --check` and signed Debug build passed. Installed on **iPhone 15 Pro
+at 12:26 November 20**, database sequence **1644**. Artifacts use
+`late-caution-*` in the OpenCode temporary directory.
+
 ### Bounded pre-alignment approach and contact diagnostics
 
 The 11:06–11:07 run (`iphone15pro-clearance-img2025.log`) made a 0.172-rad

@@ -180,9 +180,13 @@ enum FollowTurnOperationExecutor {
                         return .failed(.rotationResolutionInsufficient)
                     }
                     let sweepDirection = sweep < 0 ? -1.0 : 1.0
-                    // A small complete response may be dominated by settling or
-                    // pose noise. Large out-and-back motion is not such evidence.
-                    if net * sweepDirection <= 0, travel > profile.tolerance {
+                    // Repeated samples can accumulate a long path inside a small
+                    // heading interval. Use span to distinguish narrow settling
+                    // from a large excursion; signed motion below still debits
+                    // progress and cannot reset the original watchdog.
+                    guard let span = reduction.calibration.lastObservedBurst?.headingSpan,
+                          span.isFinite else { return .failed(.rotationResolutionInsufficient) }
+                    if net * sweepDirection <= 0, span > profile.tolerance {
                         return .failed(.rotationResolutionInsufficient)
                     }
                     sweptAngle += net

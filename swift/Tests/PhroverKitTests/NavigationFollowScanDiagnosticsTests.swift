@@ -14,6 +14,16 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         }
     }
 
+    func testRecordedNarrowOscillatingSearchResponseDoesNotClaimCoarseRotation() async {
+        for sign in [-1.0, 1.0] {
+            let (result, sends) = await searchResponseReplay(sign: sign, mode: "narrow_oscillation")
+            XCTAssertEqual(result.result, .arrived)
+            XCTAssertEqual(sends, 3)
+            XCTAssertEqual(result.stopOutcome, .confirmed)
+            XCTAssertEqual(result.searchSweepProgress ?? -1, sign * 0.2, accuracy: 1e-9)
+        }
+    }
+
     func testSearchNoiseHandlingRetainsWatchdogWrongWayAndStopFailure() async {
         for mode in ["stalled", "wrong_way", "cumulative_reverse", "excursion", "failed_stop"] {
             let (result, sends) = await searchResponseReplay(mode: mode)
@@ -61,6 +71,14 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
                     source.pose = .init(position: .zero, yaw: sign * (start + 0.2))
                     source.capture(after: 0.001)
                 }
+                if mode == "narrow_oscillation", sends == 1 {
+                    // The device accumulated 0.138 rad of path inside a
+                    // 0.0623 rad heading span, ending only 0.0038 rad backward.
+                    for delta in [-0.06, 0, -0.01, 0, -0.003799997924408882] {
+                        source.pose = .init(position: .zero, yaw: sign * (start + delta))
+                        source.capture(after: 0.017)
+                    }
+                }
             }, sleep: { duration in
                 if sends > 0 {
                     let delta: Double
@@ -68,6 +86,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
                     case "wrong_way": delta = -0.13
                     case "cumulative_reverse": delta = -0.03 * Double(sends)
                     case "stalled": delta = -0.005944669045223727
+                    case "narrow_oscillation": delta = sends == 1 ? -0.003799997924408882 : (sends == 2 ? 0.1 : 0.2)
                     default: delta = sends == 1 ? -0.005944669045223727 : (sends == 2 ? 0.1 : 0.2)
                     }
                     source.pose = .init(position: .zero, yaw: sign * (start + delta))

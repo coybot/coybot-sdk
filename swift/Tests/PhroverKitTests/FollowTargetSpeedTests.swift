@@ -3,6 +3,16 @@ import RoverNav
 @testable import PhroverKit
 
 final class FollowTargetSpeedTests: XCTestCase {
+    func testContinuousFollowHoldsWithoutCreepingInsideStandOffBand() throws {
+        for range in stride(from: 1.25, through: 1.65, by: 0.01) {
+            var target = sample(range: range, velocity: 0.2)
+            target.centersContinuously = true
+            let speed = try XCTUnwrap(FollowTargetSpeed.evaluate(target, pose: pose, now: 10, maximum: 0.35))
+            XCTAssertEqual(speed.maximumWheelSpeed, 0, accuracy: 1e-9)
+            XCTAssertEqual(speed.stopDistance, 1.65, accuracy: 1e-9)
+        }
+    }
+
     private func sample(range: Double, velocity: Double, time: Double = 10, generation: UInt64 = 1) -> FollowTargetSpeedSample {
         .init(frameID: .init(generation: generation, sequence: 1), timestamp: time,
             position: Vec2(range, 0), velocity: Vec2(velocity, 0), standOff: 1.5, minimumDistance: 1.25)

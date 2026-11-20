@@ -34,6 +34,7 @@ enum FollowFrameHealth {
         case .poseUnavailable: return batch.pose == nil ? "frame_pose_missing" : "frame_pose_nonfinite"
         case .depthUnavailable: return "depth_unavailable"
         case .noFrames: return "frame_missing"
+        case .targetVerificationUnavailable: return "target_verification_unavailable"
         }
     }
 }

@@ -13,6 +13,772 @@ Automated simulator tests do not establish LiDAR projection accuracy or prove th
 
 Record the tested phone, rover, build revision, pass/fail per step, and redacted runtime-log evidence here after the supervised run. Do not attach camera images or raw transcripts.
 
+## Advisory passage rejection (November 20)
+
+### Bounded pre-alignment approach and contact diagnostics
+
+The 11:06–11:07 run (`iphone15pro-clearance-img2025.log`) made a 0.172-rad
+left alignment correction before a right-side depth stop. The rejected
+curved sweep reported 0.064 m predicted contact travel with a 0.15 m required
+stopping distance. This is not a measured bumper-to-sofa gap; reducing the
+minimum to 0.10 m would still reject that sweep.
+
+Before stationary corrective alignment, the driver now confirms a stop and
+probes straight motion followed by a gentle arc toward the target. A clear
+candidate starts a bounded approach (wheel peak at most 0.12; at most 0.8 s
+or 0.15 m measured displacement). The normal fresh-depth, target, owner,
+guard, and transport gates still apply on each tick. The approach deadline
+also bounds transport admission. A confirmed stop separates approach and
+rotation, and the existing two-correction limit remains in force.
+
+The pursuit stall clock is paused during this separately bounded phase.
+Collision diagnostics include up to 16 nearest-cluster samples in
+`depth_hazard_contacts_x_y_z_travel_source`, identifying live versus remembered
+evidence, and `depth_hazard_sweep` with wheels, body envelope, margin, horizon,
+and sampled predicted path.
+
+Device test: repeat the same approach, measure the chassis-to-sofa gap at
+the stop, and compare it with recorded contact samples and the swept path.
+Neither projection accuracy nor successful physical traversal is established
+by simulator checks. Minimum obstacle clearance remains 0.15 m.
+
+Validation: **1,731/1,731 SDK tests passed**, zero failures/skips
+(`Test-PhroverSDKTests-2026.11.20_11-27-03--0800.xcresult`).
+Checks cover straight/gentle approach selection, newly blocked depth,
+cancellation, displacement completion with corrected heading, bounded
+no-response alignment, and live/remembered contact diagnostics.
+`git diff --check` and signed Debug build passed. Installed on **iPhone 15 Pro
+at 11:28 November 20**, database sequence **1636**. Artifacts use `approach-*`
+in the OpenCode temporary directory. No TLA+ model check was executed.
+
+### Sofa-side steering continuity follow-up
+
+The 10:35–10:36 run (`iphone15pro-sofa-img2024.log`) observed a passage centre
+0.24 m left at 10:36:20.16. Following a bounded left alignment correction,
+missing boundary detections discarded passage direction while retaining only
+the speed ceiling. Target following then commanded rightward curvature.
+Later left avoidance passed fresh and native depth checks, but a newly
+supported right-biased gap replaced it; that candidate received caution at
+0.32 m predicted contact travel, ending in a confirmed obstacle stop.
+
+Passage direction now shares the existing 1.5-second retention deadline.
+Missing/advisory detections cannot renew it. Every retained candidate is
+evaluated against current depth and rechecked at transport entry. Selecting
+obstacle avoidance releases the passage preference.
+
+Front/bilateral warnings now prioritize bounded escape-arc checks over gap
+centering. Gap geometry cannot veto a clear slow escape arc in this case.
+Both driver and native admission still reject caution/stop, stale depth,
+and steering toward an occupied lateral flank.
+
+Regressions reproduce both the clear-escape false stop and direction loss
+across multiple missing detections. Additional checks cover retention expiry
+and native stop/opposing-flank rejection for front/bilateral warnings.
+**1,730/1,730 SDK tests passed**, zero failures/skips
+(`Test-PhroverSDKTests-2026.11.20_10-44-50--0800.xcresult`).
+`git diff --check` and signed Debug build passed. Installed on **iPhone 15 Pro
+at 10:46 November 20**, database sequence **1628**. Artifacts use `sofa-*`
+in the OpenCode temporary directory. Physical traversal remains unverified.
+
+The 09:54–09:55 iPhone 15 Pro sessions captured in
+`iphone15pro-obstacle-img2023-retry.log` included a caution on the original
+curve, followed by a fresh clear slow candidate. Its supported opening was
+classified `distant_supported`, clearing the active passage field. The driver
+then rejected that candidate for missing passage guidance and reported an
+obstacle. Recorded gap width was 0.96 m versus 0.71 m required.
+
+`testClearPassageAlternativeRemainsValidWhenOpeningBecomesAdvisory` reproduced
+this as `.failed(.obstacle)` with zero commands before the fix
+(`Test-PhroverSDKTests-2026.11.20_10-01-40--0800.xcresult`).
+
+Supported live-depth geometry now survives separately as `observedPassage`.
+Candidate validation uses that geometry even when passage slowdown is advisory.
+Normal cruise and passage-speed retention still use only active guidance.
+The candidate must remain clear, fresh, pointed away from any occupied flank,
+accepted unchanged by the guard, and revalidated at native transport entry.
+Generated checks vary gap offsets, boundary distances, and speeds; stale
+snapshots must expose neither active nor observed passage guidance.
+
+Validation: **1,728/1,728 SDK tests passed**, zero failures/skips
+(`Test-PhroverSDKTests-2026.11.20_10-04-19--0800.xcresult`), including
+the reproduced failure and generated advisory/stale-depth cases.
+`git diff --check` and signed Debug build passed. Installed on **iPhone 15 Pro
+at 10:06 November 20**, database sequence **1620**. Artifacts use `advisory-*`
+in the OpenCode temporary directory. Physical passage traversal remains pending.
+
+## Passage-centering investigation (November 19)
+
+### Persistent heading error and motionless creep follow-up
+
+The 16:07–16:08 run (`iphone15pro-passage-img2020.log`) recovered depth
+successfully but never activated corrective alignment or passage centering.
+Cruise/slow transitions reset the previous slow-only steering monitor, and
+low target speeds were excluded. At about 1.70 m, requests reached 0.023/0.04
+before a confirmed insufficient-progress stop.
+
+Steering evidence now spans positive-speed changes with at least 10% wheel
+asymmetry. After two seconds of persistent bearing error above 12 degrees,
+either insufficient measured yaw or less than 3 degrees improvement in bearing
+requests the existing bounded stopped correction. Eligible low-speed following
+is included; holds, memory authority, direction reversals, and delivery gaps
+still revoke evidence. Correction time, angle, count, and native depth limits
+remain unchanged.
+
+Near-target commands at most 0.1 with no more than 1 cm translation over one
+second request a confirmed arrival/hold, only within stand-off plus 0.25 m.
+The coordinator adopts its existing wider hold band after confirmed arrival,
+preventing immediate restart at the same distance. Moving targets outside that
+band resume through normal fresh-perception handling. Healthy translation and
+far-away stalls are not converted to successful holds.
+
+Bounded boundary diagnostics now include up to 16 supported columns as
+`lateral_m:near_depth_m` in `depth_passage_boundary_profile_x_z_m`, plus the
+required body-and-clearance width in `depth_passage_required_width_m`.
+These are diagnostic evidence, not permission to traverse rejected geometry.
+
+Tests cover alternating 0.35/0.12/0.08 requests in both directions, healthy
+heading improvement, delivery gaps, motionless near-target hold, and translation
+that must not trigger hold. **1,726/1,726 full SDK tests passed**, zero failures/
+skips (`Test-PhroverSDKTests-2026.11.19_16-31-11--0800.xcresult`).
+Signed Debug build and `git diff --check` passed. Installed on **iPhone 15 Pro
+at 16:32 November 19**, database sequence **1612**. Artifacts use
+`persistent-alignment-*` in the OpenCode temporary directory.
+Physical passage traversal and the cause of rejected real-world gap geometry
+remain unverified.
+
+### Measured steering response and stable near-target hold
+
+The 15:34–15:36 run (`iphone15pro-wall-sofa-postrecovery.log`) avoided the
+previous depth recovery timeout. During about 14 seconds of slow avoidance,
+mounted-phone yaw changed only about 7 degrees while target bearing increased
+from about 12 to 23 degrees. Terminal wheel requests near 1.65 m target range
+were approximately 0.037/0.066, followed by insufficient-progress failure.
+Fresh depth was clear and stop was confirmed. Sparse `insufficient_width`
+results still do not establish the physical wall–sofa clearance.
+
+Continuous measured following now monitors acknowledged slow arcs directed
+toward the target. Two seconds of continuous requests with less than 3 degrees
+of measured yaw response and more than 12 degrees bearing error requests a
+stopped correction. Delivery gaps over 300 ms, direction changes, memory
+authority, and ineligible motion reset the evidence.
+
+The correction confirms a translation stop, then uses the existing 0.25
+rotation request with exact rotational-depth and native transport admission.
+It stops after 0.3 rad measured yaw, 0.8 seconds, or target error within
+5 degrees, whichever comes first. The deadline bounds command expiry too.
+Translation resumes only after another confirmed stop. At most two corrections
+are available to one pursuit owner; absent yaw response ends with a stall.
+No operator-cleared rotation or visibility bypass is added.
+
+Continuous following enters its stand-off hold at stand-off plus 0.15 m
+(1.65 m with Talk defaults), retaining the coordinator's existing wider exit
+threshold. The speed policy and coordinator use the same boundary. Legacy
+following and remembered-target approach retain their previous stop margin.
+
+Checks cover weak/healthy yaw in both directions, delivery gaps, stop-before-
+rotation, blocked rotation, stop failure, cancellation, no yaw response,
+near-target zero translation, and continuity across the new holding boundary.
+Suggested TLA+ extension: Idle → StopConfirmed → BoundedTurn → StopConfirmed
+→ Following, with cancellation/source invalidation revoking every transition;
+Send requires the current owner, fresh exact approval, and unexpired turn
+deadline. This model has not been run. Physical turning and clearance remain
+unverified; wheel gains are unchanged.
+
+Final validation: **1,724/1,724 full SDK tests passed**, zero failures/skips
+(`Test-PhroverSDKTests-2026.11.19_15-53-41--0800.xcresult`).
+The preceding full run exposed the scanner-failure variant of the unrelated
+calibration event test race; its three-frame expectation is now deterministic.
+Signed Debug build and `git diff --check` passed. Installed on **iPhone 15 Pro
+at 15:55 November 19**, database sequence **1604**. Artifacts use
+`steering-response-*` in the OpenCode temporary directory.
+
+### Cruise-to-avoidance depth recovery
+
+The 15:18 run (`iphone15pro-cruise-postinstall-latest.log`) kept normal cruise
+commands near 0.35. At right-flank avoidance entry, 43.1 ms remained versus a
+44.7 ms probe/admission budget. Stop completed in 41 ms. Within the fixed
+600 ms recovery window, probe-budget failures reset previously approved
+capture counts, and the run ended with only two counted captures. All recorded
+depth candidates were clear. The 15-second return wait then expired.
+
+The driver now stores the observed avoidance direction before attempting the
+extra probe, so recovery evaluates the intended slow arc first. This is a
+500 ms steering preference, never a stored depth approval. A timing-budget
+shortage on still-fresh clear depth preserves already-approved post-stop
+captures, without counting the budget-limited sample. Missing, malformed,
+actually expired depth and new recovery stops retain their reset behavior.
+The fixed 600 ms deadline, three distinct post-stop captures spanning at least
+60 ms, current owner/source/target checks, and exact native admission remain.
+
+Regression input uses the recorded transition budget, then injects an
+admission-only gap between recovery captures. It must stop once, use slow
+arc-first assessments throughout recovery, preserve evidence across that gap,
+and resume only after the existing capture gate. Permanent starvation remains
+a timeout even when one rather than two evaluations is required.
+
+Suggested small TLA+ model for the retry boundary: variables `owner`, `stopped`,
+`deadline`, `approvedCaptures`, `preference`, and `currentApproval`; transitions
+Stop, NewCapture, BudgetMiss, MissingDepth, Cancel, Deadline, and Send.
+Check that BudgetMiss cannot extend the deadline or add a capture, and Send
+requires the same owner, a current exact-command approval, and the post-stop
+capture gate. This model has not been executed and is not production proof.
+
+Validation: focused driver/depth-recovery tests passed, followed by
+**1,721/1,721 full SDK tests**, zero failures/skips
+(`Test-PhroverSDKTests-2026.11.19_15-24-01--0800.xcresult`).
+Signed Debug build and `git diff --check` passed. Installed on **iPhone 15 Pro
+at 15:25 November 19**, database sequence **1596**. Artifacts use
+`transition-recovery-*` in the OpenCode temporary directory.
+Physical recovery during passage entry remains unverified.
+
+### Normal-speed approach to distant openings
+
+The 14:59–15:00 run (`iphone15pro-passage-speed-latest.log`) repeatedly changed
+from a 0.35 target-speed ceiling to 0.12 passage/hold commands despite clear
+depth and no classified nearby flank. Distant gap observations renewed the
+slow hold. Later, the target approached stand-off range and target authority
+itself reduced requests to approximately 0.04–0.07; the terminal failure was
+insufficient measured progress, with fresh clear depth and a confirmed stop.
+
+Distant openings are now advisory. On a clear exact sweep with no classified
+obstacle side, passage authority is withheld until the observed boundary is
+within `max(0.8 m, required stopping distance + 0.6 m)`. This leaves normal
+target-limited cruise active on the approach. Caution/stop or nearby flank
+evidence still applies existing obstacle checks. Dynamic braking and target
+stand-off limits are unchanged; this is not a minimum-throttle increase.
+
+`depth_passage_result=distant_supported` and
+`depth_passage_observed_distance_m` distinguish advisory distant geometry from
+active passage steering. Such sightings cannot renew the driver's slow hold.
+The real-depth driver regression approaches a distant opening at cruise,
+then switches to the existing slow cap when boundaries become near.
+Physical speed response and the separate low-speed stand-off stall remain
+unverified; no automatic stop-and-yaw manoeuvre is introduced.
+
+Validation: **180/180 focused tests** and **1,720/1,720 full SDK tests passed**
+(`Test-PhroverSDKTests-2026.11.19_15-04-34--0800.xcresult`), zero failures/skips.
+Signed Debug build succeeded. Installed on **iPhone 15 Pro at 15:06 November 19**,
+database sequence **1588**. Artifacts use `passage-cruise-*` in the OpenCode
+temporary directory. Physical cruise/slowdown behaviour remains to be checked.
+
+### Passage flicker and conflicting flank follow-up
+
+The 13:31–13:32 run (`iphone15pro-passage-img2019-tail.log`) recorded about
+2.74 m displacement and six logged passage-centering drive ticks. Detection
+flickered between supported gaps and rejected geometry, causing 0.12/0.35
+speed changes. At termination, a 0.92 m gap centred 0.42 m right conflicted
+with occupied right-flank evidence. Both final sweeps were clear, but the
+steering policy rejected movement toward that flank; stop was confirmed.
+
+The driver now retains the 0.12 speed ceiling for 1.5 seconds after observing
+a supported gap. Missing geometry cannot renew that timer or authorize motion.
+Each command still requires fresh depth, current target authority, and native
+entry validation. `passage_slow_hold` exposes the bounded speed hold.
+
+A gap pointing toward an occupied single flank yields to a slow arc away from
+that flank. The driver and native transport share the same exception: exact
+sweep must be clear, speed at most 0.12, forward wheel ratio within the existing
+slow-arc range, and steering strictly away from the current flank. A new opposing
+flank, stop, or caution at transport entry still rejects sending. This does not
+override frontal stop or authorize a passage from stale geometry.
+
+Regression coverage includes alternating supported/missing passage observations,
+eight consecutive slow sends, conflicting gaps on both flanks, and stop/opposing
+flank changes immediately before native entry. Physical traversal remains pending.
+
+Validation: **1,719/1,719 full SDK tests passed**, zero failures/skips
+(`Test-PhroverSDKTests-2026.11.19_13-39-34--0800.xcresult`).
+Signed Debug build and `git diff --check` passed. Installed on **iPhone 15 Pro
+at 13:41 November 19**, database sequence **1580**. Artifacts use
+`passage-conflict-*` in the OpenCode temporary directory.
+
+### Staggered-boundary follow-up
+
+The 13:07–13:08 run (`iphone15pro-passage-img2018-tail.log`) moved about
+1.78 m by mounted-phone pose. No passage guidance activated. The terminal
+curved command received a caution at 0.544 m predicted contact travel with
+0.204 m required stopping distance, fresh depth (114 ms), and no classified
+obstacle side. Stop was confirmed. The image alone cannot identify the depth
+cells responsible for the warning.
+
+The updated local depth envelope considers occupied boundaries out to 2.4 m,
+including staggered boundaries and gaps entirely to one side of the rover.
+Supported boundaries need three vertical cells and 20 cm contiguous depth
+support. Candidate gaps retain the full body envelope, configured lateral
+margin, and 15 cm clearance on each side. The nearest-centred fitting gap is
+a steering preference, not proof of traversability. Exact-command live depth
+still decides every admission.
+
+An unknown-side caution during continuous following now tests a bounded list:
+slower original curvature, straight, gentle left, gentle right. Commands stay
+within the target speed ceiling and 0.12 cap. Every alternative must be clear
+on fresh depth and pass native entry validation. Stop-state observations never
+enter this fallback. Missing freshness exits to existing depth recovery; the
+candidate list cannot renew the retry budget. No asynchronous owner changes
+are introduced.
+
+Depth diagnostics now report `depth_passage_result` and left/right supported
+column counts. Results distinguish insufficient support, missing boundaries,
+insufficient width, wide-open space, and supported guidance. Candidate outcomes
+are logged as `early_warning_candidate`.
+
+Initial focused validation passed **177/177** driver/depth tests. The first
+full-suite invocation was cancelled before testing because simultaneous Xcode
+builds contended for `build.db`; it was rerun after the signed build completed.
+Artifacts use `staggered-*` in the OpenCode temporary directory.
+
+The next full run passed 1,716 tests but exposed an unrelated test race:
+`testSuccessfulEmptyScanClearsWrongMarkerFailureOnce` asserted only the first
+two events while the third submitted frame legitimately emitted `scanCompleted`.
+The test now waits for each frame and asserts the complete three-event trace;
+calibration production code is unchanged. Failing trace:
+`Test-PhroverSDKTests-2026.11.19_13-20-08--0800.xcresult`.
+
+Final full suite: **1,717/1,717 passed**, zero failures/skips
+(`Test-PhroverSDKTests-2026.11.19_13-22-02--0800.xcresult`).
+Signed Debug build and `git diff --check` passed. Installed on **iPhone 15 Pro
+at 13:23 November 19**, database sequence **1572**. This validates software
+regressions, not physical passage traversal or motor calibration.
+
+### Physical motor calibration procedure (pending)
+
+Use the phone rigidly mounted with measured camera/chassis geometry and a clear
+level floor. Record floor surface, battery state, wheel command, pulse duration,
+AR displacement/yaw, and stop outcome for every trial. Do not fit gains from
+person motion or a photo.
+
+1. In supervised manual control, start at equal wheel requests of 0.06, then
+   0.08, 0.10, and 0.12, using short 0.5-second pulses with confirmed stops.
+   Repeat each three times; abort on unexpected movement or failed stop.
+2. Measure displacement against a floor ruler and compare with mounted AR pose.
+   Identify the lowest repeatably moving request and left/right drift.
+3. Repeat gentle arcs in both directions at the tested moving speed; compare
+   measured yaw with the configured 0.13 m wheelbase prediction.
+4. Only after collecting those measurements, fit wheel response and rerun exact
+   command/braking tests before applying gains. Do not impose an unmeasured
+   minimum throttle that exceeds stand-off or clearance speed limits.
+
+Physical motor calibration, staggered-gap traversal, and measured clearance
+are still pending a supervised run. No wheel gains were inferred or installed.
+
+The user confirmed the iPhone 15 Pro was mounted during the run. The newest
+32 MiB of `Documents/phrover-runtime.log` was recovered with an AFC offset
+read after CoreDevice copies ended mid-record. Saved artifact:
+`iphone15pro-narrow-passage-img2017-tail.log` in the OpenCode temporary directory.
+Parsed complete records cover 20:34:06–20:36:08 UTC. The terminal failure was
+insufficient progress, rather than blocked depth. Late wheel requests were
+approximately 0.038/0.068 with little measured pose change; this suggests weak
+low-speed response but is not a measured motor deadband calibration.
+
+Passage steering uses two live, vertically supported boundaries across adjacent
+depth bands. The centre accounts for the body envelope and 15 cm lateral
+clearance. Guidance caps wheel requests at 0.12 and preserves target stand-off
+speed limits. Every selected command must independently pass fresh exact-wheel
+depth admission; passage detection alone never authorizes motion.
+
+Verification requirements: generated passage offsets/widths must steer toward
+the centre; one-sided, weak, stale, or too-narrow observations must not establish
+guidance. Driver tests must show an off-axis person cannot pull the command
+toward a boundary. Existing cancellation, freshness, and confirmed-stop
+regressions remain applicable. No new asynchronous ownership or retry mechanism
+is introduced. Physical centring, wheel response, and clearance remain unverified.
+
+The original driver regression failed with an obstacle result. The first
+bearing-proportional correction also failed its exact swept-volume check;
+using wheelbase-aware pure pursuit toward the observed centre resolved it
+without relaxing that check. **175/175** focused driver/depth tests passed
+(`Test-PhroverSDKTests-2026.11.19_12-57-50--0800.xcresult`), including generated
+offsets, widths, and speed caps. Signed Debug build passed. Artifacts use
+`passage-center-*` in the OpenCode temporary directory.
+
+Full SDK validation: **1,715/1,715 passed**, zero failures or skips
+(`Test-PhroverSDKTests-2026.11.19_12-58-33--0800.xcresult`).
+Installed on **iPhone 15 Pro at 12:59 November 19**, database sequence **1564**
+(database UUID `CFE71183-3241-4480-9F18-5A1624798833`).
+Next physical check: approach the passage from left, centre, and right with
+the phone rigidly mounted; confirm centring, actual forward wheel response,
+clearance on both sides, and Stop Following. These remain unverified.
+
+## Bounded last-seen-area recovery (November 19)
+
+User selected last-seen-area recovery rather than exploring unrelated open
+areas. On loss during moving pursuit, Talk may keep the existing owner and
+approach the last confirmed target location through current depth-approved
+space, then stop and search near that remembered location.
+
+The capture `iphone15pro-edge-centering-nov19-latest.log` covers
+19:53:33–19:54:42Z. It recorded 25 perception pauses and two successful
+depth recoveries before recovery-budget exhaustion. The terminal candidate
+was clear but had only 19.624 ms left versus the 20 ms minimum send reserve.
+The person had returned as a verified match at about 2.2 m and 4° bearing.
+All 525 depth candidates were clear (201 with right-side warnings).
+The 15-second return wait ran from 19:54:27.539Z to 19:54:42.557Z.
+
+The new `approachLastSeenTarget` option is enabled in Talk and off by default
+in the SDK. `FollowLastSeenApproach` is explicit destination authority, not
+a newly verified person or a re-timestamped image. It preserves the original
+capture time and AR generation, uses zero target velocity, limits wheel
+requests to 0.12, and expires three seconds after the last confirmed sighting
+or at 0.5 m displacement from entry. Stand-off braking remains active.
+No unseen-target leg starts from a stationary hold or resumes a perception
+pause without fresh verified evidence.
+
+Repeated misses cannot renew the leg. A verified spatially associated return
+resumes measured following under the same owner. Limit/arrival completion
+confirms stopping before the existing bounded, anchored reacquisition search.
+Ambiguity, cancellation, AR changes and unhealthy camera delivery revoke the
+leg. Depth, exact-wheel native admission and recovery allowances remain in
+force. Native admission rechecks authority changes and the displacement/time
+limits before and after depth evaluation.
+
+This retains spatial target memory, not appearance-based identity recognition.
+It does not authorize moving around an unobserved corner or exploring beyond
+the last-seen area. Physical traversal remains unverified.
+
+Validation: **130/130** focused driver/continuity tests and **1,713/1,713**
+full SDK tests passed. The full run used no retries
+(`Test-PhroverSDKTests-2026.11.19_12-14-40--0800.xcresult`).
+Signed Debug build and `git diff --check` passed. Installed on **iPhone 15 Pro
+at 12:16**, database sequence **2748**. Artifacts use `last-seen-area-*` in
+the OpenCode temporary directory.
+
+## Edge-of-view centering and verification return wait (November 19)
+
+`iphone15pro-retained-arc-nov19.log` contains the 19:37:50–19:38:39Z
+Follow Me attempt. Following began at 19:38:22.634Z. Two depth recoveries
+completed during following and neither exhausted the retry allowance.
+There were 518 clear depth candidates and two stale-depth candidates.
+Right-flank avoidance repeatedly requested the same 0.078/0.12 wheel pair
+while target bearing grew to about 27°. At 19:38:37.428Z body verification
+rejected the left hip (confidence 0.205); the next diagnostic also rejected
+the left shoulder. The person box reached the image's right edge.
+The perception pause was confirmed at 19:38:37.540Z. The session failed
+two seconds later instead of offering the configured human-return wait.
+
+Continuous-centering avoidance now increases curvature when the verified
+target lies in the safe escape direction. The inner/outer wheel ratio
+decreases from 0.65 at 10° to 0.15 at 30°, with the same 0.12 peak cap and
+current target-speed ceiling. Opposing-flank constraints still take priority.
+Each changed curve receives fresh exact-command depth approval, including at
+native transport admission. Retained arcs are still assessed first.
+
+When the short same-owner verification grace expires, both the timer and
+late-frame paths now use the existing confirmed-stop return flow when
+`waitForUserReturn` is enabled. That flow waits 15 seconds after its confirmed
+stop and requires stable fresh verified evidence before restarting readiness.
+Camera/AR faults retain their own failure policy. Body-verification thresholds
+are unchanged.
+
+The initial driver/coordinator regressions both failed before the fix:
+constant yaw request despite growing bearing, and terminal verification timeout.
+Generated checks cover mirrored bearing sequences, the recorded tight depth
+budget, changed obstacles at native admission, late return, fixed expiry,
+failed stopping, cancellation and AR reset. Physical yaw response and passage
+clearance remain pending device testing.
+
+Initial focused validation: **131/131** driver, continuity and return-coordinator
+tests passed. Signed Debug device build passed. Artifacts use
+`edge-centering-return-*` in the OpenCode temporary directory.
+The full SDK run passed **1,710/1,710** tests without retries, including the
+expanded native-admission and return-fault sequences
+(`Test-PhroverSDKTests-2026.11.19_11-49-45--0800.xcresult`).
+Installed on **iPhone 15 Pro at 11:51**, database sequence **2740**.
+
+## Retained avoidance depth budget (November 18 evening)
+
+The capture `iphone15pro-after-near-target-fix.log` contains the
+05:31:45–05:32:46Z November 19 session. Repeated successful depth recoveries
+ended in recovery exhaustion. The final avoidance decision had approximately
+204 ms capture age and 15 ms evaluation cost: enough for one candidate and
+native admission, but insufficient for another speculative arc evaluation.
+
+The driver now assesses the retained avoidance arc first, using the current
+target speed ceiling. If the selected escape command equals the command just
+assessed, it reuses that same-tick observation instead of evaluating it twice.
+Changed direction or speed still requires another exact-command assessment.
+The preference expires after 500 ms without a new warning; it retains no
+depth approval. Frontal stops, unknown blocked paths, stale/missing depth,
+send freshness margins, native exact-wheel checks and recovery limits remain
+enforced.
+
+The deterministic regression uses both flank directions and the recorded
+198–204 ms capture ages with 14.871 ms evaluation cost. Before the fix, all
+four sequences stopped after one send and failed with stale depth. The
+required result is eight consecutive approved sends without a recovery stop.
+Additional generated sequences change the warning side, introduce frontal
+or unclassified stops, and remove or expire depth after the first send.
+The native-controller regression changes depth immediately before the second
+send and confirms frontal stop/caution and a newly opposing flank reject
+the retained arc, with confirmed final stop.
+
+Validation: **117/117** driver tests passed, then **1,707/1,707** full SDK
+tests passed without retries (result bundle
+`Test-PhroverSDKTests-2026.11.18_21-54-36--0800.xcresult`).
+Signed Debug device build and `git diff --check` passed. Build/test artifacts
+use `retained-arc-*` in the OpenCode temporary directory.
+Installed on iPhone 15 Pro at **21:56**, database sequence **2732**.
+
+Physical traversal and depth-publication latency improvements are not
+established by this candidate-selection change.
+
+## Near-target pause/resume distance gap (November 18, 12:53 installation)
+
+The capture `iphone15pro-open-passage.log` followed from 20:30:48Z until a
+verification pause at 20:31:04Z. All 730 recorded depth candidates in that
+segment were clear, with either no side warning or right-side occupancy.
+Verified targets returned near 1.65 m, but pursuit never resumed. At
+20:31:05.994Z the app reported no camera frames despite normal AR tracking
+and a latest frame age of about 160 ms.
+
+Continuous following's holding threshold was 1.55 m, but goal construction
+called the legacy tracker, which refuses goals at or below 1.75 m. That second
+gate returned before the paused-owner resume logic. Healthy frame diagnostics
+also erased the displayed issue without clearing the unresolved deadline,
+causing timeout formatting to fall back to `noFrames`.
+
+Continuous verified-target goal construction now uses the coordinator's
+existing following/holding decision without the legacy acquisition-distance
+gate. It computes a nonnegative stand-off goal, or the rover position for a
+stationary hold. Successful same-owner resume commits the corresponding
+following/holding phase. Failed goal admission leaves the deadline intact.
+The initial recovery issue is retained independently of live frame health
+until recovery succeeds or the session resets; an unresolved target pause
+therefore cannot become a fictitious no-camera failure.
+
+The regression failed before implementation. Generated sequences cover
+1.50/1.55/1.56/1.65/1.74/1.75/1.76 m with accepted and rejected resume admission.
+They check same-owner resume, stationary hold versus following, goal geometry,
+fixed timeout with healthy frames, and preservation of the target-failure
+message. Existing cancellation, freshness, failed-stop and generation checks
+passed in the full suite.
+Final SDK run: **1,704/1,704 passed**, no retries.
+Bundle: `Test-PhroverSDKTests-2026.11.18_12-51-46--0800.xcresult`.
+Signed Debug build passed. Installed on iPhone 15 Pro at 12:53,
+database sequence **2716**. Artifacts use `near-target-pause-*` in the OpenCode
+temporary directory. Physical passage traversal remains unverified.
+
+## Continuous target centering (November 18, 12:01 installation)
+
+The capture `iphone15pro-centering.log` failed at 19:50:06Z during alignment.
+The target improved from 24.4 to 18.4 degrees off-center; it never reached the
+five-degree gate. Repeated low-confidence hips interrupted discrete turns.
+The user explicitly selected continuous centering rather than tighter
+stationary alignment.
+
+Talk now enables `continuousTargetCentering` with reactive-depth pursuit,
+continuous goals, continuous holding facing, and immediate following.
+After confirmed stopping and distinct fresh verified post-stop observations,
+the coordinator hands the measured target to the pursuit owner regardless
+of bearing. The discrete five-degree entry/handoff gate is inactive in this
+mode. The original SDK mode remains opt-in and unchanged by default.
+Native depth and exact-command admission govern every moving or yaw command.
+Holding uses two-degree entry and one-degree completion hysteresis for sensor
+noise; it no longer accepts a four-degree offset as centered. Moving pursuit
+continues to correct the measured bearing without a five-degree deadband.
+
+Missing target verification clears the measured feed and pauses the same
+pursuit owner, retaining a fixed perception-recovery deadline. Resume requires
+fresh post-stop measured evidence and updates that owner's goal. Repeated
+misses cannot renew the pause; failed stops and cancellation cannot resume.
+Verification outage has a person-specific diagnostic/message. Phase logs
+identify continuous centering and report no discrete alignment tolerance.
+The Talk-specific one-second acquisition hold override was removed, restoring
+the two-second configured default; this override explains why the earlier
+default-only change did not provide Talk with the intended full hold.
+
+Regressions failed before implementation. Generated positive/negative offsets
+cover 24.4-degree pursuit and four-degree holding, distinct post-stop handoff,
+same-owner pause/resume, pre-stop evidence rejection, timeout, cancellation,
+and failed stop. The driver corrects both signs inside the former five-degree
+band with zero translation while holding.
+Full SDK run passed **1,702/1,703** tests. The unchanged
+`ARSharedMissionFrameCalibratorTests.testSuccessfulEmptyScanClearsWrongMarkerFailureOnce`
+had a scanner-feedback scheduling assertion; the complete class passed in
+isolation. All Follow Me tests passed. Conversation ViewModel tests, signed
+Debug build and whitespace checks passed.
+Installed on iPhone 15 Pro at 12:01, database sequence **2708**.
+Artifacts use `continuous-center-*` in the OpenCode temporary directory.
+Physical centering accuracy and small-angle wheel response remain unverified.
+No model-check result is claimed.
+
+## Early frontal warning steering (November 18, 11:48 installation)
+
+The capture `iphone15pro-sofa-steering.log` followed for about six seconds.
+Three gentle avoidance commands received HTTP 200 before a probe-budget miss
+started confirmed-stop depth recovery. The next observation was `clear` with
+zero collision support and no finite collision clearance, but its obstacle
+side was `front`. The driver treated this wider warning-corridor classification
+as terminal despite clear swept-path evidence. Required stopping distance was
+0.20687 m; the warning corridor adds a 0.35 m lead beyond stopping distance.
+These are policy distances, not a measured sofa distance.
+
+With the user's updated policy, early front/bilateral warnings now evaluate
+slow gentle escape arcs. The existing steering preference is tried first;
+otherwise target bearing selects the first direction. A blocked fresh probe
+permits checking the opposite arc, subject to the remaining freshness budget.
+Each accepted arc must have clear exact-command depth, unchanged guard-approved
+wheels, and no flank conflict. Front/bilateral stopping-distance violations,
+unknown-direction blocked paths, and two blocked escape probes still stop.
+Missing or expired evidence uses the existing bounded stopped recovery.
+
+Avoidance retains its direction for 500 ms after the last warning, without
+retaining depth authority. Clear ticks do not renew that preference. Native
+transport independently accepts a front/bilateral warning only for clear depth
+and the bounded gentle shape (peak at most 0.12, inner/outer ratio 0.65).
+New caution, stop, conflicting flank occupancy, or an unprobed ordinary
+command is rejected before sending.
+
+The new early-warning regressions failed before implementation.
+Generated driver scenarios cover front/bilateral warnings, either escape,
+both blocked, preference retention/expiry, and new unknown-direction blockage.
+Native tests cover clear/caution/stop transitions and a new front warning
+on an ordinary command. Existing freshness, cancellation, source-generation,
+stop confirmation and real-depth scene tests remain in the suite.
+Final full SDK run: **1,700/1,700 passed**, no retries.
+Bundle: `Test-PhroverSDKTests-2026.11.18_11-46-07--0800.xcresult`.
+Signed Debug build passed. Installed on iPhone 15 Pro at 11:48,
+database sequence **2700**. Artifacts use `front-warning-*` in the OpenCode
+temporary directory. Physical steering response and clearance remain
+unverified; no model-check result is claimed.
+
+## Alignment verification gaps and narrow search oscillation (November 18, 11:23 installation)
+
+The capture `iphone15pro-after-flank-fix-retry2.log` contains three attempts
+between 19:05 and 19:08Z. None reached forward following. The first and last
+repeatedly rejected low-confidence hips, despite normal AR tracking. The last
+attempt improved alignment from 27 to 10 degrees but exhausted its original
+ten-second recovery episode. A verified person was observed 300 ms before
+expiry. The middle attempt rejected a small negative search response because
+0.138 rad of accumulated yaw travel exceeded the seven-degree threshold,
+although its heading span was only 0.0623 rad and net response was -0.0038 rad.
+
+- Default stopped acquisition-verification grace is now two seconds, capped
+  at two seconds and at any existing recovery deadline. Repeated misses do
+  not renew it. Body-confidence thresholds are unchanged. Motion remains
+  inhibited until a fresh verified post-stop match passes the existing gates.
+- Resuming alignment reuses the confirmed acquisition-hold stop instead of
+  issuing a redundant stop that invalidates the just-accepted frame. Ownership
+  and stop-fence identity are rechecked before reuse. Stale-frame age alone
+  also recognizes the stopped acquisition hold.
+- A recovery deadline reached during alignment with a recent verified person
+  reports alignment timeout rather than claiming person loss. The original
+  recovery deadline remains fixed; actual target loss retains its return wait.
+- Search distinguishes narrow oscillation from large excursions using the
+  observed heading span. Net negative travel still debits sweep progress.
+  Large excursions, cumulative wrong-way motion, incomplete response evidence,
+  failed stops, and the original no-progress watchdog remain terminal.
+
+Both device-pattern regressions failed before the changes. Generated checks
+cover default and explicit short holds, recovery, persistent/late misses,
+cancellation and failed stops, plus mirrored narrow oscillation and existing
+wrong-way/excursion/watchdog cases. A stop-reuse assertion initially counted
+the legitimate post-alignment stop; suspending alignment in the fixture
+isolates the pre-alignment handoff.
+
+Final full SDK run: **1,696/1,696 passed**, no retries.
+Bundle: `Test-PhroverSDKTests-2026.11.18_11-22-10--0800.xcresult`.
+Conversation ViewModel tests and signed Debug build passed. Installed on
+iPhone 15 Pro at 11:23, database sequence **2692**.
+Earlier full run had a scanner-feedback scheduling assertion in unchanged
+`ARSharedMissionFrameCalibratorTests`; that class and the final full run passed.
+Artifacts use `alignment-gap-*` in the OpenCode temporary directory.
+No TLA+ model check was run. Physical turning response, alignment completion,
+and the previous flank-depth recovery still need on-device verification.
+
+## Flank probe freshness recovery (November 18, 11:01 installation)
+
+The iPhone 15 Pro capture `iphone15pro-open-floor-obstacle.log` ended at
+18:46:09Z with clear motion depth and right-side occupancy. The final frame was
+198.243 ms old and evaluation took 18.922 ms. The remaining freshness budget
+could not cover another avoidance probe plus transport reserve. A Boolean
+arc-selection result incorrectly mapped that timing rejection to an obstacle.
+The physical source of the occupied cells is not established by this log.
+
+Arc selection now distinguishes approval, blocked escape, and unavailable depth.
+Insufficient probe budget, expired probes, and missing raw depth enter the
+existing bounded stopped recovery. No command is sent on an unchecked arc.
+Recovery retains confirmed stopping, three approved post-stop captures spanning
+at least 60 ms, the fixed 600 ms deadline, recovery limits, source-generation
+checks, cancellation, and exact-command native transport validation.
+Fresh blocked escapes and front/bilateral occupancy still fail as obstacles.
+Diagnostics distinguish insufficient probe budget, expired probes, and rejected
+escape approval.
+
+The regression failed before the fix. It replays the recorded age and evaluation
+cost through the actual driver for both flanks and generates eight action cases:
+successful recovery, persistent budget misses, cancellation, source reset,
+failed stop, blocked escape, expired probe, and missing probe depth.
+The existing expired-probe test now expects a depth timeout rather than obstacle.
+The full suite passed 1,693 of 1,694 tests, including all pursuit tests.
+`ARSessionManagerTests.testBackgroundDepthResultsCannotSurviveResetOrInterruption`
+timed out awaiting background projection; the entire unchanged class passed
+on isolated rerun. Signed Debug build and whitespace checks passed.
+Installed on iPhone 15 Pro at 11:01, database sequence **2684**.
+
+Artifacts: `flank-budget-red.log`, `flank-budget-focused.log`,
+`flank-budget-full.log`, `flank-budget-session-rerun.log`,
+and `flank-budget-build.log` in the OpenCode temporary directory.
+A small TLA+ stop/wait/resume model was proposed but not model-checked.
+Physical clearance, wheel response, and successful recovery on-device remain
+unverified; simulator tests do not establish physical safety.
+
+## Post-stop target recovery and body diagnostics (November 18, 10:22 installation)
+
+The `follow-post-6528-review-retry.log` capture contains two attempts between
+18:07:14Z and 18:08:02Z. The first repeatedly lost independent torso verification
+during alignment and exhausted the original ten-second recovery episode. The
+second followed for about eight seconds before target evidence expired.
+Its target-refresh window began before stop confirmation: approximately 353 ms
+of the 500 ms interval was consumed before the stopped-wait event, leaving only
+147 ms for new post-stop evidence. The resulting message claimed AR tracking
+loss despite normal AR quality in all 119 recorded perception events.
+All 250 recorded depth candidates were clear; this capture did not exercise
+the directional obstacle policy.
+
+- The driver's fixed 500 ms target-refresh deadline now begins after confirmed
+  stop completion. Fresh evidence must still be captured strictly after that
+  boundary, match the source generation, and pass measured-target validation.
+  Repeated misses cannot renew the deadline. The limit remains two successful
+  refresh opportunities per driver; failed stops and cancellation cannot resume.
+- Target-refresh timeout and exhausted target recovery have distinct internal
+  causes, diagnostic reasons, and person-specific messages. Actual pose/AR
+  failures retain their existing messages. Unconfirmed/failed stops still take
+  precedence over any claim that motion stopped.
+- Target-wait logs record stop start, stop confirmation, deadline and window
+  length. Timeout logs retain the latest target capture timestamp.
+- Body verification now records how many bodies inference returned and up to
+  eight detailed body evaluations. Each shoulder/hip records its confidence,
+  position and rejection reason: missing, invalid/low confidence, nonfinite
+  position, outside image, or outside person box. Geometry rejection identifies
+  insufficient shoulder span, hip span, or torso height. Nonfinite diagnostic
+  numbers serialize as null. All bodies still participate in ambiguity checks,
+  regardless of diagnostic truncation. Acceptance thresholds are unchanged.
+
+Before implementation, regressions failed for the recorded 353 ms stop delay
+and generic AR failure message. Generated stop delays of 150/353/600 ms now
+permit a verified capture delivered 300 ms after stop. Tests also cover missing,
+expired, wrong-generation and pre-stop samples, a fixed non-renewing deadline,
+the two-recovery limit, failed stops, cancellation, native cause propagation,
+and all four joints across six rejection categories. Detailed body diagnostics
+failed before implementation and now pass, including missing/nonfinite payloads
+and ambiguity beyond the eight-body diagnostic cap.
+
+Verification: the full SDK run passed **1,692 of 1,693 tests**. The unchanged
+`HybridBrainTests.testUnavailableOnDeviceWithoutConfiguredCloudRethrowsForMissionFallback`
+failed a log-content assertion; the complete `HybridBrainTests` class passed
+on an isolated rerun. All Follow Me tests passed on the full run.
+Conversation ViewModel tests, signed Debug build and diff whitespace checks
+passed. Installed on HungIphone at 10:22, database sequence **6536**.
+
+Artifacts in the OpenCode temporary directory: `follow-target-window-red.log`,
+`follow-body-diagnostics-red.log`, `follow-target-window-focused.log`,
+`follow-target-window-full.log`, `follow-target-window-cloud-rerun.log`,
+`follow-target-window-viewmodel.log`, and `follow-target-window-build.log`.
+Full SDK bundle: `Test-PhroverSDKTests-2026.11.18_10-19-28--0800.xcresult`.
+A TLA+ stop/wait/resume/cancel model was proposed but not model-checked.
+The cause of physical-session torso-verification misses is not yet established;
+the new joint diagnostics are intended to resolve it on the next device capture.
+
 ## Stop ahead, steer away from flank obstacles (November 17, 20:26 installation)
 
 The latest log was pulled to `follow-obstacle-direction-review-retry.log` after

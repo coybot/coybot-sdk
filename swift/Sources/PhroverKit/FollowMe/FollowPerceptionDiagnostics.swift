@@ -104,6 +104,21 @@ extension FollowPerceptionDiagnostics {
         result["person_body_verification"] = facts?.personVerification.map { .array($0.map { decision in .object([
             "raw_person_id": .number(Double(decision.rawPersonID)), "accepted": .bool(decision.accepted),
             "reason": .string(decision.reason), "matching_bodies": .number(Double(decision.matchingBodies)),
+            "body_count": decision.bodyCount.map { .number(Double($0)) } ?? .null,
+            "body_evaluations": .array(decision.bodyEvaluations.map { body in
+                .object(["accepted": .bool(body.accepted),
+                    "rejection_reasons": .array(body.rejectionReasons.map { .string($0) }),
+                    "joints": .array(body.joints.map { joint in
+                        func finite(_ value: Double?) -> FollowDiagnosticValue {
+                            guard let value, value.isFinite else { return .null }
+                            return .number(value)
+                        }
+                        return .object(["name": .string(joint.name), "reason": .string(joint.reason),
+                            "confidence": finite(joint.joint.map { Double($0.confidence) }),
+                            "x": finite(joint.joint.map { Double($0.location.x) }),
+                            "y": finite(joint.joint.map { Double($0.location.y) })])
+                    })])
+            }),
             "input_box": box(decision.inputBox), "normalized_box": box(decision.normalizedBox),
             "box_issue": decision.boxIssue.map { .string($0) } ?? .null,
             "verified_depth_anchor": decision.depthAnchor.map { .object([

@@ -536,7 +536,8 @@ final class FollowNavigationController {
                  guard owned(), let driver = self.pursuitDriver, !driver.perceptionPaused else {
                      throw FollowPursuitSendFailure(reason: .cancelled, definitelyUnsent: true)
                  }
-                let revision = driver.revision
+                 let revision = driver.revision
+                let capturedTarget = targetFeed?.sample
                 let source = self.readFollowPose()
                 let fence = FollowTurnBurstFence()
                 let entry = self.sourceNow()
@@ -555,6 +556,23 @@ final class FollowNavigationController {
                 }
                 let uptime = self.transportUptime
                 var depthFailure: NavigationFailure?
+                var targetAuthorityChanged = false
+                // A queued measured command may outlive the transition to a
+                // low-speed last-seen approach (or vice versa). Recheck that
+                // authority and its displacement/time limits at native entry.
+                @MainActor func targetAuthorityValid() -> Bool {
+                    let current = targetFeed?.sample
+                    guard capturedTarget?.lastSeenApproach != nil || current?.lastSeenApproach != nil else { return true }
+                    guard let capturedTarget, let current,
+                          current.frameID == capturedTarget.frameID,
+                          current.lastSeenApproach == capturedTarget.lastSeenApproach,
+                          let policy = FollowTargetSpeed.evaluate(current, pose: self.readFollowPose(),
+                              now: self.sourceNow(), maximum: FollowLastSeenApproach.maximumWheelSpeed),
+                          policy.range > policy.stopDistance,
+                          command.left > 0, command.right > 0,
+                          max(command.left, command.right) <= policy.maximumWheelSpeed + 1e-9 else { return false }
+                    return true
+                }
                 let transport = FollowTurnTransportCapture()
                 let authorization = FollowTurnBurstAuthorization(operationID: evidence?.context.controllerOperationID ?? 0,
                     sendEntryUptime: entry, requestedBudget: expiry - entry, uptime: uptime,
@@ -564,7 +582,10 @@ final class FollowNavigationController {
                               self.readFollowPose().rejection(at: self.sourceNow(), expectedGeneration: source.frameID?.generation) == nil else {
                             fence.inhibit(); return false
                         }
-                         guard fence.authorized(at: uptime()) else { return false }
+                          guard fence.authorized(at: uptime()) else { return false }
+                          guard targetAuthorityValid() else {
+                              targetAuthorityChanged = true; fence.inhibit(); return false
+                          }
                          switch self.exactDepthDecision(command, disposition: "pursuit_transport") {
                         case .allow(let accepted, _) where accepted == command: break
                         case .allow: depthFailure = .obstacle
@@ -581,7 +602,10 @@ final class FollowNavigationController {
                               self.readFollowPose().rejection(at: self.sourceNow(), expectedGeneration: source.frameID?.generation) == nil else {
                             fence.inhibit(); return false
                         }
-                        return fence.authorized(at: uptime())
+                         guard targetAuthorityValid() else {
+                             targetAuthorityChanged = true; fence.inhibit(); return false
+                         }
+                         return fence.authorized(at: uptime())
                     }, didEnterAttempt: { transport.record($0) }, transportCapture: transport)
                 if command.left != 0 || command.right != 0 { evidence?.recordStop(.pending) }
                 let result = await FollowTurnBurstTransportScope.$authorization.withValue(authorization) {
@@ -616,7 +640,8 @@ final class FollowNavigationController {
                         transport.attempts.isEmpty && ["expired", "fenced", "cancelled"].contains(result.receipt.outcome)
                     throw FollowPursuitSendFailure(reason: depthFailure ??
                          (denial == .expired ? .depthUnavailable(.staleRawDepth) : .commandFailed), definitelyUnsent: unsent,
-                         authorizationExpired: depthFailure == nil && denial == .expired)
+                          authorizationExpired: depthFailure == nil && denial == .expired,
+                          targetAuthorityChanged: targetAuthorityChanged)
                 }
             }, stop: { try await self.rotationStop(origin: "cleanup") }, sleep: { await self.sleep($0) }, publishPath: { self.path = $0 }, moving: {
                 if self.state != .driving { self.state = .driving; self.publishSafetyState(.moving) }
@@ -3376,11 +3401,15 @@ final class FollowNavigationController {
         var observation = searchDepthObservation(command)
         if FollowPlanningScope.mode == .reactiveDepth, command.left > 0, command.right > 0,
            observation.state == .clear || observation.state == .caution {
-            // Recheck the requested policy at the actual send boundary. A
-            // curved sweep being clear cannot authorize passing a frontal
-            // obstacle, or turning toward newly observed flank occupancy.
+            // Early front/bilateral warnings permit only a bounded slow arc
+            // whose exact sweep is clear. Caution/stop and steering toward a
+            // newly observed flank remain rejected at the send boundary.
+            let passageApproved = observation.passage?.accepts(command) == true
+            let flankAvoidance = observation.passage?.permitsFlankAvoidance(command, side: observation.obstacleSide) == true
             if observation.state == .caution ||
-                observation.obstacleSide == .front || observation.obstacleSide == .both ||
+                (observation.passage != nil && !passageApproved && !flankAvoidance) ||
+                ((observation.obstacleSide == .front || observation.obstacleSide == .both) &&
+                    !FollowPursuitDriver.isSlowObstacleArc(command) && !passageApproved) ||
                 (observation.obstacleSide == .left && command.left <= command.right) ||
                 (observation.obstacleSide == .right && command.right <= command.left) {
                 observation.state = .stop
@@ -3405,6 +3434,17 @@ final class FollowNavigationController {
         var fields: [String: FollowDiagnosticValue] = [
             "depth_state": .string(observation.state.telemetryReason), "depth_age_s": finite(observation.sampleAge),
             "depth_obstacle_side": observation.obstacleSide.map { .string($0.rawValue) } ?? .null,
+            "depth_passage_width_m": observation.passage.map { finite($0.width) } ?? .null,
+            "depth_passage_result": observation.passageRejectionReason.map { .string($0) } ?? .null,
+            "depth_passage_observed_distance_m": observation.passageObservedDistance.map { finite($0) } ?? .null,
+            "depth_passage_boundary_profile_x_z_m": observation.passageBoundaryProfile.map { .string($0) } ?? .null,
+            "depth_passage_required_width_m": observation.passageRequiredWidth.map { finite($0) } ?? .null,
+            "depth_hazard_contacts_x_y_z_travel_source": observation.hazardContactProfile.map { .string($0) } ?? .null,
+            "depth_hazard_sweep": observation.hazardSweepProfile.map { .string($0) } ?? .null,
+            "depth_passage_left_columns": observation.passageLeftColumns.map { .number(Double($0)) } ?? .null,
+            "depth_passage_right_columns": observation.passageRightColumns.map { .number(Double($0)) } ?? .null,
+            "depth_passage_center_lateral_m": observation.passage.map { finite($0.centerLateral) } ?? .null,
+            "depth_passage_lookahead_m": observation.passage.map { finite($0.lookAhead) } ?? .null,
             "depth_coverage_provenance": .string(observation.coverageProvenance),
             "depth_clearance_m": finite(observation.clearance), "depth_support_count": .number(Double(observation.supportCount)),
             "depth_motion_class": .string(observation.motionClass.rawValue), "depth_candidate_disposition": .string(disposition),

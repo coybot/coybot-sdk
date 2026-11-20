@@ -2,6 +2,64 @@ import XCTest
 @testable import PhroverKit
 
 final class PersonBodyVerifierTests: XCTestCase {
+    func testBodyDiagnosticPayloadPreservesMissingAndNonfiniteEvidence() {
+        let decision = PersonBodyVerifier.verify(box: CGRect(x: 0.2, y: 0.1, width: 0.6, height: 0.8),
+            rawPersonID: 0, bodies: [.init(leftShoulder: joint(.nan, 0.75, confidence: .nan),
+                rightShoulder: nil, leftHip: joint(0.43, 0.5), rightHip: joint(0.57, 0.5))])
+        var facts = FollowPerceptionDiagnostics(frameID: .init(generation: 1, sequence: 1), timestamp: 10,
+            inferenceStatus: .executed, inferenceFailureReason: nil, rawDetectorCount: 1, rawPersonCount: 1,
+            projectionAttemptedCount: 0, projectionAcceptedCount: 0, projectionRejectedCount: 0,
+            projectedPersonCount: 0, candidates: [])
+        facts.personVerification = [decision]
+        let payload = FollowPerceptionDiagnostics.payload(facts)
+        guard case .array(let decisions)? = payload["person_body_verification"],
+              case .object(let entry) = decisions[0],
+              case .array(let bodies)? = entry["body_evaluations"],
+              case .object(let body) = bodies[0],
+              case .array(let joints)? = body["joints"],
+              case .object(let left) = joints[0], case .object(let right) = joints[1] else {
+            return XCTFail("Missing joint-level diagnostic payload")
+        }
+        XCTAssertEqual(entry["body_count"], .number(1))
+        XCTAssertEqual(left["reason"], .string("invalid_confidence"))
+        XCTAssertEqual(left["confidence"], .null)
+        XCTAssertEqual(left["x"], .null)
+        XCTAssertEqual(right["reason"], .string("missing"))
+        XCTAssertEqual(right["confidence"], .null)
+        XCTAssertEqual(body["accepted"], .bool(false))
+    }
+    func testJointDiagnosticsExplainRejectionWithoutWeakeningVerification() {
+        let box = CGRect(x: 0.2, y: 0.1, width: 0.6, height: 0.8)
+        let scenarios: [(PersonBodyVerifier.Joint?, String)] = [
+            (nil, "missing"), (joint(0.4, 0.75, confidence: 0.29), "low_confidence"),
+            (joint(0.4, 0.75, confidence: .nan), "invalid_confidence"),
+            (joint(.nan, 0.75), "nonfinite_position"), (joint(-0.01, 0.75), "outside_image"),
+            (joint(0.05, 0.75), "outside_person_box")
+        ]
+        for name in ["left_shoulder", "right_shoulder", "left_hip", "right_hip"] {
+            for (invalid, reason) in scenarios {
+                let original = body()
+                let candidate = PersonBodyVerifier.Body(
+                    leftShoulder: name == "left_shoulder" ? invalid : original.leftShoulder,
+                    rightShoulder: name == "right_shoulder" ? invalid : original.rightShoulder,
+                    leftHip: name == "left_hip" ? invalid : original.leftHip,
+                    rightHip: name == "right_hip" ? invalid : original.rightHip)
+                let decision = PersonBodyVerifier.verify(box: box, rawPersonID: 0, bodies: [candidate])
+                XCTAssertFalse(decision.accepted, "\(name): \(reason)")
+                XCTAssertEqual(decision.reason, "no_matching_body")
+                XCTAssertEqual(decision.bodyCount, 1)
+                XCTAssertEqual(decision.bodyEvaluations.first?.joints.first(where: { $0.name == name })?.reason, reason)
+                XCTAssertNil(decision.depthAnchor)
+            }
+        }
+        let absent = PersonBodyVerifier.verify(box: box, rawPersonID: 0, bodies: [])
+        XCTAssertEqual(absent.bodyCount, 0)
+        let ambiguous = PersonBodyVerifier.verify(box: box, rawPersonID: 0, bodies: Array(repeating: body(), count: 12))
+        XCTAssertEqual(ambiguous.matchingBodies, 12, "Diagnostic truncation must not truncate acceptance checks")
+        XCTAssertEqual(ambiguous.bodyCount, 12)
+        XCTAssertEqual(ambiguous.bodyEvaluations.count, 8)
+        XCTAssertFalse(ambiguous.accepted)
+    }
     func testRecordedEdgeOverrunsRequireIndependentVisibleTorso() {
         let recorded = [
             CGRect(x: 0.6303116232, y: 0.056201756, width: 0.3743521869, height: 0.7421096563),

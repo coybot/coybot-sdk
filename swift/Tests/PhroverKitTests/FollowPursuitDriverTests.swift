@@ -5,6 +5,736 @@ import simd
 
 @MainActor
 final class FollowPursuitDriverTests: XCTestCase {
+    func testClearPassageAlternativeRemainsValidWhenOpeningBecomesAdvisory() async {
+        let f = Fixture()
+        let person = Vec2(3, 0.8)
+        f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+        f.targetSample = { .init(frameID: .init(generation: 1, sequence: f.sequence), timestamp: f.time,
+            position: person, velocity: .zero, standOff: 1.5, minimumDistance: 1.25,
+            centersContinuously: true) }
+        var cells = Set<DepthSafetyCell>()
+        for x in [-16, 9] {
+            for z in 29...50 {
+                for y in 2...8 { cells.insert(.init(lateralIndex: x, heightIndex: y, forwardIndex: z)) }
+            }
+        }
+        var advisoryProbes = 0
+        f.depthProvider = { command in
+            if max(command.left, command.right) > 0.12 {
+                return .init(state: .caution, clearance: 0.528, supportCount: 4,
+                    sampleAge: 0.10, requiredStoppingDistance: 0.199,
+                    motionClass: .classify(command), speedLimit: nil,
+                    passage: .init(centerLateral: -0.12, lookAhead: 1.18, width: 0.96))
+            }
+            let result = DepthSafetyEvaluator.evaluate(.init(timestamp: f.time - 0.109,
+                cells: cells, cellResolution: 0.04, validSampleRatio: 1,
+                geometry: .init(length: 0.30, width: 0.25, minimumCollisionHeight: 0.04,
+                    maximumCollisionHeight: 0.50, lateralSafetyMargin: 0.08),
+                projection: nil, failureReason: nil), command: command, now: f.time,
+                visibilityPolicy: .astralCompatible, includeDiagnosticCoverage: false,
+                minimumObstacleClearance: 0.15)
+            XCTAssertEqual(result.state, .clear)
+            XCTAssertEqual(result.passageRejectionReason, "distant_supported")
+            XCTAssertNil(result.passage, "Advisory geometry must not force normal cruising to slow")
+            advisoryProbes += 1
+            return result
+        }
+        f.onSend = { command in
+            XCTAssertLessThanOrEqual(max(command.left, command.right), 0.12)
+            XCTAssertGreaterThan(command.right, command.left)
+            f.position = person
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertEqual(f.commands.count, 1)
+        XCTAssertEqual(advisoryProbes, 1)
+    }
+
+    func testSteeringResponseRequiresContinuousIneffectiveAcknowledgedArcs() {
+        for direction in [-1.0, 1.0] {
+            for healthy in [false, true] {
+                var response = FollowSteeringResponse()
+                var requests: [Double] = []
+                for step in 0...25 {
+                    let time = Double(step) * 0.1
+                    let peak = [0.35, 0.12, 0.08][step % 3]
+                    let command = direction > 0 ? WheelCommand(left: peak / 2, right: peak) :
+                        WheelCommand(left: peak, right: peak / 2)
+                    if let request = response.observe(command: command,
+                        yaw: healthy ? direction * time * 0.1 : 0,
+                        bearing: direction * (healthy ? max(0.1, 0.35 - time * 0.06) : 0.35),
+                        now: time, eligible: true) { requests.append(request) }
+                }
+                XCTAssertEqual(requests, healthy ? [] : [direction])
+            }
+        }
+        var response = FollowSteeringResponse()
+        for step in 0...30 {
+            XCTAssertNil(response.observe(command: .init(left: 0.06, right: 0.12), yaw: 0,
+                bearing: 0.35, now: Double(step), eligible: true), "Long delivery gaps cannot accumulate response evidence")
+        }
+    }
+
+    func testNearTargetCreepWithNoTranslationSettlesIntoConfirmedHold() async {
+        let f = Fixture()
+        f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+        f.targetSample = { .init(frameID: .init(generation: 1, sequence: f.sequence), timestamp: f.time,
+            position: Vec2(1.7, 0), velocity: .zero, standOff: 1.5, minimumDistance: 1.25,
+            centersContinuously: true) }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertEqual(f.stops, 1)
+        XCTAssertTrue(f.events.contains("near_target_settled_hold"))
+        XCTAssertFalse(f.commands.isEmpty)
+        XCTAssertTrue(f.commands.allSatisfy { max($0.left, $0.right) <= 0.1 })
+    }
+
+    func testCreepResponseDoesNotHoldFarAwayOrWhileMakingProgress() {
+        for eligible in [false, true] {
+            var response = FollowCreepResponse()
+            for step in 0...40 {
+                XCTAssertFalse(response.observe(command: .init(left: 0.04, right: 0.04),
+                    position: .init(Double(step) * 0.005, 0), now: Double(step) * 0.1, eligible: eligible))
+            }
+        }
+    }
+
+    func testWeakArcResponseStopsBeforeBoundedDepthCheckedAlignment() async {
+        for fault in ["none", "blocked_rotation", "stop_failure", "cancel", "no_yaw"] {
+            let f = Fixture()
+            let person = Vec2(3 * cos(0.35), 3 * sin(0.35))
+            f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+            f.targetSample = { .init(frameID: .init(generation: 1, sequence: f.sequence), timestamp: f.time,
+                position: person, velocity: .zero, standOff: 1.5, minimumDistance: 1.25,
+                centersContinuously: true) }
+            f.stopError = fault == "stop_failure"
+            f.onStop = { if fault == "cancel" { f.allowed = false } }
+            var rotated = false
+            f.depthProvider = { command in
+                let rotation = command.left * command.right < 0
+                return .init(state: rotation && fault == "blocked_rotation" ? .stop : .clear,
+                    clearance: 1, supportCount: 3, sampleAge: 0.01, requiredStoppingDistance: 0.15,
+                    motionClass: .classify(command), speedLimit: nil,
+                    obstacleSide: rotation ? nil : .right)
+            }
+            f.onSend = { command in
+                if command.left * command.right < 0 {
+                    XCTAssertGreaterThanOrEqual(f.stops, 1, "Translation must stop before alignment")
+                    XCTAssertEqual(abs(command.left), RoverConfig.minimumRotateWheelSpeed)
+                    rotated = true
+                    if fault != "no_yaw" { f.yaw += 0.31 }
+                } else if rotated {
+                    XCTAssertGreaterThanOrEqual(f.stops, 2, "Alignment must stop before translation resumes")
+                    f.position = person
+                }
+            }
+            let result = await f.driver.run()
+            XCTAssertEqual(result, fault == "none" ? .arrived :
+                fault == "blocked_rotation" ? .failed(.obstacle) :
+                fault == "stop_failure" ? .failed(.commandFailed) :
+                fault == "cancel" ? .cancelled : .failed(.stalled), fault)
+            XCTAssertEqual(rotated, fault == "none" || fault == "no_yaw", fault)
+        }
+    }
+
+    func testWeakSteeringTriesBoundedClearApproachBeforeRotation() async {
+        for scenario in ["straight", "gentle", "new_stop", "cancel", "settled_heading"] {
+        let f = Fixture()
+        let person = Vec2(3 * cos(0.35), 3 * sin(0.35))
+        f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+        f.targetSample = { .init(frameID: .init(generation: 1, sequence: f.sequence), timestamp: f.time,
+            position: person, velocity: .zero, standOff: 1.5, minimumDistance: 1.25,
+            centersContinuously: true) }
+        f.depthProvider = { command in
+            var result = f.observation(age: 0.01)
+            if scenario == "gentle", command.left == command.right { result.state = .stop }
+            if scenario == "new_stop", f.events.contains("steering_approach_started") { result.state = .stop }
+            return result
+        }
+        f.onStop = { if scenario == "cancel" { f.allowed = false } }
+        f.onSend = { command in
+            if scenario == "settled_heading", f.events.contains("steering_approach_completed") {
+                XCTAssertFalse(f.events.contains("steering_alignment_started"))
+                f.position = person
+                return
+            }
+            if f.events.contains("steering_approach_started") || command.left * command.right < 0 {
+                XCTAssertTrue(f.events.contains("steering_approach_started"))
+                XCTAssertGreaterThan(command.left, 0)
+                XCTAssertGreaterThan(command.right, 0)
+                XCTAssertLessThanOrEqual(max(command.left, command.right), 0.12)
+                if scenario == "gentle" { XCTAssertGreaterThan(command.right, command.left) }
+                if scenario == "settled_heading" {
+                    f.position = Vec2(0.16 * cos(0.35), 0.16 * sin(0.35))
+                    f.yaw = 0.35
+                } else {
+                    f.position = person
+                }
+            }
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, scenario == "cancel" ? .cancelled :
+            scenario == "new_stop" ? .failed(.obstacle) : .arrived, scenario)
+        XCTAssertEqual(f.events.contains("steering_approach_started"), scenario != "cancel")
+        XCTAssertFalse(f.events.contains("steering_alignment_started"))
+        if scenario == "settled_heading" { XCTAssertTrue(f.events.contains("steering_approach_completed")) }
+        }
+    }
+
+    func testRejectedTransitionProbeRetainsOnlyAvoidancePreferenceForRecovery() async {
+        let f = Fixture()
+        f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+        f.targetSample = { .init(frameID: .init(generation: 1, sequence: f.sequence), timestamp: f.time,
+            position: Vec2(3, 0), velocity: .zero, standOff: 1.5, minimumDistance: 1.25) }
+        var recoveryProbes = 0
+        var budgetGapInjected = false
+        f.depthProvider = { command in
+            guard !f.commands.isEmpty else { return f.observation(age: 0.01) }
+            if f.stops > 0 {
+                recoveryProbes += 1
+                XCTAssertTrue(FollowPursuitDriver.isSlowObstacleArc(command),
+                    "A rejected transition must not restart with a cruise evaluation")
+            }
+            let budgetGap = f.stops > 0 && !budgetGapInjected && f.events.contains("depth_stability_wait")
+            if budgetGap { budgetGapInjected = true }
+            f.time += 0.0173385
+            return .init(state: .clear, clearance: 1, supportCount: 3,
+                sampleAge: f.stops == 0 ? 0.1895745 : budgetGap ? 0.22 : 0.08, requiredStoppingDistance: 0.15,
+                motionClass: .classify(command), speedLimit: nil, obstacleSide: .right)
+        }
+        f.onSend = { command in
+            if f.commands.count == 2 {
+                XCTAssertGreaterThanOrEqual(recoveryProbes, 3)
+                XCTAssertGreaterThan(command.right, command.left)
+                f.position = Vec2(3, 0)
+            }
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertEqual(f.stops, 1)
+        XCTAssertEqual(f.commands.count, 2)
+        XCTAssertTrue(budgetGapInjected)
+        XCTAssertTrue(f.events.contains("depth_stability_preserved"))
+    }
+
+    func testDistantOpeningKeepsCruiseUntilNearAdjustmentZone() async {
+        let f = Fixture()
+        let person = Vec2(3, 0)
+        f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+        f.targetSample = { .init(frameID: .init(generation: 1, sequence: f.sequence), timestamp: f.time,
+            position: person, velocity: .zero, standOff: 1.5, minimumDistance: 1.25,
+            centersContinuously: true) }
+        f.depthProvider = { command in
+            var cells = Set<DepthSafetyCell>()
+            let depths = f.commands.count < 3 ? 35...50 : 5...25
+            for x in [-11, 10] {
+                for z in depths {
+                    for y in 2...8 { cells.insert(.init(lateralIndex: x, heightIndex: y, forwardIndex: z)) }
+                }
+            }
+            let observation = DepthSafetyEvaluator.evaluate(.init(timestamp: f.time - 0.01,
+                cells: cells, cellResolution: 0.04, validSampleRatio: 1,
+                geometry: .init(length: 0.30, width: 0.25, minimumCollisionHeight: 0.04,
+                    maximumCollisionHeight: 0.50, lateralSafetyMargin: 0),
+                projection: nil, failureReason: nil), command: command, now: f.time,
+                visibilityPolicy: .astralCompatible, includeDiagnosticCoverage: false, minimumObstacleClearance: 0.15)
+            if f.commands.count < 3 {
+                XCTAssertNil(observation.passage)
+                XCTAssertEqual(observation.passageRejectionReason, "distant_supported")
+            }
+            return observation
+        }
+        f.onSend = { command in
+            if f.commands.count <= 3 {
+                XCTAssertGreaterThan(max(command.left, command.right), 0.12, "Clear approach should retain normal speed")
+            } else {
+                XCTAssertLessThanOrEqual(max(command.left, command.right), 0.12)
+                f.position = person
+            }
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertEqual(f.commands.count, 4)
+    }
+
+    func testConflictingPassageAvoidanceIsRecheckedAtNativeEntry() async {
+        for side in [DepthObstacleSide.left, .right, .front, .both] {
+            for fault in ["none", "stop", "opposing_flank"] {
+                let f = ControllerFixture()
+                f.usePlanningPolicy = true
+                var atEntry = false
+                f.beforeAttempt = { atEntry = true }
+                f.depthOverride = { command in
+                    .init(state: atEntry && fault == "stop" ? .stop : .clear,
+                        clearance: 1, supportCount: 5, sampleAge: 0.01, requiredStoppingDistance: 0.15,
+                        motionClass: .classify(command), speedLimit: nil,
+                        obstacleSide: atEntry && fault == "opposing_flank" ? (command.left > command.right ? .right : .left) : side,
+                        passage: .init(centerLateral: side == .right ? 0.42 : -0.42, lookAhead: 1.1, width: 0.92))
+                }
+                let feed = FollowTargetSpeedFeed()
+                feed.sample = .init(frameID: f.sample.frameID!, timestamp: f.clock.value,
+                    position: f.arrival, velocity: .zero, standOff: 1.5, minimumDistance: 1.25,
+                    centersContinuously: true)
+                let result = await FollowTargetSpeedScope.$feed.withValue(feed) {
+                    await FollowPlanningScope.$mode.withValue(.reactiveDepth) { await f.run() }
+                }
+                XCTAssertTrue(atEntry)
+                XCTAssertEqual(result.result, fault == "none" ? .arrived : .failed(.obstacle))
+                XCTAssertEqual(f.commands.count, fault == "none" ? 1 : 0)
+                XCTAssertEqual(result.stopOutcome, .confirmed)
+            }
+        }
+    }
+
+    func testPassageFlickerKeepsSlowSpeedAndConflictingGapYieldsToFlank() async {
+        for conflict in [false, true] {
+            let f = Fixture()
+            let person = Vec2(3, 0)
+            f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+            f.targetSample = { .init(frameID: .init(generation: 1, sequence: f.sequence), timestamp: f.time,
+                position: person, velocity: .zero, standOff: 1.5, minimumDistance: 1.25,
+                centersContinuously: true) }
+            f.depthProvider = { command in
+                var observation = f.observation(age: 0.01)
+                if conflict {
+                    observation.obstacleSide = .right
+                    observation.passage = .init(centerLateral: 0.42, lookAhead: 1.1, width: 0.92)
+                } else if f.commands.isEmpty {
+                    observation.passage = .init(centerLateral: -0.1, lookAhead: 1.1, width: 0.84)
+                }
+                return observation
+            }
+            f.onSend = { command in
+                XCTAssertLessThanOrEqual(max(command.left, command.right), 0.12 + 1e-9)
+                XCTAssertGreaterThan(command.right, command.left, "Keep the left passage preference through detection gaps")
+                if f.commands.count >= 8 { f.position = person }
+            }
+            let result = await f.driver.run()
+            XCTAssertEqual(result, .arrived)
+            XCTAssertEqual(f.commands.count, 8)
+        }
+    }
+
+    func testUnknownSideCautionTriesFreshSlowRouteButNeverOverridesStop() async {
+        for scenario in ["slow", "straight", "blocked", "stop", "stale"] {
+            let f = Fixture()
+            let person = Vec2(3, 0.8)
+            f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+            f.targetSample = { .init(frameID: .init(generation: 1, sequence: f.sequence), timestamp: f.time,
+                position: person, velocity: .zero, standOff: 1.5, minimumDistance: 1.25,
+                centersContinuously: true) }
+            var probes = 0
+            f.depthProvider = { command in
+                probes += 1
+                if scenario == "stale", probes > 1 {
+                    return .unavailable(.malformedDepth, sampleAge: 1, motionClass: .classify(command))
+                }
+                if scenario != "stop", scenario != "blocked",
+                   max(command.left, command.right) <= 0.12,
+                   scenario != "straight" || command.left == command.right {
+                    return f.observation(age: 0.01)
+                }
+                return .init(state: scenario == "stop" ? .stop : .caution,
+                    clearance: scenario == "stop" ? 0.1 : 0.54, supportCount: 3,
+                    sampleAge: 0.11, requiredStoppingDistance: 0.2,
+                    motionClass: .classify(command), speedLimit: 0.12)
+            }
+            f.onSend = { command in
+                XCTAssertLessThanOrEqual(max(command.left, command.right), 0.12)
+                if scenario == "straight" { XCTAssertEqual(command.left, command.right) }
+                f.position = person
+            }
+            let result = await f.driver.run()
+            let succeeds = scenario == "slow" || scenario == "straight"
+            XCTAssertEqual(result, succeeds ? .arrived :
+                scenario == "stale" ? .failed(.depthUnavailable(.malformedDepth)) : .failed(.obstacle), scenario)
+            XCTAssertEqual(f.commands.count, succeeds ? 1 : 0, scenario)
+            if scenario == "stop" { XCTAssertEqual(probes, 1) }
+        }
+    }
+
+    func testFrontalWarningKeepsClearEscapeDespiteConflictingGap() async {
+        for state in [DepthSafetyState.clear, .caution, .stop] {
+            let f = Fixture()
+            let person = Vec2(3, 0.8)
+            f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+            f.targetSample = { .init(frameID: .init(generation: 1, sequence: f.sequence), timestamp: f.time,
+                position: person, velocity: .zero, standOff: 1.5, minimumDistance: 1.25,
+                centersContinuously: true) }
+            f.depthProvider = { command in
+                var observation = f.observation(age: 0.01)
+                observation.obstacleSide = .front
+                observation.passage = .init(centerLateral: 0.1, lookAhead: 0.94, width: 0.76)
+                observation.state = FollowPursuitDriver.isSlowObstacleArc(command) &&
+                    command.right > command.left ? state : .caution
+                return observation
+            }
+            f.onSend = { command in
+                XCTAssertGreaterThan(command.right, command.left)
+                XCTAssertLessThanOrEqual(max(command.left, command.right), 0.12)
+                f.position = person
+            }
+            let result = await f.driver.run()
+            XCTAssertEqual(result, state == .clear ? .arrived : .failed(.obstacle))
+            XCTAssertEqual(f.commands.count, state == .clear ? 1 : 0)
+        }
+    }
+
+    func testMissingPassageCannotRenewDirectionRetention() async {
+        let f = Fixture()
+        let person = Vec2(3, 0)
+        f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+        f.targetSample = { .init(frameID: .init(generation: 1, sequence: f.sequence), timestamp: f.time,
+            position: person, velocity: .zero, standOff: 1.5, minimumDistance: 1.25,
+            centersContinuously: true) }
+        var observedAt: Double?
+        f.depthProvider = { _ in
+            var observation = f.observation(age: 0.01)
+            if f.commands.isEmpty {
+                observedAt = f.time
+                observation.passage = .init(centerLateral: -0.24, lookAhead: 0.66, width: 1.2)
+            }
+            return observation
+        }
+        f.onSend = { command in
+            if f.time - (observedAt ?? f.time) >= 1.5 {
+                XCTAssertEqual(command.left, command.right, "Expired passage must release steering")
+                f.position = person
+            } else {
+                XCTAssertGreaterThan(command.right, command.left)
+            }
+            f.time += 0.4
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .arrived)
+        XCTAssertGreaterThan(f.commands.count, 2)
+    }
+
+    func testLiveDepthPassageCentersBetweenWallsInsteadOfFollowingOffAxisPerson() async {
+        for offset in [-3, 0, 3] {
+            let f = Fixture()
+            f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+            let person = Vec2(3 * cos(0.3), 3 * sin(0.3))
+            f.targetSample = {
+                .init(frameID: .init(generation: 1, sequence: f.sequence), timestamp: f.time,
+                    position: person, velocity: .zero, standOff: 1.5, minimumDistance: 1.25,
+                    centersContinuously: true)
+            }
+            var cells = Set<DepthSafetyCell>()
+            for lateral in [-11 + offset, 10 + offset] {
+                for forward in 5...25 {
+                    for height in 2...8 {
+                        cells.insert(.init(lateralIndex: lateral, heightIndex: height, forwardIndex: forward))
+                    }
+                }
+            }
+            var probes: [String] = []
+            f.depthProvider = { command in
+                let observation = DepthSafetyEvaluator.evaluate(.init(timestamp: f.time - 0.01, cells: cells, cellResolution: 0.04,
+                    validSampleRatio: 1, geometry: .init(length: 0.30, width: 0.25,
+                        minimumCollisionHeight: 0.04, maximumCollisionHeight: 0.50, lateralSafetyMargin: 0),
+                    projection: nil, failureReason: nil), command: command, now: f.time,
+                    visibilityPolicy: .astralCompatible, includeDiagnosticCoverage: false, minimumObstacleClearance: 0.15)
+                probes.append("\(command): \(observation.state), side=\(String(describing: observation.obstacleSide)), passage=\(String(describing: observation.passage))")
+                return observation
+            }
+            f.onSend = { command in
+                XCTAssertLessThanOrEqual(max(command.left, command.right), 0.12)
+                if offset == 0 {
+                    XCTAssertEqual(command.left, command.right, accuracy: 1e-9,
+                        "An off-axis person must not pull the rover into a doorway edge")
+                } else {
+                    XCTAssertEqual(command.left > command.right, offset > 0,
+                        "Positive passage offset is rover-right")
+                }
+                f.position = person
+            }
+            let result = await f.driver.run()
+            XCTAssertEqual(result, .arrived, "offset=\(offset), probes=\(probes)")
+            XCTAssertEqual(f.commands.count, 1, "offset=\(offset)")
+        }
+    }
+
+    func testLastSeenApproachHasFixedTimeDistanceAndStandOffLimits() async {
+        for limit in ["time", "distance", "stand_off", "obstacle", "depth", "source_reset", "cancel"] {
+            let f = Fixture()
+            if limit == "stand_off" { f.position = Vec2(0.8, 0) }
+            let origin = f.position
+            let observedAt = f.time
+            f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+            f.targetSample = {
+                .init(frameID: .init(generation: 1, sequence: 1), timestamp: observedAt,
+                    position: Vec2(2.5, 0), velocity: Vec2(10, 0), standOff: 1.5, minimumDistance: 1.25,
+                    centersContinuously: true, lastSeenApproach: .init(origin: origin))
+            }
+            f.depthProvider = { command in
+                if limit == "depth", !f.commands.isEmpty {
+                    return .unavailable(.missingRawDepth, sampleAge: .infinity, motionClass: .classify(command))
+                }
+                if limit == "obstacle", !f.commands.isEmpty {
+                    return .init(state: .stop, clearance: 0.1, supportCount: 5, sampleAge: 0.01,
+                        requiredStoppingDistance: 0.15, motionClass: .classify(command), speedLimit: nil,
+                        obstacleSide: .front)
+                }
+                return f.observation(age: 0.01)
+            }
+            f.onSend = { command in
+                XCTAssertLessThanOrEqual(max(command.left, command.right), 0.12)
+                XCTAssertGreaterThan(min(command.left, command.right), 0)
+                switch limit {
+                case "time": f.time = observedAt + 3.01
+                case "distance": f.position = Vec2(0.51, 0)
+                case "stand_off": f.position = Vec2(1, 0)
+                case "source_reset": f.generation += 1
+                case "cancel": f.allowed = false
+                default: break
+                }
+            }
+            let result = await f.driver.run()
+            XCTAssertEqual(result, limit == "obstacle" ? .failed(.obstacle) :
+                limit == "depth" ? .failed(.depthUnavailable(.missingRawDepth)) :
+                limit == "source_reset" ? .failed(.trackingLost) : limit == "cancel" ? .cancelled : .arrived)
+            XCTAssertEqual(f.commands.count, 1, limit)
+            if limit == "depth" { XCTAssertEqual(f.stops, 1) }
+        }
+    }
+
+    func testNativeEntryRechecksLastSeenDisplacementAndAuthorityChanges() async {
+        for transition in ["before_depth", "during_depth", "measured_to_memory"] {
+            let f = ControllerFixture()
+            f.usePlanningPolicy = true
+            let feed = FollowTargetSpeedFeed()
+            feed.sample = .init(frameID: f.sample.frameID!, timestamp: f.clock.value,
+                position: Vec2(2.5, 0), velocity: .zero, standOff: 1.5, minimumDistance: 1.25,
+                centersContinuously: true,
+                lastSeenApproach: transition == "measured_to_memory" ? nil : .init(origin: .zero))
+            var atEntry = false, attempts = 0
+            f.beforeAttempt = {
+                atEntry = true
+                attempts += 1
+                if transition == "before_depth" { f.position = Vec2(0.51, 0) }
+                if transition == "measured_to_memory" { feed.sample?.lastSeenApproach = .init(origin: .zero) }
+            }
+            f.depthOverride = { command in
+                if atEntry, transition == "during_depth" { f.position = Vec2(0.51, 0) }
+                return .init(state: .clear, clearance: 2, supportCount: 0, sampleAge: 0.01,
+                    requiredStoppingDistance: 0.15, motionClass: .classify(command), speedLimit: nil)
+            }
+            let result = await FollowTargetSpeedScope.$feed.withValue(feed) {
+                await FollowPlanningScope.$mode.withValue(.reactiveDepth) { await f.run() }
+            }
+            XCTAssertEqual(result.result, .arrived)
+            XCTAssertEqual(result.stopOutcome, .confirmed)
+            XCTAssertEqual(f.commands.count, transition == "measured_to_memory" ? 1 : 0)
+            if let command = f.commands.first {
+                XCTAssertGreaterThan(attempts, 1, "Reject the queued fast measured command before memory approach")
+                XCTAssertLessThanOrEqual(max(command.left, command.right), 0.12)
+            }
+        }
+    }
+
+    func testAvoidanceStrengthensCenteringAsVerifiedTargetApproachesImageEdge() async {
+        for side in [DepthObstacleSide.left, .right] {
+            let f = Fixture()
+            f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+            let angles = [10.0, 20, 27, 35, 10]
+            f.targetSample = {
+                let angle = angles[min(f.commands.count, angles.count - 1)] * .pi / 180 * (side == .right ? 1 : -1)
+                return .init(frameID: .init(generation: 1, sequence: f.sequence), timestamp: f.time,
+                    position: Vec2(3 * cos(angle), 3 * sin(angle)), velocity: .zero,
+                    standOff: 1.5, minimumDistance: 1.25, centersContinuously: true)
+            }
+            var approved: [WheelCommand] = []
+            f.depthProvider = { command in
+                approved.append(command)
+                f.time += 0.014871
+                return .init(state: .clear, clearance: 1, supportCount: 0, sampleAge: f.commands.isEmpty ? 0.01 : 0.203627,
+                    requiredStoppingDistance: 0.15, motionClass: .classify(command),
+                    speedLimit: nil, obstacleSide: side)
+            }
+            f.onSend = { command in
+                XCTAssertEqual(command.left > command.right, side == .left)
+                XCTAssertEqual(approved.last, command, "Every curvature must receive exact depth approval")
+                XCTAssertGreaterThan(min(command.left, command.right), 0)
+                XCTAssertLessThanOrEqual(max(command.left, command.right), 0.12)
+                if f.commands.count > 1 {
+                    XCTAssertEqual(approved.count, 1, "Adaptive retained curve must fit the recorded single-assessment budget")
+                }
+                approved.removeAll()
+                if f.commands.count == angles.count { f.position = Vec2(3, 0) }
+            }
+            let result = await f.driver.run()
+            XCTAssertEqual(result, .arrived)
+            XCTAssertEqual(f.stops, 0)
+            let yawRequests = f.commands.map { abs($0.left - $0.right) }
+            guard yawRequests.count == angles.count else { XCTFail("Missing steering sequence"); continue }
+            XCTAssertGreaterThan(yawRequests[1], yawRequests[0])
+            XCTAssertGreaterThan(yawRequests[2], 2 * yawRequests[0], "Recorded 27° drift needs stronger centering")
+            XCTAssertGreaterThanOrEqual(yawRequests[3], yawRequests[2])
+            XCTAssertEqual(yawRequests[4], yawRequests[0], accuracy: 1e-9)
+        }
+    }
+
+    func testAdaptiveAvoidanceRequiresClearNativeSweepAndRejectsNewOpposingFlank() async {
+        for direction in [-1.0, 1.0] {
+            for fault in 0...3 {
+                let f = ControllerFixture()
+                f.usePlanningPolicy = true
+                f.arrival = Vec2(3 * cos(0.47), direction * 3 * sin(0.47))
+                var atEntry = false
+                f.beforeAttempt = { atEntry = true }
+                f.depthOverride = { command in
+                    let side: DepthObstacleSide = atEntry && fault == 3
+                        ? (direction > 0 ? .left : .right) : .front
+                    return .init(state: atEntry && fault == 1 ? .caution : atEntry && fault == 2 ? .stop : .clear,
+                        clearance: 1, supportCount: 5, sampleAge: 0.01, requiredStoppingDistance: 0.15,
+                        motionClass: .classify(command), speedLimit: nil, obstacleSide: side)
+                }
+                let feed = FollowTargetSpeedFeed()
+                feed.sample = .init(frameID: f.sample.frameID!, timestamp: f.clock.value,
+                    position: f.arrival, velocity: .zero, standOff: 1.5, minimumDistance: 1.25,
+                    centersContinuously: true)
+                let result = await FollowTargetSpeedScope.$feed.withValue(feed) {
+                    await FollowPlanningScope.$mode.withValue(.reactiveDepth) { await f.run() }
+                }
+                XCTAssertTrue(atEntry)
+                XCTAssertEqual(result.result, fault == 0 ? .arrived : .failed(.obstacle))
+                XCTAssertEqual(f.commands.count, fault == 0 ? 1 : 0)
+                XCTAssertEqual(result.stopOutcome, .confirmed)
+                if let command = f.commands.first {
+                    XCTAssertGreaterThan(abs(command.left - command.right), 0.084)
+                    XCTAssertEqual(command.right > command.left, direction > 0)
+                    XCTAssertLessThanOrEqual(max(command.left, command.right), 0.12)
+                }
+            }
+        }
+    }
+
+    func testRetainedAvoidanceFitsRecordedDepthBudgetWithoutRecoveryStops() async {
+        // Recorded capture age/evaluation cost left enough time for one candidate
+        // and native admission, but not pursuit + a second avoidance probe.
+        for side in [DepthObstacleSide.left, .right] {
+            for age in [0.198243, 0.203627] {
+                let f = Fixture()
+                f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+                f.targetSample = {
+                    .init(frameID: .init(generation: 1, sequence: f.sequence), timestamp: f.time,
+                        position: Vec2(3, 0), velocity: .zero, standOff: 1.5, minimumDistance: 1.25)
+                }
+                var evaluations = 0
+                f.depthProvider = { command in
+                    evaluations += 1
+                    let sampleAge = f.commands.isEmpty ? 0.01 : age
+                    f.time += 0.014871
+                    return .init(state: .clear, clearance: 1, supportCount: 0, sampleAge: sampleAge,
+                        requiredStoppingDistance: 0.23, motionClass: .classify(command),
+                        speedLimit: nil, obstacleSide: side)
+                }
+                f.onSend = { command in
+                    XCTAssertEqual(command.left > command.right, side == .left)
+                    XCTAssertLessThanOrEqual(max(command.left, command.right), 0.12)
+                    if f.commands.count > 1 {
+                        XCTAssertEqual(evaluations, 1, "Retained arc needs one fresh assessment")
+                        XCTAssertGreaterThan(f.expiries.last! - f.time, 0.024871)
+                    }
+                    evaluations = 0
+                    if f.commands.count == 8 { f.position = Vec2(3, 0) }
+                }
+                let result = await f.driver.run()
+                XCTAssertEqual(result, .arrived, "side \(side), age \(age)")
+                XCTAssertEqual(f.commands.count, 8)
+                XCTAssertEqual(f.stops, 0)
+            }
+        }
+    }
+
+    func testRetainedAvoidanceRechecksChangedDepthBeforeSending() async {
+        for initialSide in [DepthObstacleSide.left, .right] {
+            for fault in 0...5 {
+                let f = Fixture()
+                f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+                f.targetSample = {
+                    .init(frameID: .init(generation: f.generation, sequence: f.sequence), timestamp: f.time,
+                        position: Vec2(3, 0), velocity: .zero, standOff: 1.5, minimumDistance: 1.25)
+                }
+                f.depthProvider = { command in
+                    let changed = !f.commands.isEmpty
+                    if changed, fault == 3 {
+                        return .unavailable(.missingRawDepth, sampleAge: .infinity, motionClass: .classify(command))
+                    }
+                    let side: DepthObstacleSide? = !changed ? initialSide :
+                        fault == 0 ? .front : fault == 1 ? .both : fault == 2 ? nil :
+                        (initialSide == .left ? .right : .left)
+                    return .init(state: changed && fault < 3 ? .stop : .clear,
+                        clearance: changed && fault < 3 ? 0.1 : 1, supportCount: 5,
+                        sampleAge: changed && fault == 4 ? 0.3 : 0.01,
+                        requiredStoppingDistance: 0.23, motionClass: .classify(command),
+                        speedLimit: nil, obstacleSide: side)
+                }
+                f.onSend = { command in
+                    if f.commands.count == 2 {
+                        XCTAssertEqual(fault, 5, "Blocked/stale/missing depth cannot authorize motion")
+                        XCTAssertEqual(command.left > command.right, initialSide == .right)
+                        f.position = Vec2(3, 0)
+                    }
+                }
+                let result = await f.driver.run()
+                if fault < 3 { XCTAssertEqual(result, .failed(.obstacle)) }
+                else if fault == 5 { XCTAssertEqual(result, .arrived) }
+                else {
+                    XCTAssertEqual(result, .failed(.depthUnavailable(fault == 3 ? .missingRawDepth : .staleRawDepth)))
+                    XCTAssertEqual(f.stops, 1)
+                }
+                XCTAssertEqual(f.commands.count, fault == 5 ? 2 : 1)
+            }
+        }
+    }
+
+    func testRetainedAvoidanceStillRequiresNativeExactCommandApproval() async {
+        for fault in 0...2 {
+            let f = ControllerFixture()
+            f.usePlanningPolicy = true
+            var atSecondEntry = false
+            f.depthOverride = { command in
+                .init(state: atSecondEntry && fault != 2 ? (fault == 0 ? .stop : .caution) : .clear,
+                    clearance: atSecondEntry ? 0.1 : 1, supportCount: 5, sampleAge: 0.01,
+                    requiredStoppingDistance: 0.23, motionClass: .classify(command), speedLimit: nil,
+                    obstacleSide: atSecondEntry ? (fault == 2 ? .right : .front) : .left)
+            }
+            f.beforeAttempt = { atSecondEntry = !f.commands.isEmpty }
+            let feed = FollowTargetSpeedFeed()
+            feed.sample = .init(frameID: f.sample.frameID!, timestamp: f.clock.value,
+                position: Vec2(3, 0), velocity: .zero, standOff: 1.5, minimumDistance: 1.25)
+            f.afterSend = { f.position = .zero }
+            let result = await FollowTargetSpeedScope.$feed.withValue(feed) {
+                await FollowPlanningScope.$mode.withValue(.reactiveDepth) { await f.run() }
+            }
+            XCTAssertTrue(atSecondEntry)
+            XCTAssertEqual(result.result, .failed(.obstacle))
+            XCTAssertEqual(f.commands.count, 1, "Retained arc must be rejected before the second native send")
+            XCTAssertEqual(result.stopOutcome, .confirmed)
+        }
+    }
+
+    func testContinuousHoldingCorrectsInsideFormerFiveDegreeBand() async {
+        for degrees in [-4.0, 4.0] {
+            let f = Fixture()
+            f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+            f.targetSample = {
+                let bearing = f.commands.isEmpty ? degrees * .pi / 180 : 0
+                return .init(frameID: .init(generation: 1, sequence: f.sequence), timestamp: f.time,
+                    position: Vec2(1.5 * cos(bearing), 1.5 * sin(bearing)), velocity: .zero,
+                    standOff: 1.5, minimumDistance: 1.25, holdsTranslation: true, centersContinuously: true)
+            }
+            let result = await f.driver.run()
+            XCTAssertEqual(result, .arrived)
+            XCTAssertEqual(f.commands.count, 1)
+            if let command = f.commands.first {
+                XCTAssertEqual(command.left, -command.right)
+                XCTAssertEqual(command.right > 0, degrees > 0)
+            }
+        }
+    }
     func testRealDepthCellsDriveMirroredSideAvoidanceAndFrontalStop() async {
         for lateral in [-6, 5, 0] {
             let f = Fixture()
@@ -77,9 +807,71 @@ final class FollowPursuitDriverTests: XCTestCase {
         }
     }
 
+    func testRecordedFlankProbeBudgetStopsAndRecoversInsteadOfReportingObstacle() async {
+        for side in [DepthObstacleSide.left, .right] {
+            for fault in 0...7 {
+                let f = Fixture()
+                f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+                f.targetSample = {
+                    .init(frameID: .init(generation: f.generation, sequence: f.sequence), timestamp: f.time,
+                        position: Vec2(3, 0), velocity: .zero, standOff: 1.5, minimumDistance: 1.25)
+                }
+                var stoppedAt: Double?
+                f.onStop = {
+                    stoppedAt = f.time
+                    if fault == 2 { f.driver.inhibit() }
+                    if fault == 3 { f.generation += 1 }
+                }
+                f.stopError = fault == 4
+                f.depthProvider = { command in
+                    guard !f.commands.isEmpty else { return f.observation(age: 0.01) }
+                    let escape = abs(min(command.left, command.right) / max(command.left, command.right) - 0.65) < 1e-9
+                    if f.stops == 0, escape, fault == 7 {
+                        return .unavailable(.missingRawDepth, sampleAge: .infinity, motionClass: .classify(command))
+                    }
+                    if f.stops == 0, escape, fault == 6 { return f.observation(age: 0.3) }
+                    let budgetMiss = (f.stops == 0 && fault < 6) || fault == 1
+                    // Permanent starvation must fail even after recovery avoids
+                    // the redundant cruise probe; a single sweep cannot fit.
+                    let age = fault == 1 ? 0.23 : budgetMiss ? 0.198243 : 0.01
+                    f.time += 0.018922
+                    return .init(state: fault == 5 && f.stops > 0 ? .stop : .clear,
+                        clearance: 1, supportCount: 0, sampleAge: age,
+                        requiredStoppingDistance: 0.23345, motionClass: .classify(command),
+                        speedLimit: nil, obstacleSide: side)
+                }
+                f.onSend = { command in
+                    if f.commands.count == 2 {
+                        XCTAssertNotNil(stoppedAt)
+                        XCTAssertGreaterThan(f.time - stoppedAt!, 0.06)
+                        XCTAssertEqual(command.left > command.right, side == .left)
+                        f.position = Vec2(3, 0)
+                    }
+                }
+                let result = await f.driver.run()
+                let expected: NavigationResult
+                switch fault {
+                case 0, 6, 7: expected = .arrived
+                case 1: expected = .failed(.depthUnavailable(.staleRawDepth))
+                case 2: expected = .cancelled
+                case 3: expected = .failed(.trackingLost)
+                case 4: expected = .failed(.commandFailed)
+                default: expected = .failed(.obstacle)
+                }
+                XCTAssertEqual(result, expected, "side \(side), fault \(fault)")
+                XCTAssertEqual(f.commands.count, fault == 0 || fault >= 6 ? 2 : 1)
+                XCTAssertEqual(f.stops, 1)
+                if fault == 1 {
+                    XCTAssertLessThanOrEqual(f.time - stoppedAt!, 0.65)
+                    XCTAssertEqual(f.driver.failureCause, .pursuitDepthRefreshTimeout)
+                }
+            }
+        }
+    }
+
     func testReactiveFrontAndBothSidesStopWithoutTryingAnyArc() async {
         for side in [DepthObstacleSide.front, .both] {
-            for state in [DepthSafetyState.clear, .caution, .stop] {
+            for state in [DepthSafetyState.stop] {
                 let f = Fixture()
                 f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
                 f.targetSample = {
@@ -99,6 +891,82 @@ final class FollowPursuitDriverTests: XCTestCase {
                 XCTAssertEqual(probes, 1)
             }
         }
+    }
+
+    func testEarlyFrontalWarningTriesFreshSlowArcsAndRetainsAvoidanceBriefly() async {
+        for side in [DepthObstacleSide.front, .both] {
+            for escape in [-1, 0, 1] {
+                let f = Fixture()
+                f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+                f.targetSample = {
+                    .init(frameID: .init(generation: 1, sequence: f.sequence), timestamp: f.time,
+                        position: Vec2(3, 0), velocity: .zero, standOff: 1.5, minimumDistance: 1.25)
+                }
+                f.depthProvider = { command in
+                    let direction = command.right > command.left ? 1 : -1
+                    let slow = max(command.left, command.right) <= 0.12 && command.left != command.right
+                    let approved = slow && direction == escape
+                    return .init(state: approved || !slow ? .clear : .stop,
+                        clearance: approved || !slow ? .infinity : 0.1, supportCount: approved ? 0 : 5,
+                        sampleAge: 0.01, requiredStoppingDistance: 0.20687,
+                        motionClass: .classify(command), speedLimit: nil,
+                        obstacleSide: f.commands.isEmpty ? side : nil)
+                }
+                f.onSend = { command in
+                    XCTAssertLessThanOrEqual(max(command.left, command.right), 0.12)
+                    XCTAssertEqual(command.right > command.left, escape == 1)
+                    if f.commands.count == 2 { f.position = Vec2(3, 0) }
+                }
+                let result = await f.driver.run()
+                XCTAssertEqual(result, escape == 0 ? .failed(.obstacle) : .arrived)
+                XCTAssertEqual(f.commands.count, escape == 0 ? 0 : 2)
+            }
+        }
+    }
+
+    func testAvoidancePreferenceExpiresAndCannotAuthorizeUnknownBlockedPath() async {
+        for blocked in [false, true] {
+            let f = Fixture()
+            f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+            f.targetSample = {
+                .init(frameID: .init(generation: 1, sequence: f.sequence), timestamp: f.time,
+                    position: Vec2(3, 0), velocity: .zero, standOff: 1.5, minimumDistance: 1.25)
+            }
+            f.depthProvider = { command in
+                .init(state: blocked && !f.commands.isEmpty ? .stop : .clear,
+                    clearance: blocked ? 0.1 : .infinity, supportCount: blocked ? 5 : 0,
+                    sampleAge: 0.01, requiredStoppingDistance: 0.15, motionClass: .classify(command),
+                    speedLimit: nil, obstacleSide: f.commands.isEmpty ? .right : nil)
+            }
+            f.onSend = { command in
+                if f.commands.count < 3 {
+                    XCTAssertLessThanOrEqual(max(command.left, command.right), 0.12)
+                } else {
+                    XCTAssertGreaterThan(max(command.left, command.right), 0.12)
+                    f.position = Vec2(3, 0)
+                }
+                if f.commands.count == 2 { f.time += 0.51 }
+            }
+            let result = await f.driver.run()
+            XCTAssertEqual(result, blocked ? .failed(.obstacle) : .arrived)
+            XCTAssertEqual(f.commands.count, blocked ? 1 : 3)
+        }
+    }
+
+    func testNewFrontWarningAtNativeEntryRejectsUnprobedFastCommand() async {
+        let f = ControllerFixture()
+        f.usePlanningPolicy = true
+        var atEntry = false
+        f.depthOverride = { command in
+            .init(state: .clear, clearance: .infinity, supportCount: 0, sampleAge: 0.01,
+                requiredStoppingDistance: 0.15, motionClass: .classify(command), speedLimit: nil,
+                obstacleSide: atEntry ? .front : nil)
+        }
+        f.beforeAttempt = { atEntry = true }
+        let result = await FollowPlanningScope.$mode.withValue(.reactiveDepth) { await f.run() }
+        XCTAssertEqual(result.result, .failed(.obstacle))
+        XCTAssertTrue(f.commands.isEmpty)
+        XCTAssertEqual(result.stopOutcome, .confirmed)
     }
 
     func testHoldingTurnRequiresNativeTransportDepthApproval() async {
@@ -239,7 +1107,7 @@ final class FollowPursuitDriverTests: XCTestCase {
             var obstructed = false
             f.depthOverride = { command in
                 let allowed = command.right > command.left && command.left > 0
-                return .init(state: allowed ? .clear : .stop, clearance: allowed ? 1 : 0.1,
+                return .init(state: allowed && !obstructed ? .clear : .stop, clearance: allowed && !obstructed ? 1 : 0.1,
                     supportCount: 5, sampleAge: 0.01, requiredStoppingDistance: 0.15,
                     motionClass: .classify(command), speedLimit: nil, obstacleSide: obstructed ? .front : .right)
             }
@@ -253,6 +1121,34 @@ final class FollowPursuitDriverTests: XCTestCase {
             XCTAssertEqual(result.result, obstructAtEntry ? .failed(.obstacle) : .arrived)
             XCTAssertEqual(f.commands.count, obstructAtEntry ? 0 : 1)
             XCTAssertEqual(result.stopOutcome, .confirmed)
+        }
+    }
+
+    func testEarlyFrontalArcRequiresClearExactCommandAtNativeEntry() async {
+        for entryState in [DepthSafetyState.clear, .caution, .stop] {
+            let f = ControllerFixture()
+            f.usePlanningPolicy = true
+            f.arrival = Vec2(3, 0)
+            var atEntry = false
+            f.depthOverride = { command in
+                .init(state: atEntry ? entryState : .clear, clearance: atEntry && entryState != .clear ? 0.1 : .infinity,
+                    supportCount: 0, sampleAge: 0.01, requiredStoppingDistance: 0.20687,
+                    motionClass: .classify(command), speedLimit: nil, obstacleSide: .front)
+            }
+            f.beforeAttempt = { atEntry = true }
+            let feed = FollowTargetSpeedFeed()
+            feed.sample = .init(frameID: f.sample.frameID!, timestamp: f.clock.value,
+                position: Vec2(3, 0), velocity: .zero, standOff: 1.5, minimumDistance: 1.25)
+            let result = await FollowTargetSpeedScope.$feed.withValue(feed) {
+                await FollowPlanningScope.$mode.withValue(.reactiveDepth) { await f.run() }
+            }
+            XCTAssertEqual(result.result, entryState == .clear ? .arrived : .failed(.obstacle))
+            XCTAssertEqual(f.commands.count, entryState == .clear ? 1 : 0)
+            XCTAssertEqual(result.stopOutcome, .confirmed)
+            if let command = f.commands.first {
+                XCTAssertLessThanOrEqual(max(command.left, command.right), 0.12)
+                XCTAssertEqual(min(command.left, command.right) / max(command.left, command.right), 0.65, accuracy: 1e-9)
+            }
         }
     }
 
@@ -285,7 +1181,12 @@ final class FollowPursuitDriverTests: XCTestCase {
                 }
             }
             let result = await f.driver.run()
-            XCTAssertEqual(result, scenario < 2 ? .arrived : .failed(.obstacle), "scenario \(scenario)")
+            XCTAssertEqual(result, scenario < 2 ? .arrived :
+                scenario == 3 ? .failed(.depthUnavailable(.staleRawDepth)) : .failed(.obstacle), "scenario \(scenario)")
+            if scenario == 3 {
+                XCTAssertEqual(f.stops, 1)
+                XCTAssertEqual(f.driver.failureCause, .pursuitDepthRefreshTimeout)
+            }
             XCTAssertEqual(f.commands.count, scenario < 2 ? 2 : 1)
         }
     }
@@ -297,6 +1198,67 @@ final class FollowPursuitDriverTests: XCTestCase {
         XCTAssertEqual(result, .failed(.trackingLost))
         XCTAssertTrue(f.commands.isEmpty)
         XCTAssertEqual(f.stops, 1)
+        XCTAssertEqual(f.driver.failureCause, .pursuitTargetRefreshTimeout)
+    }
+
+    func testTargetRecoveryAllowsFullPostStopWindowDespiteDelayedAcknowledgement() async {
+        for stopDelay in [0.15, 0.353, 0.6] {
+            let f = Fixture()
+            var stoppedAt: Double?
+            f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+            f.targetSample = {
+                let recovered = stoppedAt.map { f.time >= $0 + 0.3 } ?? false
+                return .init(frameID: .init(generation: 1, sequence: f.sequence),
+                    timestamp: f.commands.isEmpty || recovered ? f.time : f.time - 0.6,
+                    position: Vec2(3, 0.5), velocity: .zero, standOff: 1.5, minimumDistance: 1.25)
+            }
+            f.onStop = {
+                f.time += stopDelay
+                stoppedAt = f.time
+            }
+            f.onSend = { _ in
+                if f.commands.count == 2 {
+                    XCTAssertGreaterThanOrEqual(f.time - stoppedAt!, 0.3)
+                    XCTAssertLessThan(f.time - stoppedAt!, 0.5)
+                    f.position = Vec2(3, 0.5)
+                }
+            }
+            let result = await f.driver.run()
+            XCTAssertEqual(result, .arrived, "stop delay \(stopDelay)")
+            XCTAssertEqual(f.commands.count, 2)
+            XCTAssertEqual(f.stops, 1)
+            XCTAssertNil(f.driver.failureCause)
+        }
+    }
+
+    func testNativeTargetTimeoutCarriesSpecificCauseAndConfirmedStop() async {
+        let f = ControllerFixture()
+        f.usePlanningPolicy = true
+        let result = await FollowTargetSpeedScope.$feed.withValue(FollowTargetSpeedFeed()) {
+            await FollowPlanningScope.$mode.withValue(.reactiveDepth) { await f.run() }
+        }
+        XCTAssertEqual(result.result, .failed(.trackingLost))
+        XCTAssertEqual(result.failure?.context.failureCause, .pursuitTargetRefreshTimeout)
+        XCTAssertEqual(result.stopOutcome, .confirmed)
+        XCTAssertTrue(f.commands.isEmpty)
+        if let failure = result.failure {
+            XCTAssertFalse(FollowMotionFailureResolution(failure).message.contains("AR tracking"))
+        }
+    }
+
+    func testRepeatedTargetLossCannotCreateUnlimitedRecoveryWindows() async {
+        let f = Fixture()
+        f.planProvider = { _, goal in .init(path: [goal], planningMode: .reactiveDepth) }
+        f.targetSample = {
+            .init(frameID: .init(generation: 1, sequence: f.sequence),
+                timestamp: f.commands.count <= f.stops ? f.time : f.time - 0.6,
+                position: Vec2(3, 0.5), velocity: .zero, standOff: 1.5, minimumDistance: 1.25)
+        }
+        let result = await f.driver.run()
+        XCTAssertEqual(result, .failed(.trackingLost))
+        XCTAssertEqual(f.driver.failureCause, .pursuitTargetRecoveryExhausted)
+        XCTAssertEqual(f.commands.count, 3)
+        XCTAssertEqual(f.stops, 2, "Native terminal cleanup owns the final stop")
     }
 
     func testReactiveTargetRecoveryCannotResumeCancelledOwner() async {
@@ -331,9 +1293,10 @@ final class FollowPursuitDriverTests: XCTestCase {
                 XCTAssertFalse(lost, "Fault \(fault) must not send a fallback waypoint command")
                 lost = true
             }
-            f.onStop = { stopCapture = f.time }
+            f.onStop = { f.time += 0.353; stopCapture = f.time }
             let result = await f.driver.run()
             XCTAssertEqual(result, .failed(.trackingLost), "fault \(fault)")
+            XCTAssertEqual(f.driver.failureCause, .pursuitTargetRefreshTimeout)
             XCTAssertEqual(f.commands.count, 1)
             XCTAssertEqual(f.stops, 1)
             XCTAssertLessThanOrEqual(f.time - stopCapture, 0.55)

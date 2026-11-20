@@ -86,7 +86,12 @@ struct FollowMotionFailureResolution {
         case .stalled: return "stalled"
         case .rotationResolutionInsufficient: return context.failureCause?.rawValue ?? "rotation_resolution_insufficient"
         case .commandFailed: return "transport_failed"
-        case .trackingLost: return context.failureCause == .poseSourceStale ? "pose_source_stale" : "tracking_lost"
+        case .trackingLost:
+            switch context.failureCause {
+            case .pursuitTargetRefreshTimeout, .pursuitTargetRecoveryExhausted, .poseSourceStale:
+                return context.failureCause!.rawValue
+            default: return "tracking_lost"
+            }
         case .cancelled: return "cancelled"
         }
     }
@@ -103,6 +108,14 @@ struct FollowMotionFailureResolution {
         switch primaryReason {
         case .noPose: return "Rover pose unavailable. Wait for AR tracking to recover."
         case .trackingLost:
+            if context.failureCause == .pursuitTargetRefreshTimeout || context.failureCause == .pursuitTargetRecoveryExhausted {
+                guard stopOutcome == .confirmed else {
+                    return "Following lost verified person evidence. Confirming motor stop…"
+                }
+                return context.failureCause == .pursuitTargetRefreshTimeout
+                    ? "Following stopped: no fresh verified person was received within 500 ms after stopping. Come back into view and restart following."
+                    : "Following stopped: person recovery attempts exhausted. Come back into view and restart following."
+            }
             if context.purpose == .followReady, context.failureCause == .readyProbeSourceInvalid {
                 return "Floor check stopped: camera pose evidence became invalid or changed. Wait for fresh tracking and restart following."
             }

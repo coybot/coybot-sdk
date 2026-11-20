@@ -2,6 +2,22 @@ import XCTest
 @testable import PhroverKit
 
 final class FollowMotionFailureResolutionTests: XCTestCase {
+    func testTargetEvidenceFailuresDoNotClaimARTrackingLossAndStopFailureWins() {
+        for cause in [FollowMotionFailureCause.pursuitTargetRefreshTimeout, .pursuitTargetRecoveryExhausted] {
+            let context = FollowMotionOperationContext(request: nil, controllerOperationID: 1,
+                purpose: .followGoal, profile: nil, failureCause: cause)
+            var resolution = FollowMotionFailureResolution(.init(context: context, reason: .trackingLost,
+                stopOutcome: .confirmed, source: .result))
+            XCTAssertEqual(resolution.diagnosticReason, cause.rawValue)
+            XCTAssertTrue(resolution.message.contains("person"))
+            XCTAssertFalse(resolution.message.contains("AR tracking"))
+            resolution.consume(.init(context: context, reason: .commandFailed, stopOutcome: .failed, source: .confirmation))
+            XCTAssertEqual(resolution.message, "Motor stop could not be confirmed. Motion is blocked.")
+        }
+        let poseFailure = FollowMotionFailureResolution(.init(context: .unknown, reason: .trackingLost,
+            stopOutcome: .confirmed, source: .result))
+        XCTAssertTrue(poseFailure.message.contains("AR tracking lost"))
+    }
     func testGeometryConflictMessageDoesNotClaimConfirmedObstacleAndRetainsStopFailure() {
         let context = FollowMotionOperationContext(request: nil, controllerOperationID: 1,
             purpose: .followGoal, profile: nil, failureCause: .pursuitMapGeometryConflict)

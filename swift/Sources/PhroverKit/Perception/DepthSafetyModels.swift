@@ -205,6 +205,19 @@ struct DepthSafetyObservation: Equatable, Sendable {
     var rememberedProjectionCount: Int?
     var evaluationDuration: TimeInterval?
     var obstacleSide: DepthObstacleSide?
+    var passage: DepthPassageGuidance?
+    /// Supported live-depth geometry, including distant advisory openings.
+    /// Revalidates a candidate direction; never authorizes motion or forces slowdown.
+    var observedPassage: DepthPassageGuidance?
+    var passageRejectionReason: String?
+    var passageLeftColumns: Int?
+    var passageRightColumns: Int?
+    var passageObservedDistance: Double?
+    var passageBoundaryProfile: String?
+    var passageRequiredWidth: Double?
+    /// Bounded rejection evidence: x:y:z:contact-travel:live/remembered.
+    var hazardContactProfile: String?
+    var hazardSweepProfile: String?
 
     static func unavailable(_ reason: DepthSafetyUnavailableReason,
                              sampleAge: TimeInterval,

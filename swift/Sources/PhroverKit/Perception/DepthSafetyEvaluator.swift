@@ -301,13 +301,35 @@ enum DepthSafetyEvaluator {
         var collisionCandidateCount = 0
         var nearbyCells = Set<DepthSafetyCell>()
         var obstacleSide: DepthObstacleSide?
+        let passage = astralCompatible && (motion == .forward || motion == .curved)
+            ? DepthPassageGuidance.assess(snapshot) : nil
         let rememberedHazards = rememberedHazardCells(snapshot: snapshot, reach: reach, projectionCount: &rememberedProjectionCount)
+        var hazardContactProfile: String?
+        var hazardSweepProfile: String?
         func finalized(_ observation: DepthSafetyObservation) -> DepthSafetyObservation {
             var result = observation
             result.rememberedHazardCellCount = rememberedHazards.count
             result.collisionCandidateCount = collisionCandidateCount
             result.rememberedProjectionCount = rememberedProjectionCount
             result.obstacleSide = obstacleSide
+            result.passage = passage?.guidance
+            result.observedPassage = passage?.guidance
+            result.passageRejectionReason = passage?.reason
+            result.passageLeftColumns = passage?.leftColumns
+            result.passageRightColumns = passage?.rightColumns
+            result.passageObservedDistance = passage?.guidance?.lookAhead
+            result.passageBoundaryProfile = passage?.boundaryProfile
+            result.passageRequiredWidth = passage?.requiredWidth
+            result.hazardContactProfile = hazardContactProfile
+            result.hazardSweepProfile = hazardSweepProfile
+            // Seeing a distant opening is not a reason to crawl. Only engage
+            // passage steering within the braking/adjustment zone, or when
+            // this exact command already has nearby obstacle evidence.
+            if let guidance = passage?.guidance, observation.state == .clear,
+               obstacleSide == nil, guidance.lookAhead > max(0.8, stoppingDistance + 0.6) {
+                result.passage = nil
+                result.passageRejectionReason = "distant_supported"
+            }
             return result
         }
         func checkingCoverage(_ observation: DepthSafetyObservation, horizon: Double) -> DepthSafetyObservation {
@@ -412,6 +434,31 @@ enum DepthSafetyEvaluator {
         }
         if let nearestCluster {
             let clearance = nearestContact(in: nearestCluster, contactTravel: contactTravel)
+            hazardContactProfile = nearestCluster.sorted {
+                let a = contactTravel[$0] ?? .infinity, b = contactTravel[$1] ?? .infinity
+                if a != b { return a < b }
+                if $0.lateralIndex != $1.lateralIndex { return $0.lateralIndex < $1.lateralIndex }
+                if $0.forwardIndex != $1.forwardIndex { return $0.forwardIndex < $1.forwardIndex }
+                return $0.heightIndex < $1.heightIndex
+            }.prefix(16).map { cell in
+                let point = center(of: cell)
+                return String(format: "%.3f:%.3f:%.3f:%.3f:%@", point.x, point.y, point.z,
+                    contactTravel[cell] ?? clearance, snapshot.cells.contains(cell) ? "live" : "remembered")
+            }.joined(separator: ",")
+            // Clearance is predicted travel, not a measured chassis gap.
+            hazardSweepProfile = String(format: "L=%.4f,R=%.4f,length=%.3f,width=%.3f,margin=%.3f,horizon=%.3f",
+                command.left, command.right, snapshot.geometry.length, snapshot.geometry.width,
+                snapshot.geometry.lateralSafetyMargin, cautionDistance)
+            if motion == .forward || motion == .curved {
+                let average = (command.left + command.right) / 2
+                let delta = command.right - command.left
+                let curvature = abs(delta) < 0.001 ? 0 : delta / (RoverConfig.wheelBase * average)
+                let path = [0, clearance / 2, clearance].map { travel in
+                    let sample = pose(at: travel, curvature: curvature)
+                    return String(format: "%.3f:%.3f:%.3f", sample.x, sample.z, sample.heading)
+                }.joined(separator: ",")
+                hazardSweepProfile! += ";path_x_z_heading=" + path
+            }
             let state: DepthSafetyState = clearance <= stoppingDistance ? .stop : .caution
             if state == .stop || confirmedRotation {
                 var observation = hazardObservation(

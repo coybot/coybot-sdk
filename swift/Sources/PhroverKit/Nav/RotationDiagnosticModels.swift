@@ -52,6 +52,8 @@ enum FollowMotionFailureCause: String, Sendable {
     case readyProbeExpired = "ready_probe_expired"
     case readyProbeBackwardLimit = "ready_probe_backward_limit"
     case pursuitDepthRefreshTimeout = "pursuit_depth_refresh_timeout"
+    case pursuitTargetRefreshTimeout = "pursuit_target_refresh_timeout"
+    case pursuitTargetRecoveryExhausted = "pursuit_target_recovery_exhausted"
     case pursuitAuthorizationExpired = "pursuit_authorization_expired"
     case pursuitRecoveryExhausted = "pursuit_recovery_exhausted"
     case pursuitStartBlocked = "pursuit_start_blocked"

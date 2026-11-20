@@ -94,7 +94,13 @@ public struct FollowMeConfiguration {
     public var stationaryPauseSeconds: TimeInterval = 5
     /// Bounded stopped grace for a previously body-verified acquisition whose
     /// next raw person fails verification. Never permits motion on stale evidence.
-    public var acquisitionVerificationGraceSeconds: TimeInterval = 0.5
+    public var acquisitionVerificationGraceSeconds: TimeInterval = 2.0
+    /// Hand fresh verified targets directly to depth-approved continuous
+    /// centering instead of requiring a discrete initial alignment turn.
+    public var continuousTargetCentering: Bool = false
+    /// Bridge a lost target with a bounded, live-depth-approved approach to its
+    /// last confirmed position, then stop and search that area.
+    public var approachLastSeenTarget: Bool = false
     public var departureRangeIncrease: Double = 0.30
     /// Share the follow turn profile's stopped-alignment and ready-admission window (radians).
     public var alignmentAngularTolerance: Double = FollowTurnBurstPlanner.Profile(purpose: .alignment).tolerance

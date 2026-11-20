@@ -789,14 +789,18 @@ final class FollowMeCoordinatorTests: XCTestCase {
     }
 
     func testVerifiedAcquisitionMissHoldsStoppedWithoutRecoveryChurnAndHasFixedDeadline() async {
+        for configuredGrace: TimeInterval? in [nil, 0.5] {
+        let grace = configuredGrace ?? 2.0
         for scenario in ["recovers", "expires", "late_match", "stop_failed", "cancelled"] {
             let perception = FollowPerceptionFake()
             let motion = FollowMotionFake()
             let clock = ManualFollowClock()
             motion.useSourceClock(clock)
             motion.suspendRotation = true
+            motion.suspendAlignment = true
             var config = FollowMeConfiguration()
             config.stationaryPauseSeconds = 0
+            if let configuredGrace { config.acquisitionVerificationGraceSeconds = configuredGrace }
             var events: [String] = []
             let coordinator = FollowMeCoordinator(perception: perception, motion: motion, clock: clock,
                 configuration: config) { event, _ in events.append(event) }
@@ -810,7 +814,7 @@ final class FollowMeCoordinatorTests: XCTestCase {
                     projectionAttemptedCount: verified ? 1 : 0, projectionAcceptedCount: verified ? 1 : 0,
                     projectionRejectedCount: 0, projectedPersonCount: verified ? 1 : 0, candidates: [])
                 facts.personVerification = [.init(rawPersonID: 0, accepted: verified,
-                    reason: verified ? "body_verified" : "invalid_person_box", matchingBodies: verified ? 1 : 0)]
+                    reason: verified ? "body_verified" : "no_matching_body", matchingBodies: verified ? 1 : 0)]
                 return .frame(.init(frameID: id, timestamp: time, pose: person.pose, depthAvailable: true,
                     people: verified ? [person] : [], trackingQuality: .normal, perceptionDiagnostics: facts))
             }
@@ -839,22 +843,25 @@ final class FollowMeCoordinatorTests: XCTestCase {
             }
             clock.advance(to: 0.3); perception.send(input(3, 0.3, verified: false)); await drain()
             if scenario == "late_match" {
-                clock.advance(to: 0.601, wakeSleepers: false)
-                perception.send(input(4, 0.601, verified: true)); await drain()
+                clock.advance(to: grace + 0.101, wakeSleepers: false)
+                perception.send(input(4, grace + 0.101, verified: true)); await drain()
                 XCTAssertEqual(coordinator.state, .reacquiring, "An undelivered timer cannot extend the first-miss deadline")
                 _ = await coordinator.stop(); motion.releaseRotation()
                 continue
             }
             if scenario == "recovers" {
-                clock.advance(to: 0.45); perception.send(input(4, 0.45, verified: true)); await drain()
+                let stops = motion.stops
+                clock.advance(to: grace - 0.05); perception.send(input(4, grace - 0.05, verified: true)); await drain()
                 XCTAssertEqual(coordinator.state, .aligning)
                 XCTAssertFalse(events.contains("follow_recovery.started"))
+                XCTAssertEqual(motion.stops, stops, "Resuming must reuse the hold stop; grace \(grace)")
             } else {
                 clock.advance(to: 0.5); perception.send(input(4, 0.5, verified: false)); await drain()
-                clock.advance(to: 0.601); await drain()
+                clock.advance(to: grace + 0.101); await drain()
                 XCTAssertEqual(coordinator.state, .reacquiring, "Repeated misses cannot extend the first-miss deadline")
             }
-            _ = await coordinator.stop(); motion.releaseRotation()
+            _ = await coordinator.stop(); motion.releaseRotation(); motion.releaseAlignment()
+        }
         }
     }
 
@@ -1342,6 +1349,30 @@ final class FollowMeCoordinatorTests: XCTestCase {
         await drain()
         XCTAssertEqual(coordinator.state, .failed("Person lost."))
         _ = await coordinator.stop()
+    }
+
+    func testRecoveryDeadlineWithRecentVerifiedPersonReportsAlignmentTimeout() async {
+        let perception = FollowPerceptionFake()
+        let motion = AbsoluteRecoveryMotionFake()
+        let clock = ManualFollowClock()
+        var config = FollowMeConfiguration()
+        config.stationaryPauseSeconds = 0
+        let coordinator = FollowMeCoordinator(perception: perception, motion: motion, clock: clock,
+            configuration: config, eventSink: { _, _ in })
+        _ = await coordinator.start()
+        perception.send(frame(1, people: [person(1)])); await drain()
+        perception.send(frame(2)); await drain()
+        motion.legacy.suspendAlignment = true
+        clock.advance(to: 9.7, wakeSleepers: false)
+        let verified = FollowPersonObservation(frameID: .init(generation: 1, sequence: 3),
+            timestamp: 9.7, confidence: 0.99, boundingBox: CGRect(x: 0.45, y: 0.4, width: 0.1, height: 0.2),
+            position: Vec2(0, 4), pose: .init(position: .zero, yaw: 0), bodyVerified: true)
+        perception.send(frame(3, at: 9.7, people: [verified])); await drain()
+        XCTAssertEqual(coordinator.state, .aligning)
+        clock.advance(to: 10); await drain()
+        XCTAssertEqual(coordinator.state, .failed("Alignment timed out despite a recent verified person. Stand still in front of the camera and restart following."))
+        XCTAssertTrue(motion.legacy.goals.isEmpty)
+        _ = await coordinator.stop(); motion.legacy.releaseAlignment()
     }
 
     func testUnusedRecoveryReadyStaysBoundUntilDistinctBaselineAndNeverRetries() async {

@@ -44,6 +44,7 @@ struct FollowPursuitSendFailure: Error {
     let reason: NavigationFailure
     var definitelyUnsent = false
     var authorizationExpired = false
+    var targetAuthorityChanged = false
 }
 
 /// One follow owner, one worker, and a newest-only goal mailbox. Planning never
@@ -206,6 +207,15 @@ final class FollowPursuitDriver {
     // Cold-start reserve only; transport still enforces exact expiry. Observed
     // evaluation/send durations raise this budget instead of assuming 100 ms.
     static let minimumFreshnessMargin = 0.02
+
+    /// Shared with native admission: early warnings authorize only bounded,
+    /// slow forward arcs, and only after exact-command depth is clear.
+    nonisolated static func isSlowObstacleArc(_ command: WheelCommand) -> Bool {
+        let peak = max(command.left, command.right)
+        let inner = min(command.left, command.right)
+        return peak.isFinite && inner.isFinite && peak > 0 && peak <= 0.12 &&
+            inner / peak >= 0.15 - 1e-9 && inner / peak <= 0.65 + 1e-9
+    }
     private(set) var failureCause: FollowMotionFailureCause?
 
     init(goal: Vec2, environment: Environment) { self.goal = goal; self.environment = environment }
@@ -257,7 +267,7 @@ final class FollowPursuitDriver {
         var lastPlan = began
         var sent = false
         var movementActive = false
-        var requiresMeasuredTarget = FollowTargetSpeedScope.feed != nil
+        var requiresTargetAuthority = FollowTargetSpeedScope.feed != nil
         var targetRefresh: (after: Double, deadline: Double)?
         var targetRefreshes = 0
         var acceleration = FollowPursuitAcceleration()
@@ -293,6 +303,18 @@ final class FollowPursuitDriver {
         var refreshFirstCapture: Double?
         var refreshLastCapture: Double?
         var stoppedAcknowledgement: Date?
+        var avoidanceSide: DepthObstacleSide?
+        var avoidanceUntil = -Double.infinity
+        var passagePreference: DepthPassageGuidance?
+        var passageSlowUntil = -Double.infinity
+        var steeringResponse = FollowSteeringResponse()
+        var alignmentRequested: Double?
+        var correctiveTurn: (direction: Double, yaw: Double, deadline: Double)?
+        var alignmentApproach: (direction: Double, origin: Vec2, deadline: Double, command: WheelCommand)?
+        var approachCompleted = false
+        var alignmentAttempts = 0
+        var creepResponse = FollowCreepResponse()
+        var creepHoldRequested = false
 
         func recordAcceptance(_ reason: String, job: Job?, source: NavigationPoseSample, at time: Double,
                               event: String = "plan_acceptance_rejected", includeGeometry: Bool = true) {
@@ -541,11 +563,21 @@ final class FollowPursuitDriver {
                 return .failed(.noPath)
             }
             let targetSample = environment.targetSample()
+            if let sample = targetSample, let approach = sample.lastSeenApproach,
+               approach.reachedLimit(position: currentPose.position, observedAt: sample.timestamp, now: time) {
+                environment.emit("last_seen_limit_reached", ["observed_at_s": .number(sample.timestamp),
+                    "deadline_s": .number(sample.validUntil)])
+                return .arrived
+            }
             let targetSpeed = FollowTargetSpeed.evaluate(targetSample, pose: current,
                 now: time, maximum: pursuit.params.maxLinear)
-            if targetSample != nil { requiresMeasuredTarget = true }
-            if route.planningMode == .reactiveDepth, requiresMeasuredTarget {
+            if targetSample != nil { requiresTargetAuthority = true }
+            if route.planningMode == .reactiveDepth, requiresTargetAuthority {
                 if let refresh = targetRefresh, time >= refresh.deadline {
+                    failureCause = .pursuitTargetRefreshTimeout
+                    environment.emit("target_wait_expired", ["deadline_s": .number(refresh.deadline),
+                        "confirmed_stop_s": .number(refresh.after),
+                        "target_capture_s": targetSample.map { .number($0.timestamp) } ?? .null])
                     return .failed(.trackingLost)
                 }
                 let postStopTarget = targetRefresh.map { refresh in
@@ -553,24 +585,35 @@ final class FollowPursuitDriver {
                 } ?? true
                 if targetSpeed == nil || !postStopTarget {
                     if targetRefresh == nil {
-                        guard targetRefreshes < 2 else { return .failed(.trackingLost) }
+                        guard targetRefreshes < 2 else {
+                            failureCause = .pursuitTargetRecoveryExhausted
+                            return .failed(.trackingLost)
+                        }
                         targetRefreshes += 1
-                        // Never substitute a waypoint when measured-target authority
+                        // Never substitute a waypoint when target authority
                         // expires. Stop once; only a new post-stop measurement can
                         // resume this owner, within a non-renewable recovery window.
-                        let deadline = environment.uptime() + 0.5
+                        let stopStarted = environment.uptime()
                         if !stationaryStopConfirmed {
                             do { try await environment.stop() } catch { return .failed(.commandFailed) }
                             stationaryStopConfirmed = true
                         }
                         guard owned else { return .cancelled }
+                        let stoppedAt = environment.uptime()
+                        guard stoppedAt.isFinite, stoppedAt >= stopStarted else { return .failed(.trackingLost) }
+                        // Delivery/stop latency cannot consume the interval reserved
+                        // for a newly captured, independently verified person.
+                        // This deadline is created once, never renewed by misses.
+                        let deadline = stoppedAt + 0.5
                         movementActive = false
                         markProgressStopped()
                         acceleration.reset()
                         resetHealthyDelivery()
                         stoppedAcknowledgement = nil
-                        targetRefresh = (environment.uptime(), deadline)
-                        environment.emit("target_wait_started", ["deadline_s": .number(deadline)])
+                        targetRefresh = (stoppedAt, deadline)
+                        environment.emit("target_wait_started", ["deadline_s": .number(deadline),
+                            "stop_started_s": .number(stopStarted), "confirmed_stop_s": .number(stoppedAt),
+                            "post_stop_window_s": .number(0.5)])
                     }
                     await environment.sleep(.milliseconds(20))
                     continue
@@ -580,7 +623,7 @@ final class FollowPursuitDriver {
                     targetRefresh = nil
                 }
             }
-            let targetExpiry = targetSpeed == nil ? Double.infinity : (targetSample!.timestamp + 0.5)
+            let targetExpiry = targetSpeed == nil ? Double.infinity : targetSample!.validUntil
             var parameters = pursuit.params
             if let targetSpeed {
                 parameters.maxLinear = targetSpeed.maximumWheelSpeed
@@ -613,14 +656,128 @@ final class FollowPursuitDriver {
             } else {
                 steeringPath = joined.path
             }
-            let holdingTurn = route.planningMode == .reactiveDepth && targetSpeed != nil && targetSample?.holdsTranslation == true
+            let correctionEligible = route.planningMode == .reactiveDepth &&
+                targetSample?.centersContinuously == true && targetSample?.lastSeenApproach == nil &&
+                targetSample?.holdsTranslation != true && (targetSpeed?.maximumWheelSpeed ?? 0) > 0
+            let creepEligible = correctionEligible &&
+                (targetSpeed?.range ?? .infinity) <= (targetSample?.standOff ?? 0) + 0.25 &&
+                (targetSpeed?.maximumWheelSpeed ?? .infinity) <= 0.1
+            if creepHoldRequested {
+                creepHoldRequested = false
+                if creepEligible {
+                    do { try await environment.stop() } catch { return .failed(.commandFailed) }
+                    stationaryStopConfirmed = true
+                    guard owned else { return .cancelled }
+                    environment.emit("near_target_settled_hold", [:])
+                    return .arrived
+                }
+            }
+            if let approach = alignmentApproach,
+               !correctionEligible || environment.uptime() >= approach.deadline ||
+                currentPose.position.distance(to: approach.origin) >= 0.15 {
+                do { try await environment.stop() } catch { return .failed(.commandFailed) }
+                stationaryStopConfirmed = true
+                movementActive = false
+                markProgressStopped()
+                guard owned else { return .cancelled }
+                alignmentApproach = nil
+                let needsTurn = correctionEligible &&
+                    (centeringBearing ?? 0) * approach.direction > Double.pi / 36
+                approachCompleted = needsTurn
+                alignmentRequested = needsTurn ? approach.direction : nil
+                environment.emit("steering_approach_completed", [
+                    "travel_m": .number(currentPose.position.distance(to: approach.origin))])
+            }
+            if let turn = correctiveTurn {
+                let travel = atan2(sin(currentPose.yaw - turn.yaw), cos(currentPose.yaw - turn.yaw)) * turn.direction
+                if !correctionEligible || environment.uptime() >= turn.deadline || travel >= 0.3 ||
+                    (centeringBearing ?? 0) * turn.direction <= Double.pi / 36 {
+                    do { try await environment.stop() } catch { return .failed(.commandFailed) }
+                    stationaryStopConfirmed = true
+                    movementActive = false
+                    markProgressStopped()
+                    correctiveTurn = nil
+                    steeringResponse.reset()
+                    previousPosition = nil; previousGoal = nil
+                    environment.emit("steering_alignment_completed", ["yaw_travel_rad": .number(travel)])
+                    guard owned else { return .cancelled }
+                    // A bounded correction with no response must not become
+                    // another unbounded sequence of motor requests.
+                    if correctionEligible, travel < Double.pi / 60 { return .failed(.stalled) }
+                    continue
+                }
+            } else if let direction = alignmentRequested {
+                alignmentRequested = nil
+                steeringResponse.reset()
+                if correctionEligible {
+                    guard alignmentAttempts < 2 else { return .failed(.stalled) }
+                    do { try await environment.stop() } catch { return .failed(.commandFailed) }
+                    stationaryStopConfirmed = true
+                    movementActive = false
+                    markProgressStopped()
+                    guard owned else { return .cancelled }
+                    if !approachCompleted {
+                        let peak = min(0.12, targetSpeed?.maximumWheelSpeed ?? 0)
+                        let candidates = [
+                            WheelCommand(left: peak, right: peak),
+                            direction > 0 ? WheelCommand(left: peak * 0.85, right: peak) :
+                                WheelCommand(left: peak, right: peak * 0.85)
+                        ]
+                        for candidate in candidates where peak > 0 {
+                            let probe = environment.depth(candidate)
+                            let compatible = probe.passage == nil || probe.passage?.accepts(candidate) == true ||
+                                probe.passage?.permitsFlankAvoidance(candidate, side: probe.obstacleSide) == true
+                            let approved = probe.state == .clear && probe.sampleAge.isFinite &&
+                                probe.sampleAge >= 0 && probe.sampleAge < DepthSafetyEvaluator.maximumRawDepthAge - Self.minimumFreshnessMargin &&
+                                compatible &&
+                                !(probe.obstacleSide == .left && candidate.left <= candidate.right) &&
+                                !(probe.obstacleSide == .right && candidate.right <= candidate.left) &&
+                                !((probe.obstacleSide == .front || probe.obstacleSide == .both) &&
+                                    !Self.isSlowObstacleArc(candidate))
+                            environment.emit("steering_approach_probe", [
+                                "left": .number(candidate.left), "right": .number(candidate.right),
+                                "approved": .bool(approved)])
+                            if approved {
+                                alignmentApproach = (direction, currentPose.position, environment.uptime() + 0.8, candidate)
+                                environment.emit("steering_approach_started", [
+                                    "deadline_s": .number(alignmentApproach!.deadline), "maximum_travel_m": .number(0.15)])
+                                break
+                            }
+                        }
+                        if alignmentApproach != nil { continue }
+                    }
+                    approachCompleted = false
+                    alignmentAttempts += 1
+                    correctiveTurn = (direction, currentPose.yaw, environment.uptime() + 0.8)
+                    environment.emit("steering_alignment_started", [
+                        "direction": .number(direction), "attempt": .number(Double(alignmentAttempts)),
+                        "deadline_s": .number(correctiveTurn!.deadline)])
+                    continue
+                }
+            }
+            let holdingTurn = correctiveTurn != nil ||
+                (route.planningMode == .reactiveDepth && targetSpeed != nil && targetSample?.holdsTranslation == true)
             let output = PursuitController(params: parameters).step(pose: currentPose, path: steeringPath)
             var desiredCommand = output.command
-            if holdingTurn, let bearing = centeringBearing {
-                if abs(bearing) <= FollowHoldingTurn.completionAngle { return .arrived }
+            if alignmentApproach != nil, targetSpeed.map({ $0.range <= $0.stopDistance }) == true { return .arrived }
+            if let approach = alignmentApproach {
+                desiredCommand = approach.command
+            } else if let turn = correctiveTurn {
+                let wheel = turn.direction * RoverConfig.minimumRotateWheelSpeed
+                desiredCommand = .init(left: -wheel, right: wheel)
+            } else if holdingTurn, let bearing = centeringBearing {
+                let completion = targetSample?.centersContinuously == true
+                    ? FollowHoldingTurn.continuousCompletionAngle : FollowHoldingTurn.completionAngle
+                if abs(bearing) <= completion { return .arrived }
                 let wheel = (bearing < 0 ? -1.0 : 1.0) * RoverConfig.minimumRotateWheelSpeed
                 desiredCommand = .init(left: -wheel, right: wheel)
             } else if targetSpeed.map({ $0.range <= $0.stopDistance }) == true { return .arrived }
+            if targetSample?.lastSeenApproach != nil,
+               desiredCommand.left <= 0 || desiredCommand.right <= 0 {
+                // Last-seen translation never spins or reverses on remembered
+                // evidence. End this leg; the stopped search owns turning.
+                return .arrived
+            }
             if output.reachedGoal && !holdingTurn {
                 // A pending new goal must not be discarded by old-goal arrival.
                 if routeRevision == revision { return .arrived }
@@ -643,7 +800,9 @@ final class FollowPursuitDriver {
             // Depth and exact-command transport checks still run below.
             var safeCommand = bypassStartupRamp ? approaching : acceleration.limited(approaching, at: environment.uptime())
             var unavailable: DepthSafetyUnavailableReason?
+            var admissionBudgetOnly = false
             var usingObstacleArc = false
+            var usingPassage = false
             var depthExpiry = -Double.infinity
             var depthEvaluationCost = 0.0
             let assessmentStarted = environment.uptime()
@@ -652,61 +811,242 @@ final class FollowPursuitDriver {
                 let elapsed = assessmentStarted - $0
                 return elapsed.isFinite && elapsed >= 0 ? .number(elapsed) : .null
             } ?? .null
-            func selectForwardArc(awayFrom original: DepthSafetyObservation) -> Bool {
+            enum ArcSelection {
+                case approved
+                case blocked
+                case depthUnavailable(DepthSafetyUnavailableReason)
+            }
+            func selectPassage(_ original: DepthSafetyObservation, retained: Bool) -> ArcSelection {
+                guard let passage = original.passage, let targetSpeed else { return .blocked }
+                let limit = min(targetSpeed.maximumWheelSpeed, original.speedLimit ?? .infinity)
+                guard limit.isFinite, limit > 0 else { return .blocked }
+                let candidate = retained && passage.accepts(safeCommand) && max(safeCommand.left, safeCommand.right) <= limit
+                    ? safeCommand : passage.command(maximum: limit)
+                var probe = original
+                var expiry = depthExpiry
+                if candidate != safeCommand {
+                    let cost = max(0.001, depthEvaluationCost)
+                    let margin = max(Self.minimumFreshnessMargin, maximumAdmissionDuration + 0.01, cost + 0.01)
+                    guard depthExpiry - environment.uptime() > cost + margin else {
+                        admissionBudgetOnly = original.state == .clear && depthExpiry > environment.uptime()
+                        return .depthUnavailable(.staleRawDepth)
+                    }
+                    let began = environment.uptime()
+                    probe = environment.depth(candidate)
+                    depthEvaluationCost = max(depthEvaluationCost, environment.uptime() - began)
+                    expiry = began + DepthSafetyEvaluator.maximumRawDepthAge - probe.sampleAge
+                }
+                if case .unavailable(let reason) = probe.state { return .depthUnavailable(reason) }
+                guard probe.sampleAge.isFinite, probe.sampleAge >= 0 else { return .depthUnavailable(.malformedDepth) }
+                guard expiry - environment.uptime() > Self.minimumFreshnessMargin else {
+                    admissionBudgetOnly = probe.state == .clear && expiry > environment.uptime()
+                    return .depthUnavailable(.staleRawDepth)
+                }
+                let observedPassage = probe.observedPassage ?? probe.passage
+                guard probe.state == .clear, observedPassage?.accepts(candidate) == true,
+                      !(probe.obstacleSide == .left && candidate.left <= candidate.right),
+                      !(probe.obstacleSide == .right && candidate.right <= candidate.left),
+                      case .allow(let accepted, _) = guardLayer.evaluate(command: candidate, depthSafety: probe),
+                      accepted == candidate else { return .blocked }
+                safeCommand = candidate
+                depthExpiry = expiry
+                usingPassage = true
+                passagePreference = probe.passage
+                return .approved
+            }
+            func forwardArc(side: DepthObstacleSide, speedLimit: Double?) -> WheelCommand? {
                 guard route.planningMode == .reactiveDepth,
                       let targetSpeed, let bearing = centeringBearing,
                       abs(bearing) <= .pi / 2,
-                      safeCommand.left > 0, safeCommand.right > 0 else { return false }
-                guard original.obstacleSide == .left || original.obstacleSide == .right else { return false }
-                let originalLimit = original.speedLimit.flatMap { $0.isFinite && $0 > 0 ? $0 : nil } ?? 0.12
+                       safeCommand.left > 0, safeCommand.right > 0 else { return nil }
+                guard side == .left || side == .right else { return nil }
+                let originalLimit = speedLimit.flatMap { $0.isFinite && $0 > 0 ? $0 : nil } ?? 0.12
                 let peak = min(0.12, targetSpeed.maximumWheelSpeed, originalLimit)
-                guard peak > 0 else { return false }
+                guard peak > 0 else { return nil }
                 // Positive lateral is rover-right. A left obstacle requires
                 // left wheel faster than right, regardless of target bearing.
-                let direction = original.obstacleSide == .left ? -1.0 : 1.0
-                let probeCost = max(0.001, depthEvaluationCost)
-                let projectedMargin = max(Self.minimumFreshnessMargin,
-                    maximumAdmissionDuration + 0.01, probeCost + 0.01)
-                guard depthExpiry - environment.uptime() > probeCost + projectedMargin else { return false }
-                let candidate = direction > 0
-                    ? WheelCommand(left: peak * 0.65, right: peak)
-                    : WheelCommand(left: peak, right: peak * 0.65)
-                let capturedAt = environment.uptime()
-                let probe = environment.depth(candidate)
-                depthEvaluationCost = max(depthEvaluationCost, environment.uptime() - capturedAt)
-                let expiry = capturedAt + DepthSafetyEvaluator.maximumRawDepthAge - probe.sampleAge
-                guard probe.sampleAge.isFinite, probe.sampleAge >= 0,
-                      expiry - environment.uptime() > Self.minimumFreshnessMargin,
-                      case .allow(let accepted, _) = guardLayer.evaluate(command: candidate, depthSafety: probe),
-                      accepted == candidate, probe.state == .clear,
-                      probe.obstacleSide != .front, probe.obstacleSide != .both,
-                      probe.obstacleSide == nil || probe.obstacleSide == original.obstacleSide else { return false }
+                // If the verified person is in the escape direction, strengthen
+                // centering from 10° to 30° instead of holding a fixed curve as
+                // their torso drifts out of view. Never steer toward the flank.
+                let centersTowardTarget = (side == .right && bearing > 0) || (side == .left && bearing < 0)
+                let centering = targetSample?.centersContinuously == true && centersTowardTarget
+                    ? min(1, max(0, (abs(bearing) - .pi / 18) / (.pi / 9))) : 0
+                let ratio = 0.65 - 0.5 * centering
+                return side == .right
+                    ? WheelCommand(left: peak * ratio, right: peak)
+                    : WheelCommand(left: peak, right: peak * ratio)
+            }
+            func selectForwardArc(awayFrom original: DepthSafetyObservation, side: DepthObstacleSide,
+                                  alternative: WheelCommand? = nil) -> ArcSelection {
+                guard let candidate = alternative ?? forwardArc(side: side, speedLimit: original.speedLimit) else { return .blocked }
+                // A directional preference is useful even if this probe cannot
+                // fit. Recovery should assess the intended arc first, not repeat
+                // cruise plus arc. This stores no authorization or expiry.
+                if original.obstacleSide != nil, original.sampleAge.isFinite,
+                   original.sampleAge >= 0, original.sampleAge <= DepthSafetyEvaluator.maximumRawDepthAge {
+                    avoidanceSide = side
+                    avoidanceUntil = environment.uptime() + 0.5
+                }
+                // Reuse only this tick's exact-command assessment. A retained
+                // direction is a candidate preference, never cached depth approval.
+                var probe = original
+                var expiry = depthExpiry
+                if candidate != safeCommand {
+                    let probeCost = max(0.001, depthEvaluationCost)
+                    let projectedMargin = max(Self.minimumFreshnessMargin,
+                        maximumAdmissionDuration + 0.01, probeCost + 0.01)
+                    guard depthExpiry - environment.uptime() > probeCost + projectedMargin else {
+                        admissionBudgetOnly = original.state == .clear && depthExpiry > environment.uptime()
+                        environment.emit("obstacle_arc_depth_wait", [
+                            "reason": .string("insufficient_probe_budget"),
+                            "remaining_s": .number(depthExpiry - environment.uptime()),
+                            "required_s": .number(probeCost + projectedMargin),
+                            "obstacle_side": original.obstacleSide.map { .string($0.rawValue) } ?? .null])
+                        return .depthUnavailable(.staleRawDepth)
+                    }
+                    let capturedAt = environment.uptime()
+                    probe = environment.depth(candidate)
+                    depthEvaluationCost = max(depthEvaluationCost, environment.uptime() - capturedAt)
+                    expiry = capturedAt + DepthSafetyEvaluator.maximumRawDepthAge - probe.sampleAge
+                }
+                if case .unavailable(let reason) = probe.state { return .depthUnavailable(reason) }
+                guard probe.sampleAge.isFinite, probe.sampleAge >= 0 else {
+                    return .depthUnavailable(.malformedDepth)
+                }
+                guard expiry - environment.uptime() > Self.minimumFreshnessMargin else {
+                    admissionBudgetOnly = probe.state == .clear && expiry > environment.uptime()
+                    environment.emit("obstacle_arc_depth_wait", ["reason": .string("probe_expired"),
+                        "remaining_s": .number(expiry - environment.uptime())])
+                    return .depthUnavailable(.staleRawDepth)
+                }
+                guard case .allow(let accepted, _) = guardLayer.evaluate(command: candidate, depthSafety: probe),
+                       accepted == candidate, probe.state == .clear,
+                       probe.passage == nil || probe.passage?.accepts(candidate) == true ||
+                        probe.passage?.permitsFlankAvoidance(candidate, side: probe.obstacleSide) == true,
+                       !((probe.obstacleSide == .front || probe.obstacleSide == .both) &&
+                         !Self.isSlowObstacleArc(candidate)),
+                       !(probe.obstacleSide == .left && candidate.left <= candidate.right),
+                       !(probe.obstacleSide == .right && candidate.right <= candidate.left) else { return .blocked }
                 // Native transport independently checks this exact command
                 // and obstacle-side evidence again immediately before HTTP.
                 safeCommand = candidate
                 depthExpiry = expiry
                 usingObstacleArc = true
-                return true
+                passagePreference = nil
+                avoidanceSide = side
+                // This retains a steering preference, never depth authority.
+                // Every tick and transport admission still checks the exact arc.
+                if original.obstacleSide != nil { avoidanceUntil = environment.uptime() + 0.5 }
+                return .approved
+            }
+            let retainingAvoidance = environment.uptime() < avoidanceUntil && avoidanceSide != nil
+            if environment.uptime() >= passageSlowUntil { passagePreference = nil }
+            // Retain the speed ceiling through detection gaps, never depth
+            // approval. Every steering preference is checked on current depth.
+            if route.planningMode == .reactiveDepth, !holdingTurn,
+               safeCommand.left > 0, safeCommand.right > 0,
+               environment.uptime() < passageSlowUntil {
+                let peak = max(safeCommand.left, safeCommand.right)
+                if peak > DepthPassageGuidance.maximumWheelSpeed {
+                    let scale = DepthPassageGuidance.maximumWheelSpeed / peak
+                    safeCommand = .init(left: safeCommand.left * scale, right: safeCommand.right * scale)
+                }
+            }
+            let preferringPassage = route.planningMode == .reactiveDepth && !holdingTurn &&
+                safeCommand.left > 0 && safeCommand.right > 0 && targetSpeed != nil && passagePreference != nil
+            if preferringPassage, let passagePreference, let targetSpeed {
+                safeCommand = passagePreference.command(maximum: targetSpeed.maximumWheelSpeed)
+            } else if retainingAvoidance, let candidate = forwardArc(side: avoidanceSide!, speedLimit: nil) {
+                // Assess the command we intend to send first, instead of spending
+                // a depth evaluation on pursuit before repeating it for this arc.
+                safeCommand = candidate
             }
             do {
                 let readStarted = environment.uptime()
                 let observation = environment.depth(safeCommand)
                 depthEvaluationCost = environment.uptime() - readStarted
                 depthExpiry = readStarted + DepthSafetyEvaluator.maximumRawDepthAge - observation.sampleAge
+                // Missing boundaries retain direction only within the original
+                // bounded window. This is a candidate, never cached clearance.
+                if observation.passage != nil { passageSlowUntil = environment.uptime() + 1.5 }
                 if route.planningMode == .reactiveDepth, safeCommand.left > 0, safeCommand.right > 0,
                    observation.state == .clear || observation.state == .caution || observation.state == .stop {
-                    if observation.obstacleSide == .front || observation.obstacleSide == .both {
+                    let frontal = observation.obstacleSide == .front || observation.obstacleSide == .both
+                    if frontal, observation.state == .stop {
                         environment.emit("obstacle_stop", ["obstacle_side": .string(observation.obstacleSide!.rawValue)])
                         return .failed(.obstacle)
                     }
-                    if observation.obstacleSide != nil {
-                        guard selectForwardArc(awayFrom: observation) else { return .failed(.obstacle) }
+                    if observation.obstacleSide == nil, observation.state != .clear, observation.passage == nil {
+                        guard observation.state == .caution, let targetSpeed,
+                              targetSample?.centersContinuously == true else { return .failed(.obstacle) }
+                        let peak = min(0.12, targetSpeed.maximumWheelSpeed, observation.speedLimit ?? 0.12)
+                        guard peak.isFinite, peak > 0 else { return .failed(.obstacle) }
+                        let scale = peak / max(safeCommand.left, safeCommand.right)
+                        let candidates = [
+                            WheelCommand(left: safeCommand.left * scale, right: safeCommand.right * scale),
+                            WheelCommand(left: peak, right: peak),
+                            WheelCommand(left: peak * 0.85, right: peak),
+                            WheelCommand(left: peak, right: peak * 0.85)
+                        ]
+                        var selection = ArcSelection.blocked
+                        for candidate in candidates {
+                            selection = selectForwardArc(awayFrom: observation,
+                                side: candidate.left > candidate.right ? .left : .right, alternative: candidate)
+                            environment.emit("early_warning_candidate", [
+                                "left": .number(candidate.left), "right": .number(candidate.right),
+                                "result": .string({
+                                    switch selection {
+                                    case .approved: return "approved"
+                                    case .blocked: return "blocked"
+                                    case .depthUnavailable: return "depth_unavailable"
+                                    }
+                                }())])
+                            if case .blocked = selection { continue }
+                            break
+                        }
+                        switch selection {
+                        case .approved: break
+                        case .blocked: return .failed(.obstacle)
+                        case .depthUnavailable(let reason): unavailable = reason
+                        }
+                    }
+                    if usingObstacleArc || unavailable != nil {
+                        // The bounded early-warning probe already selected an
+                        // exact command or handed off to existing depth recovery.
+                    } else if !frontal, observation.passage != nil, targetSpeed != nil,
+                              observation.passage?.conflicts(with: observation.obstacleSide) != true {
+                        switch selectPassage(observation, retained: preferringPassage) {
+                        case .approved: break
+                        case .blocked: return .failed(.obstacle)
+                        case .depthUnavailable(let reason): unavailable = reason
+                        }
+                    } else if observation.obstacleSide != nil || retainingAvoidance {
+                        let side: DepthObstacleSide
+                        if observation.obstacleSide == .left || observation.obstacleSide == .right {
+                            side = observation.obstacleSide!
+                        } else {
+                            side = retainingAvoidance ? avoidanceSide! : ((centeringBearing ?? 0) >= 0 ? .right : .left)
+                        }
+                        var selection = selectForwardArc(awayFrom: observation, side: side)
+                        // Early frontal/bilateral occupancy is a warning. Check
+                        // the other direction only if the first fresh probe was
+                        // blocked; missing freshness must stop for recovery.
+                        if frontal, case .blocked = selection {
+                            selection = selectForwardArc(awayFrom: observation, side: side == .left ? .right : .left)
+                        }
+                        switch selection {
+                        case .approved: break
+                        case .blocked:
+                            environment.emit("obstacle_arc_rejected", ["reason": .string("escape_not_approved")])
+                            return .failed(.obstacle)
+                        case .depthUnavailable(let reason): unavailable = reason
+                        }
                     } else if observation.state != .clear {
                         // Unknown obstacle direction is not permission to guess.
                         return .failed(.obstacle)
                     }
                 }
-                if !usingObstacleArc {
+                if !usingObstacleArc, !usingPassage, unavailable == nil {
                     switch guardLayer.evaluate(command: safeCommand, depthSafety: observation) {
                     case .allow(let limited, _):
                         // Transport still validates these exact wheels before HTTP.
@@ -722,7 +1062,15 @@ final class FollowPursuitDriver {
             }
             if unavailable == nil, !depthExpiry.isFinite || environment.uptime() >= depthExpiry { unavailable = .staleRawDepth }
             if let unavailable {
-                refreshCaptureCount = 0; refreshFirstCapture = nil; refreshLastCapture = nil
+                if admissionBudgetOnly, refreshAfter != nil {
+                    // No new capture is counted. Already approved post-stop
+                    // captures remain evidence within the fixed recovery window.
+                    environment.emit("depth_stability_preserved", [
+                        "capture_count": .number(Double(refreshCaptureCount)),
+                        "reason": .string("admission_budget_only")])
+                } else {
+                    refreshCaptureCount = 0; refreshFirstCapture = nil; refreshLastCapture = nil
+                }
                 if sent, refreshAfter == nil, unavailable == .staleRawDepth || unavailable == .missingRawDepth {
                     if let failure = await recoverExpiredCommand(expiry: depthExpiry, rawDepth: true) { return .failed(failure) }
                     continue
@@ -825,10 +1173,13 @@ final class FollowPursuitDriver {
                     approach += previousPosition.distance(to: previousGoal) - currentPose.position.distance(to: previousGoal)
                 }
                 previousPosition = currentPose.position; previousGoal = routeGoal
-                if progress.observe(distanceToGoal: -approach, now: progressTime(environment.date()), commanded: true) { return .failed(.stalled) }
+                // The pre-turn approach has its own non-renewable time/travel
+                // bounds; do not spend the pursuit stall budget twice.
+                if alignmentApproach == nil,
+                   progress.observe(distanceToGoal: -approach, now: progressTime(environment.date()), commanded: true) { return .failed(.stalled) }
             }
             let ackExpiry = ack.map { sendTime + RoverConfig.commsWatchdogTimeout - environment.date().timeIntervalSince($0) } ?? sendTime
-            let expiry = min(depthExpiry, finalSource.sourceTimestamp.map { $0 + 0.5 } ?? .infinity,
+            let expiry = min(alignmentApproach?.deadline ?? .infinity, correctiveTurn?.deadline ?? .infinity, depthExpiry, finalSource.sourceTimestamp.map { $0 + 0.5 } ?? .infinity,
                 ackExpiry, targetExpiry, sent ? .infinity : began + Self.initialAdmissionTimeout, refreshDeadline ?? .infinity)
             guard sendTime < expiry else {
                 if sendTime >= targetExpiry { continue }
@@ -848,6 +1199,8 @@ final class FollowPursuitDriver {
                     "desired_command_left": .number(desiredCommand.left), "desired_command_right": .number(desiredCommand.right),
                     "forward_acceleration_mps2": .number(FollowPursuitAcceleration.acceleration),
                     "target_range_m": targetSpeed.map { .number($0.range) } ?? .null,
+                    "target_authority": .string(targetSample?.lastSeenApproach == nil ? "measured" : "last_seen_approach"),
+                    "target_capture_s": targetSample.map { .number($0.timestamp) } ?? .null,
                     "target_radial_velocity_mps": targetSpeed.map { .number($0.radialVelocity) } ?? .null,
                     "target_speed_ceiling": targetSpeed.map { .number($0.maximumWheelSpeed) } ?? .null,
                     "target_speed_valid_until_s": targetSpeed.map { _ in .number(targetExpiry) } ?? .null,
@@ -856,7 +1209,12 @@ final class FollowPursuitDriver {
                     "target_centering_bearing_rad": centeringBearing.map { .number($0) } ?? .null,
                     "target_centering_lookahead_m": centeringBearing == nil ? .null : .number(parameters.lookahead),
                     "reactive_obstacle_arc": .bool(usingObstacleArc),
+                    "passage_centering": .bool(usingPassage),
+                    "passage_slow_hold": .bool(environment.uptime() < passageSlowUntil),
+                    "passage_width_m": passagePreference.map { .number($0.width) } ?? .null,
+                    "passage_center_lateral_m": passagePreference.map { .number($0.centerLateral) } ?? .null,
                     "holding_turn": .bool(holdingTurn),
+                    "corrective_alignment": .bool(correctiveTurn != nil),
                     "distance_to_goal_m": .number(distanceToGoal),
                     "approach_command_left": .number(approaching.left), "approach_command_right": .number(approaching.right),
                     "required_send_margin_s": .number(requiredMargin),
@@ -877,6 +1235,7 @@ final class FollowPursuitDriver {
             catch {
                 guard owned else { return .cancelled }
                 if let rejected = error as? FollowPursuitSendFailure {
+                    if rejected.definitelyUnsent, rejected.targetAuthorityChanged { continue }
                     if rejected.definitelyUnsent, perceptionPaused { continue }
                     if rejected.definitelyUnsent, rejected.authorizationExpired {
                         if environment.uptime() >= targetExpiry { continue }
@@ -891,8 +1250,15 @@ final class FollowPursuitDriver {
             }
             maximumAdmissionDuration = max(maximumAdmissionDuration,
                 environment.admissionDuration() ?? (environment.uptime() - sendStarted))
+            creepHoldRequested = creepResponse.observe(command: safeCommand, position: currentPose.position,
+                now: environment.uptime(), eligible: creepEligible && !holdingTurn && refreshAfter == nil)
+            if let direction = steeringResponse.observe(command: safeCommand, yaw: currentPose.yaw,
+                bearing: centeringBearing ?? 0, now: environment.uptime(),
+                eligible: correctionEligible && alignmentApproach == nil && !holdingTurn && refreshAfter == nil) {
+                alignmentRequested = direction
+            }
             sent = true
-            if !holdingTurn { resumeProgress(at: sendDate) }
+            if !holdingTurn && alignmentApproach == nil { resumeProgress(at: sendDate) }
             requiresCurrentRouteAfterPause = false
             acceleration.sent(safeCommand, at: sendStarted)
             movementActive = true

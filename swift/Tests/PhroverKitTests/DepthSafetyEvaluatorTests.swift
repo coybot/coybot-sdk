@@ -5,6 +5,104 @@ import RoverNav
 @testable import PhroverKit
 
 final class DepthSafetyEvaluatorTests: XCTestCase {
+    func testDistantPassageGeometrySurvivesAdvisoryPolicyButNotStaleDepth() {
+        for offset in -3...3 {
+            for start in [29, 35, 45] {
+                var cells = Set<DepthSafetyCell>()
+                for x in [-13 + offset, 12 + offset] {
+                    for z in start...(start + 6) {
+                        for y in 2...8 { cells.insert(.init(lateralIndex: x, heightIndex: y, forwardIndex: z)) }
+                    }
+                }
+                let scene = DepthSafetySnapshot(timestamp: 10, cells: cells, cellResolution: 0.04,
+                    validSampleRatio: 1, geometry: .init(length: 0.30, width: 0.25,
+                        minimumCollisionHeight: 0.04, maximumCollisionHeight: 0.50, lateralSafetyMargin: 0.08),
+                    projection: nil, failureReason: nil)
+                for speed in [0.06, 0.12, 0.35] {
+                    let command = WheelCommand(left: speed, right: speed)
+                    let result = DepthSafetyEvaluator.evaluate(scene, command: command, now: 10.1,
+                        visibilityPolicy: .astralCompatible, includeDiagnosticCoverage: false,
+                        minimumObstacleClearance: 0.15)
+                    XCTAssertEqual(result.state, .clear, "offset=\(offset), start=\(start), speed=\(speed)")
+                    XCTAssertNil(result.passage, "Distant geometry must not force cruise slowdown")
+                    XCTAssertEqual(result.passageRejectionReason, "distant_supported")
+                    XCTAssertEqual(result.observedPassage?.centerLateral ?? 99, Double(offset) * 0.04, accuracy: 1e-9)
+                    XCTAssertEqual(result.observedPassage?.width ?? 0, 0.96, accuracy: 1e-9)
+                    let stale = DepthSafetyEvaluator.evaluate(scene, command: command, now: 10.3,
+                        visibilityPolicy: .astralCompatible)
+                    XCTAssertNil(stale.observedPassage)
+                    XCTAssertNil(stale.passage)
+                }
+            }
+        }
+    }
+
+    func testStaggeredPassageBoundariesBeyondOriginalHorizon() {
+        for offset in [-15, 0, 15] {
+        var cells = Set<DepthSafetyCell>()
+        // Sofa begins nearer than the wall; neither occupies the same depth band.
+        for (x, depths) in [(-11, 35...40), (10, 45...50)] {
+            for z in depths {
+                for y in 2...8 { cells.insert(.init(lateralIndex: x + offset, heightIndex: y, forwardIndex: z)) }
+            }
+        }
+        let scene = DepthSafetySnapshot(timestamp: 10, cells: cells, cellResolution: 0.04,
+            validSampleRatio: 1, geometry: .init(length: 0.30, width: 0.25,
+                minimumCollisionHeight: 0.04, maximumCollisionHeight: 0.50, lateralSafetyMargin: 0),
+            projection: nil, failureReason: nil)
+        let passage = DepthPassageGuidance.estimate(scene)
+        XCTAssertNotNil(passage)
+        XCTAssertEqual(passage?.width ?? 0, 0.8, accuracy: 1e-9)
+        XCTAssertEqual(passage?.centerLateral ?? 99, Double(offset) * 0.04, accuracy: 1e-9)
+        XCTAssertEqual(DepthPassageGuidance.assess(scene).reason, "supported")
+        }
+    }
+
+    func testPassageGuidanceGeneratedOffsetsAndIncompleteBoundaries() {
+        func snapshot(_ lateral: [Int], forward: ClosedRange<Int> = 5...25,
+                      heights: ClosedRange<Int> = 2...8) -> DepthSafetySnapshot {
+            var cells = Set<DepthSafetyCell>()
+            for x in lateral {
+                for z in forward {
+                    for y in heights {
+                        cells.insert(.init(lateralIndex: x, heightIndex: y, forwardIndex: z))
+                    }
+                }
+            }
+            return .init(timestamp: 10, cells: cells, cellResolution: 0.04, validSampleRatio: 1,
+                geometry: .init(length: 0.30, width: 0.25, minimumCollisionHeight: 0.04,
+                    maximumCollisionHeight: 0.50, lateralSafetyMargin: 0),
+                projection: nil, failureReason: nil)
+        }
+        for offset in -5...5 {
+            for halfWidth in 8...14 {
+                let scene = snapshot([-halfWidth - 1 + offset, halfWidth + offset])
+                guard let passage = DepthPassageGuidance.estimate(scene) else {
+                    XCTFail("Missing supported passage: offset=\(offset), halfWidth=\(halfWidth)")
+                    continue
+                }
+                XCTAssertEqual(passage.centerLateral, Double(offset) * 0.04, accuracy: 1e-9)
+                XCTAssertEqual(passage.width, Double(halfWidth) * 0.08, accuracy: 1e-9)
+                for cap in [0.02, 0.06, 0.12, 0.3] {
+                    let command = passage.command(maximum: cap)
+                    XCTAssertLessThanOrEqual(max(command.left, command.right), min(cap, 0.12))
+                    XCTAssertGreaterThan(min(command.left, command.right), 0)
+                    XCTAssertTrue(passage.accepts(command))
+                    if offset == 0 { XCTAssertEqual(command.left, command.right) }
+                    else { XCTAssertEqual(command.left > command.right, offset > 0) }
+                }
+                let stale = DepthSafetyEvaluator.evaluate(scene, command: .init(left: 0.1, right: 0.1),
+                    now: 10.3, visibilityPolicy: .astralCompatible)
+                XCTAssertNil(stale.passage)
+            }
+        }
+        for scene in [snapshot([-11]), snapshot([10]), snapshot([-11, 10], forward: 5...8),
+                      snapshot([-11, 10], heights: 2...3), snapshot([-6, 5]), snapshot([])] {
+            XCTAssertNil(DepthPassageGuidance.estimate(scene),
+                "One flank, weak support, and a gap narrower than body plus clearance are not passage guidance")
+        }
+    }
+
     func testObstacleSideUsesOccupiedSpaceNotCommandCurvature() {
         func cells(_ lateral: Int) -> Set<DepthSafetyCell> {
             Set((2...4).map { .init(lateralIndex: lateral, heightIndex: $0, forwardIndex: 10) })
@@ -69,6 +167,14 @@ final class DepthSafetyEvaluatorTests: XCTestCase {
                         XCTAssertEqual(control.speedLimit, full.speedLimit)
                         XCTAssertEqual(control.requiredStoppingDistance, full.requiredStoppingDistance)
                         XCTAssertEqual(control.rememberedHazardCellCount, full.rememberedHazardCellCount)
+                        if control.state == .stop || control.state == .caution {
+                            let contacts = try XCTUnwrap(control.hazardContactProfile)
+                            XCTAssertLessThanOrEqual(contacts.split(separator: ",").count, 16)
+                            XCTAssertTrue(contacts.contains(remembered ? "remembered" : "live"))
+                            XCTAssertNotNil(control.hazardSweepProfile)
+                        } else {
+                            XCTAssertNil(control.hazardContactProfile)
+                        }
                         XCTAssertNil(control.coverage)
                         let strict = DepthSafetyEvaluator.evaluate(scene, command: command, now: 10 + age)
                         let strictWithoutDiagnostics = DepthSafetyEvaluator.evaluate(scene, command: command, now: 10 + age,

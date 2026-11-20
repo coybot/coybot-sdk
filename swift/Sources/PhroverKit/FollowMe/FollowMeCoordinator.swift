@@ -112,6 +112,7 @@ public final class FollowMeCoordinator {
     private var movementTask: Task<Void, Never>?
     private var deadlineTask: Task<Void, Never>?
     private var poseTask: Task<Void, Never>?
+    private var lastSeenApproachTask: Task<Void, Never>?
     private var frameWatchdogTask: Task<Void, Never>?
     private var startupTask: Task<Void, Never>?
     private var pauseTask: Task<Void, Never>?
@@ -161,6 +162,9 @@ public final class FollowMeCoordinator {
     }
     private var recoveryStopBoundary: RecoveryStopBoundary?
     private var poseDeadline: TimeInterval?
+    /// Retained until the paused owner actually resumes, independently of
+    /// subsequent healthy frame diagnostics.
+    private var poseRecoveryIssue: FollowPerceptionIssue?
     private var perceptionStopRequested = false
     private var scanRotation: Double = 0
     private var scanAttempts = 0
@@ -193,7 +197,7 @@ public final class FollowMeCoordinator {
     private var phaseStartedAt: TimeInterval?
 
     private var perceptionFailureMessage: String {
-        let issue = perceptionIssue ?? .noFrames
+        let issue = perceptionIssue ?? poseRecoveryIssue ?? .noFrames
         if issue == .trackingLimited, let reason = latestBatch?.trackingReason {
             return "AR tracking limited (\(reason.rawValue)). \(reason.action)"
         }
@@ -279,6 +283,7 @@ public final class FollowMeCoordinator {
         recoveryHasProvisionalLock = false
         recoveryStopBoundary = nil
         poseDeadline = nil
+        poseRecoveryIssue = nil
         perceptionStopRequested = false
         perceptionReady = false
         scanRotation = 0
@@ -383,6 +388,7 @@ public final class FollowMeCoordinator {
     /// Synchronously fence observations and goals when the app is leaving the foreground
     /// or Talk. The caller must subsequently await stop() before handing off motion.
     public func inhibitMotion() {
+        clearLastSeenApproach()
         clearObstacleDetour()
         pursuitTargetFeed.sample = nil
         pursuitPerceptionPaused = false
@@ -425,6 +431,7 @@ public final class FollowMeCoordinator {
 
     private func finish(_ result: FollowMeState, resolvingFailure: Bool = false,
                         returnWaitReason: FollowReturnWaitReason? = nil) async -> Bool {
+        clearLastSeenApproach()
         clearObstacleDetour()
         pursuitTargetFeed.sample = nil
         pursuitPerceptionPaused = false
@@ -676,9 +683,23 @@ public final class FollowMeCoordinator {
                 stopOutcome: result.stopOutcome, source: .result))
             return true
         }
-        if config.continuousHoldingFacing, result.result == .arrived,
+        if pursuitTargetFeed.sample?.lastSeenApproach != nil, result.result == .arrived,
            result.context.purpose == .followGoal, result.context.request == activeRequest,
            result.context.request?.sessionGeneration == generation, result.stopOutcome == .confirmed {
+            log("follow_last_seen.approach_completed")
+            await loseTarget(generation: generation)
+            return true
+        }
+        if config.continuousHoldingFacing, result.result == .arrived,
+            result.context.purpose == .followGoal, result.context.request == activeRequest,
+            result.context.request?.sessionGeneration == generation, result.stopOutcome == .confirmed {
+            if usesContinuousCentering, let sample = pursuitTargetFeed.sample,
+               sample.lastSeenApproach == nil, let pose = latestBatch?.pose,
+               pose.position.distance(to: sample.position) <= config.maximumHoldDistance {
+                // A settled near-target arrival enters the existing wider
+                // hold band; a fresh frame must move outside it to translate.
+                state = .holdingDistance
+            }
             // A completed centred hold releases this owner. A later bearing
             // change must not be throttled by the old, unchanged hold waypoint.
             lastGoal = nil
@@ -804,7 +825,7 @@ public final class FollowMeCoordinator {
         // A timer and frame processor can resume in either order at the boundary.
         // Never let a late frame clear an outage whose recovery window has ended.
         if let deadline = poseDeadline, clock.now >= deadline {
-            _ = await finish(.failed(perceptionFailureMessage))
+            await finishPerceptionOutage()
             return
         }
         let evaluatedPending = evaluatedPendingSnapshot?.batch.frameID == batch.frameID ? evaluatedPendingSnapshot : nil
@@ -954,11 +975,13 @@ public final class FollowMeCoordinator {
             emitAssociation(evaluated.evaluation, batch: batch, now: now)
             switch evaluated.decision {
             case .matched(let selected):
+                var resumedAcquisitionHold = false
                 if let hold = acquisitionHold {
                     if clock.now >= hold.deadline { await loseTarget(generation: token); return }
                     guard selected.bodyVerified, matchedFrameClearsNewestStop(batch) else { return }
                     if clock.now >= hold.deadline { await loseTarget(generation: token); return }
                     clearAcquisitionHold()
+                    resumedAcquisitionHold = true
                     log("follow_acquisition.hold_resumed")
                 }
                 if state == .waitingForMovement {
@@ -1017,7 +1040,8 @@ public final class FollowMeCoordinator {
                                         selected.position.x - batch.pose!.position.x)
                     if let confirmed = alignmentConfirmedAfter,
                        confirmed.generation == batch.frameID.generation, batch.frameID.sequence > confirmed.sequence,
-                       abs(normalizeAngle(heading - batch.pose!.yaw)) <= config.alignmentAngularTolerance {
+                       (abs(normalizeAngle(heading - batch.pose!.yaw)) <= config.alignmentAngularTolerance ||
+                        (usesContinuousCentering && selected.bodyVerified && batch.depthAvailable)) {
                         if recoveryEpisode != nil, !recoveryFrameEligible(selected, batch: batch) { return }
                         if targetFacing != nil {
                             guard await restoreRecovery(selected, phase: .following) else { return }
@@ -1069,7 +1093,7 @@ public final class FollowMeCoordinator {
                         }
                     } else {
                         state = .aligning
-                        align(generation: token)
+                        align(generation: token, reusingConfirmedStop: resumedAcquisitionHold)
                     }
                 }
             case .lost:
@@ -1096,6 +1120,12 @@ public final class FollowMeCoordinator {
                 await follow(selected, rover: batch.pose!.position, generation: token,
                              lead: trackVelocity(at: batch.timestamp))
             case .lost:
+                if usesContinuousCentering, activeRequest?.purpose == .followGoal {
+                    if await approachLastSeenArea(batch, generation: token) { return }
+                    pursuitTargetFeed.sample = nil
+                    await perceptionUnavailable(.targetVerificationUnavailable, generation: token)
+                    return
+                }
                 if pursuitPerceptionPaused {
                     clearPerceptionOutage()
                     await loseTarget(generation: token)
@@ -1187,17 +1217,21 @@ public final class FollowMeCoordinator {
                   newestStopFence?.identity == confirmedStop, let batch = latestBatch, poseDeadline == nil,
                   batch.frameID == selected.frameID, pendingFrame == nil || pendingFrame?.frameID == batch.frameID,
                   matchedFrameClearsNewestStop(batch) else { return }
-            if stoppedAlignment {
+            if stoppedAlignment && !usesContinuousCentering {
                 guard let pose = batch.pose,
                       abs(normalizeAngle(atan2(selected.position.y - pose.position.y,
                           selected.position.x - pose.position.x) - pose.yaw)) <= config.alignmentAngularTolerance else { return }
+            }
+            if stoppedAlignment, usesContinuousCentering {
+                guard selected.bodyVerified, batch.depthAvailable else { return }
             }
             if stoppedRecovery, !recoveryFrameEligible(selected, batch: batch) { return }
         }
         let distance = rover.distance(to: selected.position)
         guard distance.isFinite else { await loseTarget(generation: token); return }
         let holdDistance = config.continuousGoals && selected.bodyVerified && state == .following
-            ? max(config.minimumHoldDistance, config.standOffDistance + 0.05) : config.maximumHoldDistance
+            ? max(config.minimumHoldDistance, config.standOffDistance +
+                FollowHoldingTurn.stopMargin(continuous: usesContinuousCentering)) : config.maximumHoldDistance
         let continuousHold = config.continuousHoldingFacing && config.continuousGoals &&
             config.planningMode == .reactiveDepth && selected.bodyVerified
         let holding = distance <= holdDistance
@@ -1208,10 +1242,12 @@ public final class FollowMeCoordinator {
             return true
         } ?? false
         if config.continuousGoals, selected.bodyVerified, measured {
+            if pursuitTargetFeed.sample?.lastSeenApproach != nil { log("follow_last_seen.target_recovered") }
+            clearLastSeenApproach()
             pursuitTargetFeed.sample = .init(frameID: selected.frameID, timestamp: selected.timestamp,
                 position: selected.position, velocity: lead ?? trackVelocity(at: selected.timestamp) ?? .zero,
                 standOff: config.standOffDistance, minimumDistance: config.minimumHoldDistance,
-                holdsTranslation: continuousHold && holding)
+                holdsTranslation: continuousHold && holding, centersContinuously: usesContinuousCentering)
         }
         if pursuitPerceptionPaused {
             guard measured, let control = motion as? any FollowMePursuitControl,
@@ -1224,7 +1260,7 @@ public final class FollowMeCoordinator {
            association.frameID == batch.frameID, case .matched = association.decision {
             let bearing = normalizeAngle(atan2(selected.position.y - pose.position.y,
                 selected.position.x - pose.position.x) - pose.yaw)
-            if !(continuousHold && holding),
+            if !usesContinuousCentering, !(continuousHold && holding),
                abs(bearing) > (state == .following || continuousHold ? movingFacingEntryAngle : Self.targetFacingEntryAngle) {
                 if pursuitPerceptionPaused {
                     clearPerceptionOutage()
@@ -1235,8 +1271,9 @@ public final class FollowMeCoordinator {
             }
         }
         let holdingBearing = normalizeAngle(atan2(selected.position.y - rover.y, selected.position.x - rover.x) - selected.pose.yaw)
+        let holdingEntry = usesContinuousCentering ? FollowHoldingTurn.continuousEntryAngle : FollowHoldingTurn.entryAngle
         let retainHoldingOwner = continuousHold && holding && measured &&
-            (abs(holdingBearing) > FollowHoldingTurn.entryAngle || activeRequest?.purpose == .followGoal && lastGoal != nil)
+            (abs(holdingBearing) > holdingEntry || activeRequest?.purpose == .followGoal && lastGoal != nil)
         if holding && !retainHoldingOwner {
             if pursuitPerceptionPaused { clearPerceptionOutage() }
             if lastGoal != nil || pursuitPerceptionPaused { _ = await confirmStop(generation: token) }
@@ -1250,13 +1287,27 @@ public final class FollowMeCoordinator {
             return
         }
         let aim = leadPoint(selected.position, velocity: lead)
-        guard let goal = continuousHold && holding ? rover : tracker.standOffGoal(rover: rover, person: aim) else { return }
+        let goal: Vec2
+        if config.continuousGoals, selected.bodyVerified {
+            // `holding` above is the single continuous distance decision.
+            // The legacy tracker applies a separate 1.75 m acquisition band,
+            // which must not veto resuming an owner still following at 1.65 m.
+            let delta = aim - rover
+            let aimRange = delta.length
+            guard aimRange.isFinite else { await loseTarget(generation: token); return }
+            goal = holding || aimRange <= config.standOffDistance ? rover :
+                rover + delta * ((aimRange - config.standOffDistance) / aimRange)
+        } else {
+            guard let legacyGoal = tracker.standOffGoal(rover: rover, person: aim) else { return }
+            goal = legacyGoal
+        }
         if pursuitPerceptionPaused {
             guard let control = motion as? any FollowMePursuitControl,
                   (motion as? any FollowMeContextualMotion)?.updateFollowGoal(goal) == true,
                   control.resumeFollowAfterPerception(timestamp: selected.timestamp) else { return }
             pursuitPerceptionPaused = false
             clearPerceptionOutage()
+            state = targetPhase
             lastGoal = goal
             lastGoalTime = clock.now
             log("follow_pursuit.perception_resumed")
@@ -1314,12 +1365,68 @@ public final class FollowMeCoordinator {
 
     // MARK: Track, coasting and tolerant continuation
 
+    private func clearLastSeenApproach() {
+        lastSeenApproachTask?.cancel()
+        lastSeenApproachTask = nil
+        if pursuitTargetFeed.sample?.lastSeenApproach != nil { pursuitTargetFeed.sample = nil }
+    }
+
+    /// Keep the existing owner, replacing velocity lead with the last actual
+    /// sighting. No synthetic person/frame is introduced into association.
+    private func approachLastSeenArea(_ batch: FollowFrameBatch, generation token: UInt64) async -> Bool {
+        guard config.approachLastSeenTarget, usesContinuousCentering, state == .following,
+              !pursuitPerceptionPaused, poseDeadline == nil, !stopBlocked,
+              stopTask == nil, confirmationTask == nil, recoveryEpisode == nil,
+              let pose = batch.pose, frameIssue(batch, now: clock.now) == nil,
+              let sample = pursuitTargetFeed.sample,
+              sample.frameID.generation == batch.frameID.generation,
+              (motion as? any FollowMePursuitControl)?.preservesFollowGoalOwner == true else { return false }
+        if let approach = sample.lastSeenApproach {
+            if approach.reachedLimit(position: pose.position, observedAt: sample.timestamp, now: clock.now) {
+                await loseTarget(generation: token)
+            }
+            return true
+        }
+        guard clock.now >= sample.timestamp, clock.now < sample.validUntil,
+              !sample.holdsTranslation else { return false }
+        let delta = sample.position - pose.position
+        let range = delta.length
+        let bearing = normalizeAngle(atan2(delta.y, delta.x) - pose.yaw)
+        let stopDistance = max(sample.minimumDistance, sample.standOff + 0.05)
+        guard range.isFinite, range > stopDistance, abs(bearing) < .pi / 2 else {
+            await loseTarget(generation: token); return true
+        }
+        let goal = pose.position + delta * (min(FollowLastSeenApproach.maximumDisplacement, range - stopDistance) / range)
+        guard (motion as? any FollowMeContextualMotion)?.updateFollowGoal(goal) == true else { return false }
+        let approach = FollowLastSeenApproach(origin: pose.position)
+        let destination = FollowTargetSpeedSample(frameID: sample.frameID, timestamp: sample.timestamp,
+            position: sample.position, velocity: .zero, standOff: sample.standOff, minimumDistance: sample.minimumDistance,
+            centersContinuously: true, lastSeenApproach: approach)
+        pursuitTargetFeed.sample = destination
+        lastGoal = goal
+        lastGoalTime = clock.now
+        log("follow_last_seen.approach_started", extra: ["observed_at_s": String(sample.timestamp),
+            "deadline_s": String(destination.validUntil), "maximum_displacement_m": String(FollowLastSeenApproach.maximumDisplacement),
+            "target_x": String(sample.position.x), "target_z": String(sample.position.y)])
+        lastSeenApproachTask?.cancel()
+        lastSeenApproachTask = Task { [weak self, clock] in
+            await clock.sleep(seconds: max(0, destination.validUntil - clock.now))
+            guard !Task.isCancelled, let self, self.generation == token,
+                  self.pursuitTargetFeed.sample?.frameID == sample.frameID,
+                  self.pursuitTargetFeed.sample?.lastSeenApproach == approach else { return }
+            self.log("follow_last_seen.approach_expired")
+            await self.loseTarget(generation: token)
+        }
+        return true
+    }
+
     private func announceImmediateReadyIfNeeded() {
         guard config.followImmediatelyAfterAlignment, !immediateReadyAnnounced,
               let announce = stationaryReadyAnnouncement else { return }
         immediateReadyAnnounced = true
         announce("I'm ready to follow you.")
-        emitReadiness("follow_ready.announcement_requested", reason: "immediate_aligned_following")
+        emitReadiness("follow_ready.announcement_requested",
+            reason: usesContinuousCentering ? "continuous_target_centering" : "immediate_aligned_following")
     }
 
     private func beginTargetFacing(generation token: UInt64, bearing: Double) {
@@ -1466,9 +1573,18 @@ public final class FollowMeCoordinator {
         return gated.count == 1 ? gated[0] : nil   // two candidates in the gate: do not guess
     }
 
-    private func align(generation token: UInt64) {
+    private var usesContinuousCentering: Bool {
+        config.continuousTargetCentering && config.continuousGoals &&
+            config.continuousHoldingFacing && config.followImmediatelyAfterAlignment &&
+            config.planningMode == .reactiveDepth
+    }
+
+    private func align(generation token: UInt64, reusingConfirmedStop: Bool = false) {
         guard alignmentTask == nil else { return }
-        let retainedFacingFence = targetFacing != nil ? stationaryObservationFence : nil
+        // Only the resumed-hold caller sets this after validating a verified
+        // post-stop frame; clearing the hold must not discard its stop fence.
+        let retainedFacingFence = reusingConfirmedStop ? newestStopFence :
+            (targetFacing != nil ? stationaryObservationFence : nil)
         alignmentSerial &+= 1
         let serial = alignmentSerial
         let capturedPhase = String(describing: state)
@@ -1480,10 +1596,12 @@ public final class FollowMeCoordinator {
                 if self.generation == token, self.alignmentSerial == serial { self.alignmentTask = nil }
             }
             if let retainedFacingFence {
-                guard self.generation == token, self.targetFacingStopFence?.identity == retainedFacingFence.identity,
+                guard self.generation == token,
+                      reusingConfirmedStop || self.targetFacingStopFence?.identity == retainedFacingFence.identity,
                       self.newestStopFence?.identity == retainedFacingFence.identity,
                       self.stopTask == nil, self.confirmationTask == nil, !self.stopBlocked else { return }
-                self.log("follow_facing.stop_reused", extra: ["stop_acknowledgement_s": String(retainedFacingFence.acknowledgementUptime)])
+                self.log(reusingConfirmedStop ? "follow_acquisition.stop_reused" : "follow_facing.stop_reused",
+                    extra: ["stop_acknowledgement_s": String(retainedFacingFence.acknowledgementUptime)])
             } else {
                 guard await self.confirmStop(generation: token, origin: capturedStopOrigin) else { return }
             }
@@ -1499,12 +1617,13 @@ public final class FollowMeCoordinator {
             let angle = normalizeAngle(heading - pose.yaw)
             guard angle.isFinite else { return }
             if self.config.followImmediatelyAfterAlignment,
-               abs(angle) <= self.config.alignmentAngularTolerance,
+               (abs(angle) <= self.config.alignmentAngularTolerance ||
+                (self.usesContinuousCentering && selected.bodyVerified && snapshot.batch.depthAvailable)),
                let fence = self.newestStopFence,
                self.matchedFrameClearsNewestStop(snapshot.batch) {
-                // The target is already aligned in a fresh settled post-stop
-                // frame. Keep this stop boundary instead of launching a zero
-                // turn, stopping again, and moving the boundary forward.
+                // Continuous centering delegates the measured bearing to the
+                // depth-approved pursuit owner. The legacy mode still requires
+                // angular alignment. Both need distinct fresh post-stop evidence.
                 self.alignmentConfirmedAfter = snapshot.batch.frameID
                 self.alignmentCompletionTime = fence.acknowledgementUptime
                 guard let handoff = await self.awaitAlignmentMatch(after: snapshot.batch.frameID,
@@ -1580,7 +1699,9 @@ public final class FollowMeCoordinator {
         (motion as? any FollowMeContextualMotion)?.inhibitScanContinuation(origin: .independent)
         cancelAlignment()
         let id = UUID()
-        let deadline = min(clock.now + min(1.0, config.acquisitionVerificationGraceSeconds),
+        // Hold stopped through brief torso-verification gaps. Misses never
+        // renew this first-miss deadline or the enclosing recovery episode.
+        let deadline = min(clock.now + min(2.0, config.acquisitionVerificationGraceSeconds),
             recoveryEpisode?.deadline ?? .infinity)
         acquisitionHold = (id, deadline)
         log("follow_acquisition.hold_started", extra: ["deadline_uptime_s": String(deadline)])
@@ -2191,6 +2312,7 @@ public final class FollowMeCoordinator {
 
     private func loseTarget(generation token: UInt64) async {
         guard generation == token, state != .reacquiring else { return }
+        clearLastSeenApproach()
         pursuitTargetFeed.sample = nil
         pursuitPerceptionPaused = false
         clearTargetFacing()
@@ -2231,7 +2353,14 @@ public final class FollowMeCoordinator {
         guard generation == token, isActive, let episode = recoveryEpisode,
               (validationTime ?? clock.now) >= episode.deadline else { return false }
         emitRecovery("expired", reason: "original_deadline_reached", episode: episode)
-        _ = await finish(.failed("Person lost."), returnWaitReason: .targetLost)
+        let age = locked.map { (validationTime ?? clock.now) - $0.timestamp }
+        let recentVerifiedAlignment = state == .aligning && locked?.bodyVerified == true &&
+            age.map { $0.isFinite && $0 >= 0 && $0 <= config.maximumObservationAge } == true
+        if recentVerifiedAlignment {
+            _ = await finish(.failed("Alignment timed out despite a recent verified person. Stand still in front of the camera and restart following."))
+        } else {
+            _ = await finish(.failed("Person lost."), returnWaitReason: .targetLost)
+        }
         return true
     }
 
@@ -2451,7 +2580,8 @@ public final class FollowMeCoordinator {
             (stationaryReadyPending || readySignalSucceeded)
         let stoppedFacing = state == .aligning && targetFacing != nil && targetFacingStopFence != nil &&
             targetFacingStopFence?.identity == newestStopFence?.identity
-        guard recovering || spokenReady || stoppedFacing,
+        let stoppedAcquisition = acquisitionHold != nil && (state == .aligning || state == .waitingForMovement)
+        guard recovering || spokenReady || stoppedFacing || stoppedAcquisition,
               !scanning, movementTask == nil, alignmentTask == nil || stoppedFacing,
               !stopBlocked, stopTask == nil, confirmationTask == nil,
               pendingAdmission == nil, activeReadyAdmission == nil,
@@ -2463,8 +2593,26 @@ public final class FollowMeCoordinator {
         return fence
     }
 
+    private func finishPerceptionOutage() async {
+        // Brief verification gaps may resume the same pursuit owner. Once that
+        // grace expires, use the confirmed-stop human-return flow instead of
+        // ending Talk's session. Camera/AR faults keep their terminal policy.
+        let transientIssue = perceptionIssue == nil || perceptionIssue == .targetVerificationUnavailable ||
+            perceptionIssue == .staleFrame
+        let waitingForPerson = transientIssue && poseRecoveryIssue == .targetVerificationUnavailable &&
+            (state == .following || state == .holdingDistance)
+        if waitingForPerson, config.approachLastSeenTarget {
+            clearPerceptionOutage()
+            await loseTarget(generation: generation)
+            return
+        }
+        _ = await finish(.failed(perceptionFailureMessage),
+            returnWaitReason: waitingForPerson ? .targetLost : nil)
+    }
+
     private func clearPerceptionOutage() {
         poseDeadline = nil
+        poseRecoveryIssue = nil
         perceptionStopRequested = false
         poseTask?.cancel()
         poseTask = nil
@@ -2522,6 +2670,7 @@ public final class FollowMeCoordinator {
 
     private func perceptionUnavailable(_ issue: FollowPerceptionIssue, generation token: UInt64) async {
         guard generation == token else { return }
+        clearLastSeenApproach()
         if state == .avoidingObstacle {
             _ = await finish(.failed("Obstacle detour stopped. " + issue.message))
             return
@@ -2548,13 +2697,14 @@ public final class FollowMeCoordinator {
         if poseDeadline == nil {
             let deadline = clock.now + config.perceptionRecoverySeconds
             poseDeadline = deadline
+            poseRecoveryIssue = issue
             perceptionStopRequested = false
             poseTask?.cancel()
             poseTask = Task { [weak self, clock] in
                 await clock.sleep(seconds: max(0, deadline - clock.now))
                 guard !Task.isCancelled, let self, self.generation == token, self.poseDeadline == deadline,
                        self.clock.now >= deadline else { return }
-                _ = await self.finish(.failed(self.perceptionFailureMessage))
+                await self.finishPerceptionOutage()
             }
         }
         guard !perceptionStopRequested, let deadline = poseDeadline else { return }
@@ -2562,7 +2712,8 @@ public final class FollowMeCoordinator {
         // fence while waiting for fresh post-stop continuity. Re-stopping here
         // would move the fence past each delayed observation indefinitely.
         if waitingWhileStopped { return }
-        if issue == .staleFrame, config.continuousGoals, state == .following,
+        if issue == .staleFrame || issue == .targetVerificationUnavailable,
+           config.continuousGoals, state == .following || (usesContinuousCentering && state == .holdingDistance),
            activeRequest?.purpose == .followGoal, let control = motion as? any FollowMePursuitControl {
             perceptionStopRequested = true
             pursuitPerceptionPaused = true
@@ -2683,7 +2834,8 @@ public final class FollowMeCoordinator {
             "stationary_pause_seconds": .number(config.stationaryPauseSeconds),
             "planning_mode": .string(config.planningMode.rawValue),
             "maximum_observation_age_s": .number(config.maximumObservationAge),
-            "alignment_angular_tolerance_rad": .number(config.alignmentAngularTolerance),
+            "alignment_angular_tolerance_rad": usesContinuousCentering ? .null : .number(config.alignmentAngularTolerance),
+            "target_centering_mode": .string(usesContinuousCentering ? "continuous" : "discrete_alignment"),
             "ready_signal_clearance_m": .number(config.readySignalClearance),
             "timing_clock": .string("system_uptime")]
     }

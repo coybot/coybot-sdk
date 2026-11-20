@@ -26,11 +26,13 @@ protocol FollowMePursuitControl: AnyObject {
 
 public enum FollowPerceptionIssue: String, Equatable, Sendable {
     case noFrames, staleFrame, poseUnavailable, depthUnavailable, trackingLimited, trackingUnavailable
+    case targetVerificationUnavailable
 
     public var message: String {
         switch self {
         case .noFrames: "No camera frames received. Check the AR session and camera access."
         case .staleFrame: "Camera frame stale or timestamp invalid. Check camera delivery and inference latency."
+        case .targetVerificationUnavailable: "Fresh verified person evidence did not return in time. Stand in view and restart following."
         case .poseUnavailable: "Rover pose unavailable. Wait for AR tracking to recover."
         case .depthUnavailable: "Depth unavailable. Check LiDAR visibility and depth support."
         case .trackingLimited: "AR tracking limited. Move slowly and point the camera at a well-lit, textured scene."

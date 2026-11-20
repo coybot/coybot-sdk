@@ -475,17 +475,20 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
                 imageResolution: CGSize(width: 100, height: 100), depthMap: nil,
                 trackingQuality: .normal
             )
-            await Task.yield()
+            await eventually { collector.events.count >= Int(timestamp) }
         }
 
         await eventually { scans.value == 3 }
-        await eventually { collector.events.count == 2 }
+        await eventually { collector.events.count == 3 }
         XCTAssertEqual(collector.events, [
             .feedback(.scannerFailed(context: .init(
                 frameID: ARFrameID(generation: 0, sequence: 1), monotonicTimestamp: 1
             ))),
             .feedback(.waitingForMarker(context: .init(
                 frameID: ARFrameID(generation: 0, sequence: 2), monotonicTimestamp: 2
+            ))),
+            .feedback(.scanCompleted(context: .init(
+                frameID: ARFrameID(generation: 0, sequence: 3), monotonicTimestamp: 3
             ))),
         ])
         consumer.cancel()
@@ -568,16 +571,19 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
                 imageResolution: CGSize(width: 100, height: 100), depthMap: nil,
                 trackingQuality: .normal
             )
-            await Task.yield()
+            await eventually { collector.events.count >= Int(timestamp) }
         }
 
-        await eventually { collector.events.count == 2 }
+        await eventually { collector.events.count == 3 }
         XCTAssertEqual(collector.events, [
             .feedback(.groundingFailed(context: .init(
                 frameID: ARFrameID(generation: 0, sequence: 1), monotonicTimestamp: 1
             ), reason: .wrongMarkerID)),
             .feedback(.waitingForMarker(context: .init(
                 frameID: ARFrameID(generation: 0, sequence: 2), monotonicTimestamp: 2
+            ))),
+            .feedback(.scanCompleted(context: .init(
+                frameID: ARFrameID(generation: 0, sequence: 3), monotonicTimestamp: 3
             ))),
         ])
         consumer.cancel()

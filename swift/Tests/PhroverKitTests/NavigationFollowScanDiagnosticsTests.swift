@@ -488,7 +488,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
             utc: { Date(timeIntervalSince1970: 50) }, sink: sink.append)
         let controller = FollowNavigationController(currentPose: { source.pose },
             forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { Date() },
-            sendCommand: { _ in source.pose = .init(position: Vec2(2, 3), yaw: 0.35) },
+            sendCommand: { _ in source.pose = .init(position: Vec2(2, 3), yaw: 0.32) },
             stopRover: {}, sleep: source.advance,
             diagnosticEmitter: emitter, poseSample: {
                 reads += 1
@@ -523,8 +523,9 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         XCTAssertGreaterThan(source.snapshot.sourceTimestamp ?? 0, try XCTUnwrap(result.turnStopFence?.acknowledgementUptime))
         XCTAssertEqual(json["controller_arrival_source_identity"] as? String, source.snapshot.source)
         XCTAssertEqual(json["requested_movement_rad"] as? Double, 0.3)
-        XCTAssertEqual(json["measured_movement_rad"] as? Double, 0.35)
-        XCTAssertEqual(try XCTUnwrap(json["stage_error_rad"] as? Double), -0.05, accuracy: 1e-12)
+        XCTAssertEqual(json["measured_movement_rad"] as? Double, 0.32)
+        XCTAssertEqual(try XCTUnwrap(json["stage_error_rad"] as? Double), -0.02, accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(json["profile_angular_tolerance_rad"] as? Double), 2 * .pi / 180, accuracy: 1e-12)
         XCTAssertEqual(json["segment_arrived"] as? Bool, true)
         XCTAssertEqual(json["stage_arrived"] as? Bool, true)
         XCTAssertEqual(json["operation_start_monotonic_s"] as? Double, 50)
@@ -619,6 +620,29 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         XCTAssertTrue(result.result == .cancelled && result.context.requestedRotation == nil && result.context.targetYaw == nil
             && result.recovery?.postStopSource.pose?.yaw == 0.4 && result.recovery?.resolutionSource == nil
             && result.recovery?.segmentHeading == nil && result.recovery?.stageArrived == nil)
+    }
+
+    func testRecoveryTenDegreeSegmentDoesNotFinishAfterOnlyFourDegrees() async {
+        let source = FollowRecoveryDiagnosticSourceFixture()
+        var commands = 0
+        let controller = FollowNavigationController(currentPose: { source.pose },
+            forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { Date() },
+            sendCommand: { _ in commands += 1 }, stopRover: {}, sleep: { duration in
+                if Self.seconds(duration) >= 0.299, commands > 0 {
+                    source.pose = .init(position: .zero, yaw: (commands == 1 ? 4 : 10) * .pi / 180)
+                }
+                await source.advance(duration)
+            }, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+            sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
+        let request = FollowRecoveryHeadingRequest(stageHeading: 15 * .pi / 180,
+            authorization: .init(episodeID: UUID(), expectedGeneration: 4, deadline: 12,
+                now: { source.uptime }, canContinue: { true }), maximumSegment: .pi / 18)
+        let result = await NavigationFollowMeMotion(navigation: controller).performRecoveryHeading(request,
+            context: .init(sessionGeneration: 1, requestToken: 10, purpose: .followScan, phase: "reacquiring"))
+        XCTAssertEqual(result.result, .arrived)
+        XCTAssertGreaterThanOrEqual(commands, 2, "A small initial response must not end the ten-degree search segment")
+        XCTAssertEqual(source.pose.yaw, 10 * .pi / 180, accuracy: 2 * .pi / 180)
     }
 
     func testAbsoluteRecoveryKeepsSegmentTargetThroughOppositeSignCorrectionAndInclusiveTolerance() async {

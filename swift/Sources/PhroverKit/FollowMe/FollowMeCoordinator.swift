@@ -150,6 +150,7 @@ public final class FollowMeCoordinator {
     private var stopBlocked = false
     private var locked: FollowPersonObservation?
     private var reliableMemory: FollowReliableMemory?
+    private var previousReliableMemory: FollowReliableMemory?
     private var recoveryEpisode: FollowReacquisitionEpisode?
     private var recoveryCenterSource: NavigationPoseSample?
     private var recoveryCenterReadUptime: Double?
@@ -275,6 +276,7 @@ public final class FollowMeCoordinator {
         // this only after the fresh post-alignment handoff, including after loss.
         departurePending = config.departureRangeIncrease > 0
         reliableMemory = nil
+        previousReliableMemory = nil
         recoveryEpisode = nil
         recoveryCenterSource = nil
         recoveryCenterReadUptime = nil
@@ -2324,7 +2326,11 @@ public final class FollowMeCoordinator {
             recoveryCenterReadUptime = nil
             recoveryDiagnosticUnavailable = nil
             recoveryEpisode = FollowReacquisitionEpisode(firstLoss: clock.now, anchor: reliableMemory,
-                deadlineLimit: obstacleDetourDeadline ?? .infinity)
+                deadlineLimit: obstacleDetourDeadline ?? .infinity,
+                searchDirection: FollowReacquisitionPlanner.partialDirection(
+                    anchor: reliableMemory, batch: latestBatch, now: clock.now) ??
+                    reliableMemory.map { FollowReacquisitionPlanner.movementDirection(
+                        previous: previousReliableMemory, current: $0) } ?? 0)
             let episode = recoveryEpisode!
             emitRecovery("started", reason: "first_loss", episode: episode, stop: "pending")
             deadlineTask = Task { [weak self, clock] in
@@ -2397,6 +2403,7 @@ public final class FollowMeCoordinator {
               let quality = batch.trackingQuality,
               let memory = FollowReliableMemory(accepted: person, association: .continued,
                   now: validationTime, trackingQuality: quality) else { return false }
+        previousReliableMemory = nil
         reliableMemory = memory
         state = phase
         clearObstacleDetourDeadline()
@@ -2464,6 +2471,7 @@ public final class FollowMeCoordinator {
               let quality = batch.trackingQuality,
               let memory = FollowReliableMemory(accepted: person, association: association,
                   now: clock.now, trackingQuality: quality) else { return }
+        previousReliableMemory = reliableMemory
         reliableMemory = memory
     }
 
@@ -2499,13 +2507,13 @@ public final class FollowMeCoordinator {
                 reason: episode.center == nil ? "no_valid_center_or_source" : "center_frozen",
                 episode: episode, centerSource: sample)
         }
-        guard let center = episode.center, episode.stageIndex < FollowReacquisitionPlanner.offsets.count else { return }
+        guard let center = episode.center, episode.stageIndex < episode.searchOffsets.count else { return }
         let episodeID = episode.id
         operation &+= 1
         let id = operation
         guard let authorization = recoveryAuthorization(generation: token, operation: id) else { return }
         let request = FollowRecoveryHeadingRequest(stageHeading: FollowReacquisitionPlanner.wrap(
-            center.heading + FollowReacquisitionPlanner.offsets[episode.stageIndex]), authorization: authorization,
+            center.heading + episode.searchOffsets[episode.stageIndex]), authorization: authorization,
             stageIndex: episode.stageIndex, segmentIndex: episode.segmentIndex,
             maximumSegment: min(config.scanIncrement, .pi / 6))
         let context = FollowMotionRequestContext(sessionGeneration: token, requestToken: id,
@@ -2553,7 +2561,7 @@ public final class FollowMeCoordinator {
                     "next_segment_index": .number(Double(self.recoveryEpisode?.segmentIndex ?? current.segmentIndex)),
                     "controller_operation_id": FollowReacquisitionDiagnostics.number(result.context.controllerOperationID.map(Double.init)),
                     "request_token": .number(Double(id))]) { _, new in new })
-            if self.recoveryEpisode?.stageIndex == FollowReacquisitionPlanner.offsets.count {
+            if self.recoveryEpisode?.stageIndex == current.searchOffsets.count {
                 self.emitRecovery("exhausted", reason: "finite_pass_complete_observe_stationary", stop: "confirmed")
             }
             self.scan(generation: token)

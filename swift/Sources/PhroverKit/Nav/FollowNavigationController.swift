@@ -125,7 +125,7 @@ final class FollowNavigationController {
         nextFollowOperationID &+= 1 // Controller-owned identity reserved before the first suspension.
         let captured = FollowMotionOperationContext(request: context, controllerOperationID: nextFollowOperationID,
             purpose: request.purpose, profile: (request.purpose == .followScan || request.purpose == .followAlignment)
-                ? .turnBurst(purpose: request.purpose) : nil,
+                ? .turnBurst(purpose: request.purpose, recovery: FollowRecoveryScope.heading != nil) : nil,
             requestedRotation: FollowRecoveryScope.heading == nil ? request.requestedRotation : nil)
         let evidence = FollowMotionOperationEvidence(context: captured)
         if (request.purpose == .followScan || request.purpose == .followAlignment), let diagnosticEmitter {
@@ -1357,7 +1357,8 @@ final class FollowNavigationController {
         // drift/gaps; exact-heading completion and burst budgets stay intact.
         let profile = FollowTurnBurstPlanner.Profile(purpose: purpose == .followAlignment ? .alignment : .scan,
             fastSearch: searchSweep != nil ||
-                (purpose == .followScan && evidence?.context.request?.allowsEarlyScanSettle == true))
+                (purpose == .followScan && evidence?.context.request?.allowsEarlyScanSettle == true),
+            recovery: FollowRecoveryScope.heading != nil)
         state = .driving
         publishSafetyState(.moving)
         let task = Task { @MainActor in
@@ -1555,7 +1556,7 @@ final class FollowNavigationController {
                 abs(FollowReacquisitionPlanner.wrap(target - $0.yaw)) <= profile.tolerance
             } == true
             let stageArrived = valid ? arrival.pose.map {
-                abs(FollowReacquisitionPlanner.wrap(previous.stageHeading - $0.yaw)) <= profile.tolerance
+                abs(FollowReacquisitionPlanner.wrap(previous.stageHeading - $0.yaw)) <= FollowReacquisitionPlanner.tolerance
             } : nil
             evidence?.recovery = .init(postStopSource: previous.postStopSource,
                 resolutionSource: previous.resolutionSource, stageHeading: previous.stageHeading,

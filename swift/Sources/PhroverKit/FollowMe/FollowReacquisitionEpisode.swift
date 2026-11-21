@@ -10,15 +10,19 @@ public struct FollowReacquisitionEpisode: Sendable {
     public let stageIndex: Int
     public let segmentIndex: Int
     public let unavailableReason: String?
+    public let searchOffsets: [Double]
 
-    public init(id: UUID = UUID(), firstLoss: TimeInterval, anchor: FollowReliableMemory?, deadlineLimit: TimeInterval = .infinity) {
+    public init(id: UUID = UUID(), firstLoss: TimeInterval, anchor: FollowReliableMemory?, deadlineLimit: TimeInterval = .infinity,
+                searchDirection: Int = 0) {
         self.id = id; self.firstLoss = firstLoss; self.deadline = min(firstLoss + 10, deadlineLimit)
         self.anchor = anchor; self.center = nil; self.stageIndex = 0; self.segmentIndex = 0
         self.unavailableReason = anchor == nil ? "missing_reliable_memory" : nil
+        searchOffsets = FollowReacquisitionPlanner.searchOffsets(direction: searchDirection)
     }
     private init(episode: Self, center: FollowReacquisitionPlanner.Center?, stage: Int, segment: Int, reason: String?) {
         id = episode.id; firstLoss = episode.firstLoss; deadline = episode.deadline; anchor = episode.anchor
         self.center = center; stageIndex = stage; segmentIndex = segment; unavailableReason = reason
+        searchOffsets = episode.searchOffsets
     }
     public func selectingCenter(current: FollowRecoveryPose, now: TimeInterval) -> Self {
         guard center == nil else { return self }
@@ -34,7 +38,9 @@ public struct FollowReacquisitionEpisode: Sendable {
               actual.trackingQuality == .normal, actual.timestamp.isFinite,
               (0...0.5).contains(now - actual.timestamp),
               actual.pose.position.x.isFinite, actual.pose.position.y.isFinite else { return self }
-        let decision = FollowReacquisitionPlanner.nextSegment(center: center.heading, stage: stageIndex, actualYaw: actual.pose.yaw)
+        guard searchOffsets.indices.contains(stageIndex) else { return self }
+        let decision = FollowReacquisitionPlanner.resolveAbsoluteStage(
+            stageHeading: center.heading + searchOffsets[stageIndex], actualYaw: actual.pose.yaw)
         switch decision {
         case .stageArrived:
             return Self(episode: self, center: center, stage: stageIndex + 1, segment: 0, reason: nil)
@@ -42,11 +48,11 @@ public struct FollowReacquisitionEpisode: Sendable {
         }
     }
     public func recordingSegmentArrival(target: Double, actual: FollowRecoveryPose, now: TimeInterval) -> Self {
-        guard now.isFinite, now < deadline, let center, let anchor, stageIndex < FollowReacquisitionPlanner.offsets.count,
+        guard now.isFinite, now < deadline, let center, let anchor, stageIndex < searchOffsets.count,
               actual.frameID.generation == anchor.frameID.generation, actual.trackingQuality == .normal,
               actual.timestamp.isFinite, (0...0.5).contains(now - actual.timestamp),
               actual.pose.position.x.isFinite, actual.pose.position.y.isFinite,
-              abs(FollowReacquisitionPlanner.wrap(target - actual.pose.yaw)) <= FollowReacquisitionPlanner.tolerance else { return self }
+               abs(FollowReacquisitionPlanner.wrap(target - actual.pose.yaw)) <= FollowReacquisitionPlanner.segmentTolerance else { return self }
         let stageArrival = recordingArrival(actual: actual, now: now)
         if stageArrival.stageIndex != stageIndex { return stageArrival }
         return Self(episode: self, center: center, stage: stageIndex, segment: segmentIndex + 1, reason: nil)

@@ -13,10 +13,11 @@ public enum FollowTurnBurstPlanner {
         public let fixedWheelMagnitude: Double = 0.25
         public let tolerance: Double
         public init(purpose: Purpose) { self.init(purpose: purpose, fastSearch: false) }
-        init(purpose: Purpose, fastSearch: Bool) {
+        init(purpose: Purpose, fastSearch: Bool, recovery: Bool = false) {
             self.purpose = purpose
             // Share Astral's practical stopped-alignment acceptance corridor.
-            tolerance = (purpose == .alignment ? 5 : 7) * .pi / 180
+            tolerance = recovery ? FollowReacquisitionPlanner.segmentTolerance :
+                (purpose == .alignment ? 5 : 7) * .pi / 180
             settleWait = fastSearch ? 0.100 : 0.300
         }
     }

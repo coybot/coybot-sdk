@@ -1569,6 +1569,39 @@ final class FollowMeCoordinatorTests: XCTestCase {
         }
     }
 
+    func testPartialOcclusionOrdersRecoveryWithoutCreatingTranslationAuthority() async {
+        for sign in [-1.0, 1.0] {
+            for count in [1, 2] {
+                let perception = FollowPerceptionFake()
+                let motion = AbsoluteRecoveryMotionFake()
+                let clock = ManualFollowClock()
+                var config = FollowMeConfiguration()
+                config.stationaryPauseSeconds = 0
+                config.departureRangeIncrease = 0
+                let coordinator = FollowMeCoordinator(perception: perception, motion: motion,
+                    clock: clock, configuration: config)
+                _ = await coordinator.start()
+                perception.send(frame(1, people: [person(1, y: 1.5)]))
+                await drain()
+                let goals = motion.legacy.goals.count
+                clock.advance(to: 0.1)
+                let hint = FollowBearingObservation(frameID: .init(generation: 1, sequence: 2), timestamp: 0.1,
+                    confidence: 0.8, boundingBox: .init(x: 0.4, y: 0.2, width: 0.2, height: 0.6),
+                    bearing: .pi / 2 + sign * 0.15, pose: .init(position: .zero, yaw: 0))
+                perception.send(.frame(.init(frameID: hint.frameID, timestamp: hint.timestamp, pose: hint.pose,
+                    depthAvailable: true, people: [], trackingQuality: .normal,
+                    partialPeople: Array(repeating: hint, count: count))))
+                await drain()
+                XCTAssertEqual(coordinator.state, .reacquiring)
+                XCTAssertEqual(motion.headings.first ?? .nan,
+                    .pi / 2 + (count == 1 ? sign * .pi / 12 : 0), accuracy: 1e-12)
+                XCTAssertEqual(motion.legacy.goals.count, goals)
+                XCTAssertEqual(motion.authorizations.first?.deadline, 10.1)
+                _ = await coordinator.stop()
+            }
+        }
+    }
+
     func testRecoveryCommandSuccessWithoutAuthoritativeArrivalCannotAdvanceStage() async {
         let perception = FollowPerceptionFake()
         let motion = AbsoluteRecoveryMotionFake()

@@ -340,8 +340,9 @@ enum FollowMotionTaskScope {
 struct FollowScanRotationProfile: Sendable, Equatable {
     /// Legacy trace schema projection of the active immutable burst profile.
     /// `pulseWait` is the maximum requested host budget, never an ACK-relative wait.
-    static func turnBurst(purpose: FollowMotionPurpose) -> Self {
-        let profile = FollowTurnBurstPlanner.Profile(purpose: purpose == .followAlignment ? .alignment : .scan)
+    static func turnBurst(purpose: FollowMotionPurpose, recovery: Bool = false) -> Self {
+        let profile = FollowTurnBurstPlanner.Profile(purpose: purpose == .followAlignment ? .alignment : .scan,
+            fastSearch: false, recovery: recovery)
         return .init(pulseWait: profile.maximumHostBurstBudget, settleWait: profile.settleWait,
             wheelCap: profile.fixedWheelMagnitude, yawGain: RoverConfig.followScanRotationProfile.yawGain,
             angularTolerance: profile.tolerance)

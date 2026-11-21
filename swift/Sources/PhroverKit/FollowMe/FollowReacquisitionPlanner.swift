@@ -63,6 +63,58 @@ public enum FollowReacquisitionPlanner {
     }
     public static let offsets: [Double] = [0, 15, -15, 30, -30, 45, -45].map { $0 * .pi / 180 }
     public static let tolerance = 7 * Double.pi / 180
+    /// A ten-degree segment must not complete after only three degrees of travel.
+    public static let segmentTolerance = 2 * Double.pi / 180
+
+    public static func searchOffsets(direction: Int) -> [Double] {
+        guard direction != 0 else { return offsets }
+        let sign = direction > 0 ? 1.0 : -1.0
+        return [15.0, 30, 45, 0, -15, -30, -45].map { $0 * sign * .pi / 180 }
+    }
+
+    /// Search ordering only: neither extrapolates a position nor grants motion authority.
+    public static func movementDirection(previous: FollowReliableMemory?, current: FollowReliableMemory) -> Int {
+        guard let previous, previous.frameID.generation == current.frameID.generation,
+              current.frameID.sequence > previous.frameID.sequence,
+              (0.05...0.75).contains(current.timestamp - previous.timestamp),
+              let before = previous.position, let after = current.position,
+              let rover = current.pairedPose?.position,
+              before.distance(to: after) >= 0.03, before.distance(to: after) <= 1,
+              before.distance(to: rover) > 0.2, after.distance(to: rover) > 0.2 else { return 0 }
+        let delta = wrap(atan2(after.y - rover.y, after.x - rover.x) -
+            atan2(before.y - rover.y, before.x - rover.x))
+        guard delta.isFinite, abs(delta) >= 2 * .pi / 180, abs(delta) <= .pi / 4 else { return 0 }
+        return delta > 0 ? 1 : -1
+    }
+
+    /// A unique, nearby, fresh bearing can select the first search side. It cannot
+    /// move the frozen center, refresh the anchor, or resolve a person identity.
+    public static func partialDirection(anchor: FollowReliableMemory?, batch: FollowFrameBatch?,
+                                        now: TimeInterval) -> Int? {
+        guard let anchor, let point = anchor.position, let batch, let pose = batch.pose,
+              batch.trackingQuality == .normal, batch.frameID.generation == anchor.frameID.generation,
+              batch.frameID.sequence > anchor.frameID.sequence, batch.people.isEmpty,
+              batch.timestamp > anchor.timestamp,
+              now.isFinite, (0...0.5).contains(now - batch.timestamp),
+              (0...3).contains(now - anchor.timestamp),
+              point.distance(to: pose.position) > 0.2 else { return nil }
+        let expected = atan2(point.y - pose.position.y, point.x - pose.position.x)
+        let hints = batch.partialPeople.filter {
+            $0.frameID == batch.frameID && $0.timestamp == batch.timestamp &&
+            $0.confidence.isFinite && $0.confidence >= 0.5 && $0.confidence <= 1 &&
+            [$0.boundingBox.minX, $0.boundingBox.minY, $0.boundingBox.width, $0.boundingBox.height,
+             $0.boundingBox.maxX, $0.boundingBox.maxY].allSatisfy(\.isFinite) &&
+            $0.boundingBox.width > 0 && $0.boundingBox.height > 0 &&
+            $0.boundingBox.minX >= -0.01 && $0.boundingBox.minY >= -0.01 &&
+            $0.boundingBox.maxX <= 1.01 && $0.boundingBox.maxY <= 1.01 &&
+            $0.pose == pose && $0.bearing.isFinite &&
+            abs(wrap($0.bearing - expected)) <= 20 * .pi / 180
+        }
+        guard hints.count == 1 else { return nil }
+        let delta = wrap(hints[0].bearing - expected)
+        guard abs(delta) >= 2 * .pi / 180 else { return nil }
+        return delta > 0 ? 1 : -1
+    }
     public static func nextSegment(center: Double, stage: Int, actualYaw: Double) -> SegmentDecision {
         guard stage >= 0, center.isFinite, actualYaw.isFinite else { return .unavailable }
         guard stage < offsets.count else { return .exhausted }

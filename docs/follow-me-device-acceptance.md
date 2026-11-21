@@ -13,6 +13,38 @@ Automated simulator tests do not establish LiDAR projection accuracy or prove th
 
 Record the tested phone, rover, build revision, pass/fail per step, and redacted runtime-log evidence here after the supervised run. Do not attach camera images or raw transcripts.
 
+## Sideways exits and partial occlusion (November 20)
+
+The latest capture, `iphone15pro-target-occlusion.log` (21:21:25–21:41:50Z),
+showed ten-degree search requests accepting only three to four degrees of
+actual yaw, consuming the ten-second recovery window in repeated small turns.
+The “I can't see you” response followed recovery expiry.
+
+Recovery segments now require measured yaw within two degrees of their
+requested heading. The broader seven-degree search-stage corridor remains
+separate. Recent accepted target displacement selects the first search side;
+both displacement bearings use the same rover position, so rover rotation
+alone cannot create apparent target movement.
+
+A unique, fresh partial detection near the last reliable target direction may
+select search order. It never replaces the reliable target position, shifts
+the frozen search center, authorizes forward motion, or renews the deadline.
+Ambiguous, stale, future and wrong-generation hints are rejected. Normal
+verified-target association and post-stop confirmation still own resumption.
+
+See [verification notes](follow-occlusion-verification.md) for the failing
+controller reproduction, generated geometry/source cases and concurrency-model
+proposal. Physical acceptance remains pending for lateral exits on both sides,
+brief furniture occlusion and a second person crossing the original track.
+
+Verification: **1,740/1,740** SDK tests passed with zero failures/skips
+(`Test-PhroverSDKTests-2026.11.20_21-21-26--0800.xcresult`).
+Signed Debug build and `git diff --check` passed. Installed at **21:23,
+November 20** on **iPhone 15 Pro**, device
+`FC11C836-4978-5B20-9170-16EAD18568BE`, bundle `bot.coy.phrover`,
+installation database sequence **1660**, database UUID
+`CFE71183-3241-4480-9F18-5A1624798833`.
+
 ## Advisory passage rejection (November 20)
 
 ### Blocked follow yaw-and-observe recovery

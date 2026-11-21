@@ -3,6 +3,68 @@ import RoverNav
 import PhroverKit
 
 final class FollowReacquisitionPlannerTests: XCTestCase {
+    func testMovementDirectionIgnoresRoverYawAndMirrorsSearchOrder() {
+        for degrees in stride(from: -180.0, to: 180, by: 15) {
+            for sign in [-1.0, 1.0] {
+                let heading = degrees * .pi / 180
+                func memory(_ angle: Double, sequence: UInt64, time: Double, yaw: Double) -> FollowReliableMemory {
+                    .init(position: Vec2(2 * cos(angle), 2 * sin(angle)),
+                        pairedPose: .init(position: .zero, yaw: yaw), bearing: nil,
+                        frameID: .init(generation: 4, sequence: sequence), timestamp: time, association: .continued)
+                }
+                let before = memory(heading, sequence: 1, time: 1, yaw: -2)
+                let after = memory(heading + sign * 0.1, sequence: 2, time: 1.2, yaw: 2)
+                let direction = FollowReacquisitionPlanner.movementDirection(previous: before, current: after)
+                XCTAssertEqual(direction, Int(sign), "heading=\(degrees), sign=\(sign)")
+                let offsets = FollowReacquisitionPlanner.searchOffsets(direction: direction)
+                XCTAssertEqual(offsets[0], sign * 15 * .pi / 180, accuracy: 1e-12)
+                XCTAssertEqual(Set(offsets).count, 7)
+                XCTAssertTrue(offsets.allSatisfy { abs($0) <= .pi / 4 })
+                let stationary = memory(heading, sequence: 2, time: 1.2, yaw: 2)
+                XCTAssertEqual(FollowReacquisitionPlanner.movementDirection(previous: before, current: stationary), 0)
+                let stale = memory(heading + sign * 0.1, sequence: 2, time: 2, yaw: 2)
+                XCTAssertEqual(FollowReacquisitionPlanner.movementDirection(previous: before, current: stale), 0)
+            }
+        }
+    }
+
+    func testPartialHintsOnlyOrderSearchAndRejectAmbiguityStaleAndResetFrames() {
+        let anchor = FollowReliableMemory(position: Vec2(2, 0), pairedPose: nil, bearing: nil,
+            frameID: .init(generation: 4, sequence: 1), timestamp: 1, association: .continued)
+        let pose = Pose2D(position: .zero, yaw: 0)
+        for sign in [-1.0, 1.0] {
+            for generation in [UInt64(4), 5] {
+                for time in [0.9, 1.2, 2.0, Double.nan] {
+                    for count in [0, 1, 2] {
+                        let frame = ARFrameID(generation: generation, sequence: 2)
+                        let hint = FollowBearingObservation(frameID: frame, timestamp: time, confidence: 0.8,
+                            boundingBox: .init(x: 0.4, y: 0.2, width: 0.2, height: 0.6),
+                            bearing: sign * 0.15, pose: pose)
+                        let batch = FollowFrameBatch(frameID: frame, timestamp: time, pose: pose,
+                            depthAvailable: true, people: [], trackingQuality: .normal,
+                            partialPeople: Array(repeating: hint, count: count))
+                        let direction = FollowReacquisitionPlanner.partialDirection(anchor: anchor, batch: batch, now: 1.3)
+                        let eligible = generation == 4 && time == 1.2 && count == 1
+                        XCTAssertEqual(direction, eligible ? Int(sign) : nil,
+                            "generation=\(generation), time=\(time), count=\(count)")
+                        var episode = FollowReacquisitionEpisode(firstLoss: 1.3, anchor: anchor,
+                            searchDirection: direction ?? 0)
+                        let id = episode.id
+                        let sample = FollowRecoveryPose(pose: pose, frameID: .init(generation: 4, sequence: 3),
+                            timestamp: 1.3, trackingQuality: .normal)
+                        episode = episode.selectingCenter(current: sample, now: 1.3)
+                        episode = episode.recordingArrival(actual: sample, now: 1.3)
+                        XCTAssertEqual(episode.id, id)
+                        XCTAssertEqual(episode.deadline, 11.3)
+                        XCTAssertEqual(episode.anchor?.timestamp, 1)
+                        XCTAssertEqual(episode.anchor?.position, Vec2(2, 0))
+                        XCTAssertEqual(episode.center?.heading, 0)
+                    }
+                }
+            }
+        }
+    }
+
     func testObservationSearchCanCapRecoverySegmentsAtTenDegrees() {
         guard case .turn(let delta, _) = FollowReacquisitionPlanner.resolveAbsoluteStage(
             stageHeading: 1, actualYaw: 0, maximumSegment: .pi / 18) else { return XCTFail() }

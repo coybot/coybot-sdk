@@ -7,8 +7,8 @@ enum FollowReacquisitionDiagnostics {
                         centerReadUptime: Double? = nil) -> [String: FollowDiagnosticValue] {
         let anchor = episode.anchor
         let center = episode.center
-        let offset = FollowReacquisitionPlanner.offsets.indices.contains(episode.stageIndex)
-            ? FollowReacquisitionPlanner.offsets[episode.stageIndex] : nil
+        let offset = episode.searchOffsets.indices.contains(episode.stageIndex)
+            ? episode.searchOffsets[episode.stageIndex] : nil
         let fields: [String: FollowDiagnosticValue] = [
             "episode_id": .string(episode.id.uuidString), "first_loss_s": .number(episode.firstLoss),
             "deadline_s": .number(episode.deadline), "elapsed_s": .number(now - episode.firstLoss),
@@ -43,7 +43,7 @@ enum FollowReacquisitionDiagnostics {
             "center_source_identity": centerSource.map { .string($0.source) } ?? .null,
             "center_rover_x": number(center?.sample.pose.position.x), "center_rover_z": number(center?.sample.pose.position.y),
             "stage_index": .number(Double(episode.stageIndex)), "segment_index": .number(Double(episode.segmentIndex)),
-            "stage_name": .string(episode.stageIndex == 0 ? "center_return" : (offset == nil ? "exhausted" : "offset")),
+            "stage_name": .string(offset == 0 ? "center_return" : (offset == nil ? "exhausted" : "offset")),
             "stage_offset_rad": number(offset),
             "stage_target_rad": number(center.flatMap { center in offset.map { FollowReacquisitionPlanner.wrap(center.heading + $0) } }),
             "pass_exhausted": .bool(offset == nil), "unavailable_reason": episode.unavailableReason.map { .string($0) } ?? .null,
